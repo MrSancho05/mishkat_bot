@@ -1,7 +1,9 @@
 import asyncio
 import html
+import logging
 import os
 import re
+import uuid
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -15,54 +17,63 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app import config
+from app.utils import dual_role_header, now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
+    get_legacy_debts,
+    get_unpaid_legacy_debts_map,
+    get_notification_details,
     get_pending_action,
+    get_teacher_by_telegram_id,
     get_user,
     get_user_lang,
+    has_dual_student_parent_role,
+    save_notification_details,
     update_pending_action_status,
 )
+from app.debt_view import (
+    build_debt_notice,
+    compute_children_debts,
+    format_admin_extra_lines,
+    load_group_fees,
+    send_expandable_notice,
+)
+from app.debt_view import _dt as debt_text
+from app.debt_view import format_uzs as debt_format_uzs
 from app.keyboards import (
+    InlineKeyboardBuilder,
+    build_expandable_notif_kb,
     groups_inline_kb,
     payment_confirm_kb,
     student_payment_detail_kb,
     students_list_kb,
 )
 from app.locales import (
+    button_texts,
     format_human_cycle_title,
     format_lesson_line,
     format_next_payment_info,
     format_uz_date,
     t,
 )
-from app.sheets import get_sheets_manager
+from app.sheets import SheetsManager, get_sheets_manager
 from app.states import PaymentStates
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="payments")
 
-PAYMENT_CONFIRM_MENU_TEXTS = {
-    t("menu_admin_payments", "latn"),
-    t("menu_admin_payments", "cyrl"),
-    t("menu_teacher_payments", "latn"),
-    t("menu_teacher_payments", "cyrl"),
-}
+PAYMENT_CONFIRM_MENU_TEXTS = button_texts(
+    "menu_admin_payments", "menu_teacher_payments"
+)
 
-STUDENT_PARENT_PAYMENTS_TEXTS = {
-    t("menu_student_payments", "latn"),
-    t("menu_student_payments", "cyrl"),
-    t("menu_parent_payments", "latn"),
-    t("menu_parent_payments", "cyrl"),
-}
+STUDENT_PARENT_PAYMENTS_TEXTS = button_texts(
+    "menu_student_payments", "menu_parent_payments"
+)
 
-DEBTORS_MENU_TEXTS = {
-    t("menu_admin_debtors", "latn"),
-    t("menu_admin_debtors", "cyrl"),
-    t("menu_teacher_debtors", "latn"),
-    t("menu_teacher_debtors", "cyrl"),
-}
+DEBTORS_MENU_TEXTS = button_texts("menu_admin_debtors", "menu_teacher_debtors")
 
 LOCAL_TEXTS: dict[str, dict[str, str]] = {
     "latn": {
@@ -78,7 +89,21 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "👥 Jami qarzdorlar: <b>{count} ta</b>\n"
             "💵 Umumiy qarz summasi: <b>{total} so‘m</b>"
         ),
-        "btn_remind_debtors": "📢 Qarzdorlarga eslatma yuborish",
+        "btn_remind_debtors": "📢 Eslatma yuborish",
+        "parent_child_payment_block": (
+            "👶 Farzand: <b>{child_fio}</b>\n"
+            "📚 Guruh: <b>{group_name}</b>\n"
+            "💵 Oylik to'lov: <b>{monthly_fee} so'm</b>\n"
+            "📊 Holati: <b>{status_text}</b>\n"
+            "❗️ Qarzdorlik: <b>{child_debt} so'm ({debt_months} oy)</b>"
+        ),
+        "parent_total_debt_footer": (
+            "━━━━━━━━━━━━━━\n"
+            "💰 Barcha farzandlar bo'yicha umumiy qarzdorlik: <b>{total_debt} so'm</b>\n\n"
+            "💳 To‘lov uchun karta: <code>{card_number}</code>\n"
+            "👤 Karta egasi: <b>{card_owner}</b>\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
         "reminder_student": (
             "🔔 <b>To‘lov eslatmasi</b>\n\n"
             "👤 Talaba: <b>{student_name}</b>\n"
@@ -88,18 +113,47 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "To‘lovni o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
             "💳 Karta: <code>{card_number}</code>\n"
             "👤 Karta egasi: <b>{card_owner}</b>\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
-        "reminder_sent_report": (
-            "✅ Qarzdorlik eslatmasi yuborildi!\n"
-            "🎓 Talabalarga: <b>{stu_sent} ta</b> | 👨‍👩‍👧 Ota-onalarga: <b>{par_sent} ta</b>"
+        "reminder_parent_same_group": (
+            "🔔 <b>To‘lov eslatmasi</b>\n\n"
+            "📚 Guruh: <b>{group}</b> (Oylik to‘lov: <b>{fee} so‘m</b>)\n\n"
+            "👨‍👩‍👧‍👦 <b>Farzandlaringiz ({child_count} nafar):</b>\n{children_lines}\n\n"
+            "💰 <b>Jami qarzdorlik: {total} so‘m</b>\n\n"
+            "To‘lovni o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
+            "💳 Karta: <code>{card_number}</code>\n"
+            "👤 Karta egasi: <b>{card_owner}</b>\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "reminder_parent_multi_group": (
+            "🔔 <b>Umumiy to‘lov eslatmasi</b>\n\n"
+            "{groups_blocks}\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "💵 <b>Umumiy jami qarzdorlik: {grand_total} so‘m</b>\n\n"
+            "To‘lovni o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
+            "💳 Karta: <code>{card_number}</code>\n"
+            "👤 Karta egasi: <b>{card_owner}</b>\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "reminder_sent_report_short": (
+            "✅ <b>Qarzdorlik eslatmasi yuborildi!</b>\n\n"
+            "🎓 Talabalarga yuborildi: <b>{stu_sent} ta</b>\n"
+            "👨‍👩‍👧 Ota-onalarga yuborildi: <b>{par_sent} ta</b>\n"
+            "📨 Jami xabarlar: <b>{total_sent} ta</b>\n\n"
+            "<i>Batafsil ro‘yxat va aloqa havolalarini ko‘rish uchun pastdagi tugmani bosing.</i>"
+        ),
+        "reminder_sent_report_detailed": (
+            "✅ <b>Qarzdorlik eslatmasi hisoboti (Batafsil)</b>\n\n"
+            "🎓 Talabalar: <b>{stu_sent} ta</b> | 👨‍👩‍👧 Ota-onalar: <b>{par_sent} ta</b>\n\n"
+            "🎓 <b>Xabar yuborilgan talabalar:</b>\n{student_lines}\n\n"
+            "👨‍👩‍👧 <b>Xabar yuborilgan ota-onalar:</b>\n{parent_lines}"
         ),
         "payment_confirmed_instant_admin": (
             "✅ <b>To‘lov tasdiqlandi va jadval yashil rangga bo‘yaldi!</b>\n\n"
             "👤 Talaba: <b>{student_name}</b> ({group})\n"
             "🗓 O‘quv oyi: <b>{cycle_title}</b>"
         ),
-        "signature": "\n\nHurmat bilan, Mishkat o'quv muassasasi",
+        "signature_center": "\n\nHurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!",
     },
     "cyrl": {
         "fee_summary_line": "💰 Гуруҳ ойлик тўлови: <b>{fee} сўм</b>",
@@ -114,7 +168,21 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "👥 Жами қарздорлар: <b>{count} та</b>\n"
             "💵 Умумий қарз суммаси: <b>{total} сўм</b>"
         ),
-        "btn_remind_debtors": "📢 Қарздорларга эслатма юбориш",
+        "btn_remind_debtors": "📢 Эслатма юбориш",
+        "parent_child_payment_block": (
+            "👶 Фарзанд: <b>{child_fio}</b>\n"
+            "📚 Гуруҳ: <b>{group_name}</b>\n"
+            "💵 Ойлик тўлов: <b>{monthly_fee} сўм</b>\n"
+            "📊 Ҳолати: <b>{status_text}</b>\n"
+            "❗️ Қарздорлик: <b>{child_debt} сўм ({debt_months} ой)</b>"
+        ),
+        "parent_total_debt_footer": (
+            "━━━━━━━━━━━━━━\n"
+            "💰 Барча фарзандлар бўйича умумий қарздорлик: <b>{total_debt} сўм</b>\n\n"
+            "💳 Тўлов учун карта: <code>{card_number}</code>\n"
+            "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
         "reminder_student": (
             "🔔 <b>Тўлов эслатмаси</b>\n\n"
             "👤 Талаба: <b>{student_name}</b>\n"
@@ -124,18 +192,47 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Тўловни ўз вақтида амалга оширишингизни сўраймиз.\n\n"
             "💳 Карта: <code>{card_number}</code>\n"
             "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
-        "reminder_sent_report": (
-            "✅ Қарздорлик эслатмаси юборилди!\n"
-            "🎓 Талабаларга: <b>{stu_sent} та</b> | 👨‍👩‍👧 Ота-оналарга: <b>{par_sent} та</b>"
+        "reminder_parent_same_group": (
+            "🔔 <b>Тўлов эслатмаси</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b> (Ойлик тўлов: <b>{fee} сўм</b>)\n\n"
+            "👨‍👩‍👧‍👦 <b>Фарзандларингиз ({child_count} нафар):</b>\n{children_lines}\n\n"
+            "💰 <b>Жами қарздорлик: {total} сўм</b>\n\n"
+            "Тўловни ўз вақтида амалга оширишингизни сўраймиз.\n\n"
+            "💳 Карта: <code>{card_number}</code>\n"
+            "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "reminder_parent_multi_group": (
+            "🔔 <b>Умумий тўлов эслатмаси</b>\n\n"
+            "{groups_blocks}\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "💵 <b>Умумий жами қарздорлик: {grand_total} сўм</b>\n\n"
+            "Тўловни ўз вақтида амалга оширишингизни сўраймиз.\n\n"
+            "💳 Карта: <code>{card_number}</code>\n"
+            "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "reminder_sent_report_short": (
+            "✅ <b>Қарздорлик эслатмаси юборилди!</b>\n\n"
+            "🎓 Талабаларга юборилди: <b>{stu_sent} та</b>\n"
+            "👨‍👩‍👧 Ота-оналарга юборилди: <b>{par_sent} та</b>\n"
+            "📨 Жами хабарлар: <b>{total_sent} та</b>\n\n"
+            "<i>Батафсил рўйхат ва алоқа ҳаволаларини кўриш учун пастдаги тугмани босинг.</i>"
+        ),
+        "reminder_sent_report_detailed": (
+            "✅ <b>Қарздорлик эслатмаси ҳисоботи (Батафсил)</b>\n\n"
+            "🎓 Талабалар: <b>{stu_sent} та</b> | 👨‍👩‍👧 Ота-оналар: <b>{par_sent} та</b>\n\n"
+            "🎓 <b>Хабар юборилган талабалар:</b>\n{student_lines}\n\n"
+            "👨‍👩‍👧 <b>Хабар юборилган ота-оналар:</b>\n{parent_lines}"
         ),
         "payment_confirmed_instant_admin": (
             "✅ <b>Тўлов тасдиқланди ва жадвал яшил рангга бўялди!</b>\n\n"
             "👤 Талаба: <b>{student_name}</b> ({group})\n"
             "🗓 Ўқув ойи: <b>{cycle_title}</b>"
         ),
-        "signature": "\n\nҲурмат билан, Мишкат ўқув муассасаси",
+        "signature_center": "\n\nҲурмат билан,\nМишкат Нодавлат Таълим Муассасаси!",
     },
 }
 
@@ -144,6 +241,40 @@ def _lt(key: str, lang: str = "latn", **kwargs: Any) -> str:
     safe_lang = lang if lang in LOCAL_TEXTS else "latn"
     template = LOCAL_TEXTS[safe_lang].get(key) or LOCAL_TEXTS["latn"].get(key, key)
     return template.format(**kwargs) if kwargs else template
+
+
+def _parse_chat_id(val: Any) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if val != 0 else None
+    if isinstance(val, float):
+        try:
+            int_val = int(val)
+            return int_val if int_val != 0 and float(int_val) == val else None
+        except (ValueError, OverflowError):
+            return None
+    cleaned = str(val).strip()
+    if not cleaned or cleaned == "Ma'lumot kiritilmagan":
+        return None
+    if re.fullmatch(r"-?\d+(?:\.0+)?", cleaned):
+        int_val = int(cleaned.split(".", 1)[0])
+        return int_val if int_val != 0 else None
+    return None
+
+
+def _normalize_phone_key(phone: Any) -> str:
+    cleaned = str(phone or "").strip()
+    if not cleaned or cleaned in {"Ma'lumot kiritilmagan", "Yo'q", "yo'q", "yoq", "—", "-"}:
+        return ""
+    digits = re.sub(r"\D", "", cleaned)
+    if not digits or len(digits) < 7:
+        return ""
+    if len(digits) == 9:
+        return f"998{digits}"
+    if len(digits) == 12 and digits.startswith("998"):
+        return digits
+    return digits
 
 
 def _get_default_monthly_fee() -> int:
@@ -190,6 +321,42 @@ def _count_debt_months(debt_raw: str) -> int:
     return len(items)
 
 
+def _format_lesson_attendance_stats(
+    held: int, attended: int, missed: int, lang: str
+) -> str:
+    if lang == "cyrl":
+        return (
+            f"📊 <b>{held}</b> та ўтилган дарс: "
+            f"<b>{attended}</b> та келган, <b>{missed}</b> та келмаган"
+        )
+    return (
+        f"📊 <b>{held}</b> ta o'tilgan dars: "
+        f"<b>{attended}</b> ta kelgan, <b>{missed}</b> ta kelmagan"
+    )
+
+
+async def _resolve_debtor_stats(
+    sheets: SheetsManager, debtor: dict[str, Any], group_name: str
+) -> dict[str, Any]:
+    if (
+        "total_held_lessons" in debtor
+        and "attended_lessons" in debtor
+        and "missed_lessons" in debtor
+    ):
+        return {
+            "total_held_lessons": int(debtor.get("total_held_lessons") or 0),
+            "attended_lessons": int(debtor.get("attended_lessons") or 0),
+            "missed_lessons": int(debtor.get("missed_lessons") or 0),
+            "cycle_title": str(debtor.get("cycle_title") or ""),
+        }
+    return await asyncio.to_thread(
+        sheets.get_student_cycle_lesson_stats,
+        group_name,
+        str(debtor.get("Talaba_ID", "")).strip(),
+        str(debtor.get("F.I.O.", "")).strip(),
+    )
+
+
 def _get_payment_card_info() -> tuple[str, str]:
     card_number = (
         getattr(config, "PAYMENT_CARD_NUMBER", None)
@@ -206,6 +373,82 @@ def _get_payment_card_info() -> tuple[str, str]:
         or "—"
     )
     return str(card_number).strip(), str(card_owner).strip()
+
+
+def _normalize_phone(raw_phone: str) -> str:
+    cleaned = str(raw_phone or "").strip()
+    if not cleaned:
+        return ""
+    compact = re.sub(r"[^\d+]", "", cleaned)
+    if re.fullmatch(r"\d{9}", compact):
+        return f"+998{compact}"
+    if re.fullmatch(r"998\d{9}", compact):
+        return f"+{compact}"
+    if compact and not compact.startswith("+") and len(compact) >= 7:
+        return f"+{compact}"
+    return compact
+
+
+def _format_tel_link(raw_phone: str) -> str:
+    cleaned = str(raw_phone or "").strip()
+    if not cleaned or cleaned == "—":
+        return "—"
+    norm = _normalize_phone(cleaned)
+    if not norm or not any(ch.isdigit() for ch in norm):
+        return html.escape(cleaned)
+    safe_norm = html.escape(norm)
+    return f'<a href="tel:{safe_norm}">{safe_norm}</a>'
+
+
+def _format_tg_link(
+    raw_tg: str = "", chat_id: Any = None, fallback_label: str = "Telegram"
+) -> str:
+    cid_int = _parse_chat_id(chat_id)
+    cid_str = str(cid_int) if cid_int is not None else ""
+    cleaned_tg = str(raw_tg or "").strip()
+    if cleaned_tg.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        username = cleaned_tg.rstrip("/").split("/")[-1].lstrip("@")
+    else:
+        username = cleaned_tg.lstrip("@")
+    valid_username = bool(re.fullmatch(r"[A-Za-z0-9_]{3,}", username))
+
+    if cid_int is not None and cid_int > 0:
+        label = f"@{username}" if valid_username else fallback_label
+        return f'<a href="tg://user?id={cid_str}">{html.escape(label)}</a>'
+    if valid_username:
+        safe_u = html.escape(username)
+        return f'<a href="https://t.me/{safe_u}">@{safe_u}</a>'
+    return "—"
+
+
+def _safe_truncate_html_lines(text: str, limit: int = 3950) -> str:
+    if len(text) <= limit:
+        return text
+    out_lines: list[str] = []
+    cur_len = 0
+    for line in text.split("\n"):
+        add_len = len(line) + (1 if out_lines else 0)
+        if cur_len + add_len > limit - 4:
+            break
+        out_lines.append(line)
+        cur_len += add_len
+    return "\n".join(out_lines) + "\n..."
+
+
+def _debt_report_toggle_kb(
+    notif_id: str, is_detailed: bool, lang: str
+) -> InlineKeyboardMarkup:
+    btn_text = t("btn_short", lang) if is_detailed else t("btn_detailed", lang)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=btn_text,
+                    callback_data=f"debt_rep_toggle:{notif_id}:{int(not is_detailed)}",
+                )
+            ]
+        ]
+    )
 
 
 async def _is_admin(user_id: int) -> bool:
@@ -225,6 +468,29 @@ async def _is_admin(user_id: int) -> bool:
     except Exception:
         pass
     return False
+
+
+async def _resolve_actor_teacher_name(
+    user_id: int, group: Optional[dict[str, Any]]
+) -> str:
+    db_tch = await get_teacher_by_telegram_id(user_id)
+    if db_tch and db_tch.get("full_name"):
+        return str(db_tch["full_name"]).strip()
+    sheets = get_sheets_manager()
+    try:
+        sheet_tch = await sheets.a_get_teacher_by_chat_id(user_id)
+        if sheet_tch and sheet_tch.get("F.I.O."):
+            fio = str(sheet_tch["F.I.O."]).strip()
+            if fio and fio != "Ma'lumot kiritilmagan":
+                return fio
+    except Exception:
+        pass
+    db_usr = await get_user(user_id)
+    if db_usr and db_usr.get("full_name"):
+        return str(db_usr["full_name"]).strip()
+    if group and group.get("Ustoz_FIO"):
+        return str(group["Ustoz_FIO"]).strip()
+    return str(user_id)
 
 
 async def _get_authorized_groups(user_id: int) -> tuple[bool, list[dict[str, Any]]]:
@@ -295,7 +561,7 @@ def _fetch_full_cycle_history_sync(
     group_name: str, student_id: str
 ) -> list[dict[str, Any]]:
     sheets = get_sheets_manager()
-    current_year = datetime.now(TZ).year
+    current_year = now_tashkent().year
     cycles: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
 
@@ -331,7 +597,7 @@ def _build_lessons_lines(cycle: dict[str, Any], lang: str) -> str:
     enriched = cycle.get("enriched_lessons")
     if not enriched:
         enriched = _enrich_cycle_with_weekdays(
-            cycle, datetime.now(TZ).year
+            cycle, now_tashkent().year
         ).get("enriched_lessons", [])
     if not enriched:
         return "—"
@@ -353,12 +619,11 @@ def _cycles_selection_kb(
     builder = InlineKeyboardBuilder()
     for idx, c in enumerate(cycles):
         icon = "✅" if c["is_paid"] else "❌"
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{icon} {_format_cycle_display_title(c, lang)}",
-                callback_data=f"pay_cyc:{idx}",
-            )
+        builder.button(
+            text=f"{icon} {_format_cycle_display_title(c, lang)}",
+            callback_data=f"pay_cyc:{idx}",
         )
+    builder.adjust(2)
     builder.row(
         InlineKeyboardButton(text=t("btn_back", lang), callback_data="pay_cyc:__back__"),
         InlineKeyboardButton(
@@ -511,6 +776,116 @@ def _format_student_cycle_text(
     return f"{body}\n\n{fee_block}\n\n{card_block}"
 
 
+def _build_parent_payment_context_lines(
+    target_student: dict[str, Any],
+    group_name: str,
+    monthly_fee: int,
+    parent_cid: int,
+    all_students: list[dict[str, Any]],
+    group_fees: dict[str, int],
+    default_fee: int,
+    is_confirm: bool,
+    lang: str,
+    legacy_rows: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    """
+    Real-time payment context for a parent. It names ONLY the specific child
+    whose payment was confirmed/reverted (siblings are never listed or marked
+    as paid) and shows that child's remaining debt (current cycles + legacy).
+    """
+    stu_name = str(target_student.get("F.I.O.") or target_student.get("Talaba_ID") or "").strip()
+    fee_fmt = _format_uzs(monthly_fee)
+
+    if lang == "cyrl":
+        amount_label = "Тасдиқланган сумма" if is_confirm else "Янгиланган сумма"
+        lines = [
+            f"👦 <b>Фарзандингиз {html.escape(stu_name)}</b> ({html.escape(group_name)})",
+            f"💰 {amount_label}: <b>{fee_fmt} сўм</b>",
+        ]
+    else:
+        amount_label = "Tasdiqlangan summa" if is_confirm else "Yangilangan summa"
+        lines = [
+            f"👦 <b>Farzandingiz {html.escape(stu_name)}</b> ({html.escape(group_name)})",
+            f"💰 {amount_label}: <b>{fee_fmt} so‘m</b>",
+        ]
+
+    debt_months = _count_debt_months(str(target_student.get("Qarzdor_Oylar") or "").strip())
+    rem_sum = debt_months * monthly_fee
+    legacy_list = list(legacy_rows or [])
+    legacy_months = sum(max(1, int(r.get("months") or 1)) for r in legacy_list)
+    legacy_sum = sum(max(0, int(r.get("amount") or 0)) for r in legacy_list)
+    total_months = debt_months + legacy_months
+    total_sum = rem_sum + legacy_sum
+
+    if lang == "cyrl":
+        if total_months <= 0:
+            lines.append(
+                f"✅ <b>{html.escape(stu_name)}</b> бўйича қолган қарздорлик: <b>0 сўм</b>"
+            )
+        else:
+            lines.append(
+                f"⚠️ <b>{html.escape(stu_name)}</b> бўйича қолган қарздорлик: "
+                f"<b>{total_months} ой — {_format_uzs(total_sum)} сўм</b>"
+            )
+            if legacy_sum:
+                lines.append(
+                    f"   (жорий: {debt_months} ой × {fee_fmt} = {_format_uzs(rem_sum)} сўм; "
+                    f"аввалги қарз: {legacy_months} ой — {_format_uzs(legacy_sum)} сўм)"
+                )
+    else:
+        if total_months <= 0:
+            lines.append(
+                f"✅ <b>{html.escape(stu_name)}</b> bo‘yicha qolgan qarzdorlik: <b>0 so‘m</b>"
+            )
+        else:
+            lines.append(
+                f"⚠️ <b>{html.escape(stu_name)}</b> bo‘yicha qolgan qarzdorlik: "
+                f"<b>{total_months} oy — {_format_uzs(total_sum)} so‘m</b>"
+            )
+            if legacy_sum:
+                lines.append(
+                    f"   (joriy: {debt_months} oy × {fee_fmt} = {_format_uzs(rem_sum)} so‘m; "
+                    f"avvalgi qarz: {legacy_months} oy — {_format_uzs(legacy_sum)} so‘m)"
+                )
+    return "\n".join(lines)
+
+
+async def _notify_admins_delivery_failure(
+    bot: Any,
+    actor_user_id: int,
+    student_name: str,
+    group_name: str,
+    failed_parents: list[tuple[int, str]],
+) -> None:
+    if not failed_parents:
+        return
+    recipients: set[int] = set(ADMIN_IDS)
+    if await _is_admin(actor_user_id):
+        recipients.add(actor_user_id)
+
+    fail_lines = "\n".join(
+        f"• Chat ID <code>{cid}</code>: <code>{html.escape(err[:180])}</code>"
+        for cid, err in failed_parents
+    )
+    alert_text = (
+        f"⚠️ <b>To‘lov xabarini yetkazishda xatolik (talaba / ota-ona)!</b>\n\n"
+        f"👤 Talaba: <b>{html.escape(student_name)}</b> ({html.escape(group_name)})\n"
+        f"{fail_lines}"
+    )
+    for admin_cid in recipients:
+        try:
+            await bot.send_message(
+                chat_id=admin_cid,
+                text=alert_text,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify admin_id=%s about parent payment delivery failure",
+                admin_cid,
+            )
+
+
 async def _broadcast_payment_event(
     bot: Any,
     group_name: str,
@@ -519,107 +894,188 @@ async def _broadcast_payment_event(
     is_confirm: bool,
     actor_user_id: int,
 ) -> None:
-    """
-    Sends payment confirmation or accidental-payment reversion notifications
-    to Student, Father, Mother, Teacher, and Group chat.
-    """
     sheets = get_sheets_manager()
+    student_id = str(student.get("Talaba_ID") or "").strip()
+    if student_id:
+        fresh_student = await sheets.a_get_student_by_id(student_id)
+        if fresh_student:
+            student = fresh_student
+
+    all_students = await sheets.a_get_all_students()
+    all_groups = await sheets.a_get_all_groups()
     group = await sheets.a_get_group(group_name)
-    stu_name = student.get("F.I.O.", "").strip() or student.get("Talaba_ID", "")
+    default_fee = _get_default_monthly_fee()
+    group_fees = {
+        g.get("Guruh_Nomi", "").strip().lower(): _parse_group_fee(g)
+        for g in all_groups
+    }
+    monthly_fee = group_fees.get(group_name.strip().lower(), _parse_group_fee(group))
+    stu_name = str(student.get("F.I.O.") or student_id).strip()
+
+    def _signature(target_lang: str) -> str:
+        """Payment confirmations / reversals always carry the official center signature."""
+        return _lt("signature_center", target_lang)
 
     stu_key = "payment_confirmed_student" if is_confirm else "payment_reverted_student"
     par_key = "payment_confirmed_parent" if is_confirm else "payment_reverted_parent"
     tch_key = "payment_confirmed_teacher" if is_confirm else "payment_reverted_teacher"
-    grp_key = "payment_confirmed_group" if is_confirm else "payment_reverted_group"
 
-    # 1. Student DM
-    stu_cid_str = str(student.get("Talaba_Chat_ID", "")).strip()
-    stu_cid = int(stu_cid_str) if stu_cid_str.lstrip("-").isdigit() else None
-    if stu_cid:
+    try:
+        legacy_rows = await get_legacy_debts(student_id) if student_id else []
+    except Exception:
+        logger.exception("Failed loading legacy debts for %s", student_id)
+        legacy_rows = []
+
+    failed_deliveries: list[tuple[int, str]] = []
+
+    stu_cid = _parse_chat_id(student.get("Talaba_Chat_ID"))
+    if stu_cid is not None:
         try:
             s_lang = await get_user_lang(stu_cid)
+            s_prefix = (
+                dual_role_header("student", s_lang)
+                if await has_dual_student_parent_role(stu_cid)
+                else ""
+            )
+            stu_name_line = (
+                f"👤 Талаба: <b>{html.escape(stu_name)}</b>\n"
+                if s_lang == "cyrl"
+                else f"👤 Talaba: <b>{html.escape(stu_name)}</b>\n"
+            )
+            stu_body = t(
+                stu_key,
+                s_lang,
+                group=html.escape(group_name),
+                cycle_title=html.escape(cycle_title),
+                student_name=html.escape(stu_name),
+            )
+            first_break = stu_body.find("\n\n")
+            if first_break != -1 and html.escape(stu_name) not in stu_body:
+                stu_body = (
+                    stu_body[: first_break + 2] + stu_name_line + stu_body[first_break + 2 :]
+                )
             await bot.send_message(
                 chat_id=stu_cid,
-                text=t(
-                    stu_key,
-                    s_lang,
-                    group=html.escape(group_name),
-                    cycle_title=html.escape(cycle_title),
-                )
-                + _lt("signature", s_lang),
+                text=s_prefix + stu_body + _signature(s_lang),
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception(
+                "Failed to send payment notification to student chat_id=%s student=%s",
+                stu_cid,
+                stu_name,
+            )
+            failed_deliveries.append((stu_cid, f"student: {exc}"))
 
-    # 2. Father & Mother DMs (plus OtaOna_Chat_ID fallback)
-    notified_parents: set[int] = set()
+    parent_cids: set[int] = set()
     for col in ("Otasi_Chat_ID", "Onasi_Chat_ID", "OtaOna_Chat_ID"):
-        raw = str(student.get(col, "")).strip()
-        if not raw.lstrip("-").isdigit():
-            continue
-        p_cid = int(raw)
+        p_cid = _parse_chat_id(student.get(col))
+        if p_cid is not None:
+            parent_cids.add(p_cid)
+
+    src_phones = {
+        p
+        for p in (
+            _normalize_phone_key(student.get("Otasi_Tel")),
+            _normalize_phone_key(student.get("Onasi_Tel")),
+            _normalize_phone_key(student.get("OtaOna_Tel")),
+        )
+        if p
+    }
+    if src_phones:
+        for row in all_students:
+            row_phones = {
+                p
+                for p in (
+                    _normalize_phone_key(row.get("Otasi_Tel")),
+                    _normalize_phone_key(row.get("Onasi_Tel")),
+                    _normalize_phone_key(row.get("OtaOna_Tel")),
+                )
+                if p
+            }
+            if src_phones & row_phones:
+                for col in ("Otasi_Chat_ID", "Onasi_Chat_ID", "OtaOna_Chat_ID"):
+                    sib_p_cid = _parse_chat_id(row.get(col))
+                    if sib_p_cid is not None:
+                        parent_cids.add(sib_p_cid)
+
+    failed_parents: list[tuple[int, str]] = failed_deliveries
+    notified_parents: set[int] = set()
+    for p_cid in sorted(parent_cids):
         if p_cid == stu_cid or p_cid in notified_parents:
             continue
         notified_parents.add(p_cid)
         try:
             p_lang = await get_user_lang(p_cid)
+            p_prefix = (
+                dual_role_header("parent", p_lang, [stu_name])
+                if await has_dual_student_parent_role(p_cid)
+                else ""
+            )
+            base_par_text = t(
+                par_key,
+                p_lang,
+                student_name=html.escape(stu_name),
+                group=html.escape(group_name),
+                cycle_title=html.escape(cycle_title),
+            )
+            context_block = _build_parent_payment_context_lines(
+                target_student=student,
+                group_name=group_name,
+                monthly_fee=monthly_fee,
+                parent_cid=p_cid,
+                all_students=all_students,
+                group_fees=group_fees,
+                default_fee=default_fee,
+                is_confirm=is_confirm,
+                lang=p_lang,
+                legacy_rows=legacy_rows,
+            )
             await bot.send_message(
                 chat_id=p_cid,
-                text=t(
-                    par_key,
-                    p_lang,
-                    student_name=html.escape(stu_name),
-                    group=html.escape(group_name),
-                    cycle_title=html.escape(cycle_title),
-                )
-                + _lt("signature", p_lang),
+                text=f"{p_prefix}{base_par_text}\n\n{context_block}{_signature(p_lang)}",
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception(
+                "Failed to send payment notification to parent chat_id=%s student=%s",
+                p_cid,
+                stu_name,
+            )
+            failed_parents.append((p_cid, f"parent: {exc}"))
 
-    # 3. Teacher DM
+    if failed_parents:
+        await _notify_admins_delivery_failure(
+            bot=bot,
+            actor_user_id=actor_user_id,
+            student_name=stu_name,
+            group_name=group_name,
+            failed_parents=failed_parents,
+        )
+
     if group:
-        tch_cid_str = str(group.get("Ustoz_Chat_ID", "")).strip()
-        if tch_cid_str.lstrip("-").isdigit():
-            t_cid = int(tch_cid_str)
-            if t_cid != actor_user_id:
-                try:
-                    t_lang = await get_user_lang(t_cid)
-                    await bot.send_message(
-                        chat_id=t_cid,
-                        text=t(
-                            tch_key,
-                            t_lang,
-                            student_name=html.escape(stu_name),
-                            group=html.escape(group_name),
-                            cycle_title=html.escape(cycle_title),
-                        )
-                        + _lt("signature", t_lang),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-
-        # 4. Group Telegram Chat (Latin script)
-        grp_tg_str = str(group.get("Guruh_TG_Chat_ID", "")).strip()
-        if grp_tg_str.lstrip("-").isdigit():
+        t_cid = _parse_chat_id(group.get("Ustoz_Chat_ID"))
+        if t_cid is not None and t_cid != actor_user_id and t_cid != stu_cid and t_cid not in notified_parents:
             try:
+                t_lang = await get_user_lang(t_cid)
                 await bot.send_message(
-                    chat_id=int(grp_tg_str),
+                    chat_id=t_cid,
                     text=t(
-                        grp_key,
-                        "latn",
+                        tch_key,
+                        t_lang,
                         student_name=html.escape(stu_name),
                         group=html.escape(group_name),
                         cycle_title=html.escape(cycle_title),
                     )
-                    + _lt("signature", "latn"),
+                    + _signature(t_lang),
                     parse_mode="HTML",
                 )
             except Exception:
-                pass
+                logger.exception(
+                    "Failed to send payment notification to teacher chat_id=%s student=%s",
+                    t_cid,
+                    stu_name,
+                )
 
 
 # ----------------------------------------------------------------------
@@ -1113,35 +1569,175 @@ async def cb_payment_pending_cancel(callback: CallbackQuery) -> None:
 
 
 # ----------------------------------------------------------------------
-# 2. Student & Parent: "💳 To'lovlar va Qarzlar"
+# 2. Student & Parent: "💳 To'lovlar va Qarzlar" (Strictly Single Message)
 # ----------------------------------------------------------------------
 
 
-def _find_student_by_any_chat_sync(user_id: int) -> Optional[dict[str, Any]]:
+def _find_role_linked_students_sync(
+    user_id: int, fallback_student_id: Optional[str] = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sheets = get_sheets_manager()
-    res = sheets.get_student_by_chat_id(user_id)
-    if res:
-        return res[0]
-    target = str(user_id).strip()
-    for s in sheets.get_all_students():
-        if (
-            str(s.get("Otasi_Chat_ID", "")).strip() == target
-            or str(s.get("Onasi_Chat_ID", "")).strip() == target
-        ):
-            return s
-    return None
+    target = _parse_chat_id(user_id)
+    self_students: list[dict[str, Any]] = []
+    parent_children: list[dict[str, Any]] = []
+    seen_self: set[tuple[str, str]] = set()
+    seen_parent: set[tuple[str, str]] = set()
+
+    all_rows = sheets.get_all_students()
+    for s in all_rows:
+        sid = str(s.get("Talaba_ID", "")).strip()
+        grp = str(s.get("Guruh", "")).strip().lower()
+        if not sid:
+            continue
+        key = (sid, grp)
+
+        stu_cid = _parse_chat_id(s.get("Talaba_Chat_ID"))
+        parent_cids = {
+            cid
+            for cid in (
+                _parse_chat_id(s.get("Otasi_Chat_ID")),
+                _parse_chat_id(s.get("Onasi_Chat_ID")),
+                _parse_chat_id(s.get("OtaOna_Chat_ID")),
+            )
+            if cid is not None
+        }
+
+        if target is not None and stu_cid == target and key not in seen_self:
+            seen_self.add(key)
+            self_students.append(s)
+
+        if target is not None and target in parent_cids and key not in seen_parent:
+            seen_parent.add(key)
+            parent_children.append(s)
+
+    if not self_students and not parent_children and fallback_student_id:
+        single = sheets.get_student_by_id(fallback_student_id)
+        if single:
+            parent_children.append(single)
+
+    return self_students, parent_children
 
 
-async def _resolve_linked_student(user_id: int) -> Optional[dict[str, Any]]:
+async def _send_combined_debt_view(
+    message: Message,
+    students: list[dict[str, Any]],
+    lang: str,
+    audience: str,
+    recipient_name: str = "",
+) -> None:
+    """
+    Student / Parent "💳 To'lovlarim" view: polite short summary (total sum +
+    total months, legacy + current cycles combined) with an inline
+    📄 Batafsil / 📋 Qisqacha toggle listing every unpaid cycle and its exact
+    lesson dates.
+    """
     sheets = get_sheets_manager()
-    db_user = await get_user(user_id)
-    if db_user and db_user.get("linked_student_id"):
-        student = await asyncio.to_thread(
-            sheets.get_student_by_id, db_user["linked_student_id"]
+    all_groups = await asyncio.to_thread(sheets.get_all_groups)
+    group_fees = {
+        g.get("Guruh_Nomi", "").strip().lower(): _parse_group_fee(g)
+        for g in all_groups
+    }
+    default_fee = _get_default_monthly_fee()
+    card_number, card_owner = _get_payment_card_info()
+
+    children = await compute_children_debts(sheets, students, group_fees, default_fee)
+    user_id = message.from_user.id if message.from_user else 0
+    prefix = ""
+    if user_id and await has_dual_student_parent_role(user_id):
+        prefix = dual_role_header(
+            "parent" if audience == "parent" else "student",
+            lang,
+            [str(s.get("F.I.O.") or "") for s in students],
         )
-        if student:
-            return student
-    return await asyncio.to_thread(_find_student_by_any_chat_sync, user_id)
+    short_text, detailed_text = build_debt_notice(
+        children,
+        lang,
+        audience=audience,
+        card_number=card_number,
+        card_owner=card_owner,
+        recipient_name=recipient_name,
+        header_key="header_view",
+        prefix=prefix,
+    )
+    if detailed_text != short_text:
+        notif_id = f"dbt{uuid.uuid4().hex[:12]}_{lang}"
+        await save_notification_details(notif_id, short_text, detailed_text)
+        await message.answer(
+            short_text,
+            reply_markup=build_expandable_notif_kb(notif_id, expanded=False, lang=lang),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    else:
+        await message.answer(short_text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _build_parent_payments_text(
+    children_debts: list[dict[str, Any]],
+    lang: str,
+    card_number: str = "",
+    card_owner: str = "",
+) -> str:
+    """
+    Plain-language single summary for parents (no Batafsil/Qisqacha toggle):
+    every child's group, monthly fee, paid/unpaid status, individual debt and
+    the total debt across all children.
+    """
+    blocks: list[str] = []
+    total_debt = 0
+    for idx, child in enumerate(children_debts, 1):
+        child_debt = int(child.get("total_sum") or 0)
+        total_debt += child_debt
+        status_key = (
+            "parent_pay_status_unpaid" if child_debt > 0 else "parent_pay_status_paid"
+        )
+        blocks.append(
+            t(
+                "parent_pay_child",
+                lang,
+                tartib=idx,
+                talaba_ismi=html.escape(str(child.get("name") or "—")),
+                guruh_nomi=html.escape(str(child.get("group") or "—")),
+                oylik_tolov=debt_format_uzs(int(child.get("fee") or 0)),
+                tolov_holati=t(status_key, lang),
+                qarz_summasi=debt_format_uzs(child_debt),
+            )
+        )
+    text = t("parent_pay_header", lang) + t("parent_pay_separator", lang).join(blocks)
+    text += t("parent_pay_total", lang, umumiy_qarz=debt_format_uzs(total_debt))
+    if total_debt > 0 and card_number:
+        text += "\n\n" + debt_text(
+            "card_block",
+            lang,
+            card_number=html.escape(card_number),
+            card_owner=html.escape(card_owner or "—"),
+        )
+    return text
+
+
+async def _send_parent_payments_single_message(
+    message: Message,
+    children: list[dict[str, Any]],
+    lang: str,
+) -> None:
+    sheets = get_sheets_manager()
+    group_fees, default_fee = await load_group_fees(sheets)
+    card_number, card_owner = _get_payment_card_info()
+    children_debts = await compute_children_debts(
+        sheets, children, group_fees, default_fee
+    )
+    user_id = message.from_user.id if message.from_user else 0
+    prefix = ""
+    if user_id and await has_dual_student_parent_role(user_id):
+        prefix = dual_role_header(
+            "parent", lang, [str(c.get("F.I.O.") or "") for c in children]
+        )
+    text = prefix + _build_parent_payments_text(
+        children_debts, lang, card_number=card_number, card_owner=card_owner
+    )
+    await message.answer(
+        text[:4090], parse_mode="HTML", disable_web_page_preview=True
+    )
 
 
 @router.message(F.text.in_(STUDENT_PARENT_PAYMENTS_TEXTS))
@@ -1151,88 +1747,37 @@ async def cmd_student_parent_payments(message: Message) -> None:
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
 
-    student = await _resolve_linked_student(user_id)
-    if not student:
-        await message.answer(t("unregistered_user", lang))
-        return
+    db_user = await get_user(user_id)
+    active_role = db_user.get("role") if db_user else None
+    fallback_sid = db_user.get("linked_student_id") if db_user else None
 
-    sheets = get_sheets_manager()
-    student_id = student["Talaba_ID"]
-    student_name = student["F.I.O."]
-    group_name = student.get("Guruh", "")
-    group = await sheets.a_get_group(group_name) if group_name else None
-    monthly_fee = _parse_group_fee(group)
-    fee_fmt = _format_uzs(monthly_fee)
-    card_number, card_owner = _get_payment_card_info()
+    try:
+        self_students, parent_children = await asyncio.to_thread(
+            _find_role_linked_students_sync, user_id, fallback_sid
+        )
 
-    debt_raw = student.get("Qarzdor_Oylar", "").strip()
-    debt_titles = {
-        x.strip()
-        for x in debt_raw.split(";")
-        if x.strip() and x.strip() != "0" and not x.strip().isdigit()
-    }
-    debt_count = _count_debt_months(debt_raw)
+        if active_role == "parent" or (parent_children and active_role != "student"):
+            target_children = parent_children or self_students
+            if not target_children:
+                await message.answer(t("unregistered_user", lang))
+                return
+            await _send_parent_payments_single_message(message, target_children, lang)
+            return
 
-    header_text = t(
-        "student_payments_header",
-        lang,
-        student_name=html.escape(student_name),
-        group=html.escape(group_name),
-        card_number=html.escape(card_number),
-        card_owner=html.escape(card_owner),
-    )
-    header_text = f"{header_text}\n{_lt('fee_summary_line', lang, fee=fee_fmt)}"
-    if debt_count > 0:
-        header_text += "\n" + _lt(
-            "debt_summary_line",
+        students = self_students or parent_children
+        if not students:
+            await message.answer(t("unregistered_user", lang))
+            return
+        await _send_combined_debt_view(
+            message,
+            students,
             lang,
-            months=debt_count,
-            fee=fee_fmt,
-            total=_format_uzs(debt_count * monthly_fee),
-            cycles=html.escape(debt_raw),
+            audience="student",
+            recipient_name=str(students[0].get("F.I.O.") or "").strip(),
         )
-    await message.answer(header_text, parse_mode="HTML")
-
-    cycles = await asyncio.to_thread(
-        _fetch_full_cycle_history_sync, group_name, student_id
-    )
-
-    shown_any = False
-    for idx, cycle in enumerate(cycles):
-        if cycle["is_paid"]:
-            continue
-        status_label = _get_student_cycle_status_label(cycle, debt_titles, lang)
-        text = _format_student_cycle_text(
-            cycle,
-            status_label,
-            False,
-            lang,
-            monthly_fee=monthly_fee,
-            debt_raw=debt_raw,
-        )
-        await message.answer(
-            text,
-            reply_markup=student_payment_detail_kb(student_id, idx, False, lang),
-            parse_mode="HTML",
-        )
-        shown_any = True
-
-    existing_titles = {c["cycle_title"] for c in cycles}
-    for debt_title in sorted(debt_titles):
-        if debt_title not in existing_titles:
-            item_text = t(
-                "student_payment_cycle_compact",
-                lang,
-                cycle_title=html.escape(debt_title),
-                next_payment_info="—",
-                status_label=t("status_unpaid", lang),
-            )
-            item_text = f"{item_text}\n{_lt('cycle_fee_line', lang, fee=fee_fmt)}"
-            await message.answer(item_text, parse_mode="HTML")
-            shown_any = True
-
-    if not shown_any:
-        await message.answer(t("no_debts_msg", lang))
+    except Exception:
+        logger.exception("Failed building payments view for user_id=%s", user_id)
+        await message.answer(t("error_generic", lang))
 
 
 @router.callback_query(F.data.startswith("stu_pay_toggle:"))
@@ -1291,7 +1836,7 @@ async def cb_student_payment_toggle(callback: CallbackQuery) -> None:
 
 
 # ----------------------------------------------------------------------
-# 3. Teacher / Admin: "⚠️ Qarzdorlar"
+# 3. Teacher / Admin: "⚠️ Qarzdorlar" + Smart Multi-Child Debt Broadcast
 # ----------------------------------------------------------------------
 
 
@@ -1308,6 +1853,7 @@ async def _fetch_authorized_debtors_and_fees(
 
     if is_admin:
         debtors = await asyncio.to_thread(sheets.get_debtors, None)
+        debtors = await _augment_debtors_with_legacy(sheets, debtors, None)
         return True, debtors, group_fees
 
     raw_groups = await asyncio.to_thread(sheets.get_teacher_groups, user_id)
@@ -1328,7 +1874,48 @@ async def _fetch_authorized_debtors_and_fees(
         for d in all_debtors
         if d.get("Guruh", "").strip().lower() in allowed_groups
     ]
+    debtors = await _augment_debtors_with_legacy(sheets, debtors, allowed_groups)
     return True, debtors, group_fees
+
+
+async def _augment_debtors_with_legacy(
+    sheets: SheetsManager,
+    debtors: list[dict[str, Any]],
+    allowed_groups: Optional[set[str]],
+) -> list[dict[str, Any]]:
+    """
+    Adds students who owe ONLY pre-system (legacy) debts to the debtor list and
+    attaches `_legacy_rows` to every debtor so totals include legacy cycles.
+    """
+    try:
+        legacy_map = await get_unpaid_legacy_debts_map()
+    except Exception:
+        logger.exception("Failed loading legacy debts map")
+        legacy_map = {}
+    result = list(debtors)
+    known = {str(d.get("Talaba_ID", "")).strip() for d in result}
+    if legacy_map:
+        all_students = await sheets.a_get_all_students()
+        by_id = {str(s.get("Talaba_ID", "")).strip(): s for s in all_students}
+        for sid in legacy_map:
+            if sid in known or sid not in by_id:
+                continue
+            stu = by_id[sid]
+            grp_key = str(stu.get("Guruh", "")).strip().lower()
+            sobiq_key = str(stu.get("Sobiq_Guruh", "")).strip().lower()
+            if allowed_groups is not None and not (
+                grp_key in allowed_groups or sobiq_key in allowed_groups
+            ):
+                continue
+            enriched = dict(stu)
+            enriched.setdefault("total_held_lessons", 0)
+            enriched.setdefault("attended_lessons", 0)
+            enriched.setdefault("missed_lessons", 0)
+            result.append(enriched)
+            known.add(sid)
+    for d in result:
+        d["_legacy_rows"] = legacy_map.get(str(d.get("Talaba_ID", "")).strip(), [])
+    return result
 
 
 @router.message(F.text.in_(DEBTORS_MENU_TEXTS))
@@ -1348,59 +1935,123 @@ async def cmd_debtors_list(message: Message) -> None:
         await message.answer(t("debtors_empty", lang))
         return
 
+    sheets = get_sheets_manager()
     default_fee = _get_default_monthly_fee()
     header = t("debtors_list_header", lang)
     lines: list[str] = []
     grand_total = 0
+
+    legacy_map_local = {
+        str(d.get("Talaba_ID", "")).strip(): list(d.get("_legacy_rows") or [])
+        for d in debtors
+    }
+    try:
+        child_debts = await compute_children_debts(
+            sheets, debtors, group_fees, default_fee, legacy_map=legacy_map_local
+        )
+    except Exception:
+        logger.exception("Failed computing combined debts for debtor list")
+        child_debts = []
+    child_by_sid = {c["student_id"]: c for c in child_debts}
 
     for d in debtors:
         name = html.escape(d.get("F.I.O.", ""))
         group_name = d.get("Guruh", "")
         group = html.escape(group_name)
         debts_raw = d.get("Qarzdor_Oylar", "").strip()
-        debts = html.escape(debts_raw)
-        stu_phone = html.escape(d.get("Talaba_Tel", "") or "—")
-        father_phone = d.get("Otasi_Tel", "").strip()
-        mother_phone = d.get("Onasi_Tel", "").strip()
-        fallback_par = d.get("OtaOna_Tel", "").strip()
 
         fee = group_fees.get(group_name.strip().lower(), default_fee)
-        months = _count_debt_months(debts_raw)
+        child = child_by_sid.get(str(d.get("Talaba_ID", "")).strip())
+        months = child["total_months"] if child else _count_debt_months(debts_raw)
         if months <= 0:
             continue
-        total_debt = months * fee
+        total_debt = child["total_sum"] if child else months * fee
         grand_total += total_debt
+        if not debts_raw or debts_raw == "0":
+            debts_raw = (
+                "Аввалги қарз" if lang == "cyrl" else "Avvalgi qarz"
+            ) if child and child["legacy"] else debts_raw
+
+        stats = await _resolve_debtor_stats(sheets, d, group_name)
+        cycle_title = str(stats.get("cycle_title") or "").strip()
+        debts_display = (
+            f"{debts_raw} ({cycle_title})"
+            if debts_raw.isdigit() and cycle_title
+            else debts_raw
+        )
+        debts = html.escape(debts_display)
+        lesson_stats_line = _format_lesson_attendance_stats(
+            stats["total_held_lessons"],
+            stats["attended_lessons"],
+            stats["missed_lessons"],
+            lang,
+        )
+
+        stu_phone_link = _format_tel_link(d.get("Talaba_Tel", ""))
+        stu_tg_link = _format_tg_link(
+            d.get("Talaba_TG", ""),
+            d.get("Talaba_Chat_ID", ""),
+            fallback_label="Talaba TG" if lang == "latn" else "Талаба TG",
+        )
 
         par_parts: list[str] = []
-        if father_phone:
-            par_parts.append(f"Otasi: {html.escape(father_phone)}")
-        if mother_phone:
-            par_parts.append(f"Onasi: {html.escape(mother_phone)}")
+        father_phone = str(d.get("Otasi_Tel") or "").strip()
+        father_cid = _parse_chat_id(d.get("Otasi_Chat_ID"))
+        if father_phone or father_cid is not None:
+            lbl = "Otasi" if lang == "latn" else "Отаси"
+            f_tel = _format_tel_link(father_phone)
+            f_tg = _format_tg_link("", father_cid, fallback_label=lbl)
+            f_info = f"{lbl}: {f_tel}"
+            if f_tg != "—":
+                f_info += f" ({f_tg})"
+            par_parts.append(f_info)
+
+        mother_phone = str(d.get("Onasi_Tel") or "").strip()
+        mother_cid = _parse_chat_id(d.get("Onasi_Chat_ID"))
+        if mother_phone or mother_cid is not None:
+            lbl = "Onasi" if lang == "latn" else "Онаси"
+            m_tel = _format_tel_link(mother_phone)
+            m_tg = _format_tg_link("", mother_cid, fallback_label=lbl)
+            m_info = f"{lbl}: {m_tel}"
+            if m_tg != "—":
+                m_info += f" ({m_tg})"
+            par_parts.append(m_info)
+
         if not par_parts:
-            par_parts.append(html.escape(fallback_par or "—"))
+            fallback_par = str(d.get("OtaOna_Tel") or "").strip()
+            fallback_cid = _parse_chat_id(d.get("OtaOna_Chat_ID"))
+            if fallback_par or fallback_cid is not None:
+                lbl = "Ota-ona" if lang == "latn" else "Ота-она"
+                p_tel = _format_tel_link(fallback_par)
+                p_tg = _format_tg_link("", fallback_cid, fallback_label=lbl)
+                p_info = f"{lbl}: {p_tel}"
+                if p_tg != "—":
+                    p_info += f" ({p_tg})"
+                par_parts.append(p_info)
+            else:
+                par_parts.append("—")
 
-        tg_raw = d.get("Talaba_TG", "").strip()
-        if tg_raw and not tg_raw.startswith("@"):
-            tg_raw = f"@{tg_raw}"
-        tg_display = html.escape(tg_raw) if tg_raw else "—"
-
-        base_line = t(
-            "debtor_item",
-            lang,
-            student_name=name,
-            group=group,
-            debts=debts,
-            phone=stu_phone,
-        )
-        amount_part = _lt(
-            "debtor_amount_part",
-            lang,
-            months=months,
-            fee=_format_uzs(fee),
-            total=_format_uzs(total_debt),
-        )
+        if child and child["legacy_sum"]:
+            amount_part = (
+                f"💰 <b>{months} ой — {_format_uzs(total_debt)} сўм</b>"
+                if lang == "cyrl"
+                else f"💰 <b>{months} oy — {_format_uzs(total_debt)} so‘m</b>"
+            )
+        else:
+            amount_part = _lt(
+                "debtor_amount_part",
+                lang,
+                months=months,
+                fee=_format_uzs(fee),
+                total=_format_uzs(total_debt),
+            )
+        extra_lines = format_admin_extra_lines(child, lang) if child else ""
         lines.append(
-            f"{base_line} | {amount_part} | {' / '.join(par_parts)} | {tg_display}"
+            f"• <b>{name}</b> ({group}) — <i>{debts}</i> | {amount_part}\n"
+            f"  {lesson_stats_line}\n"
+            + (f"{extra_lines}\n" if extra_lines else "")
+            + f"  📞 {stu_phone_link} | 💬 {stu_tg_link}\n"
+            f"  👨‍👩‍👧 {' | '.join(par_parts)}"
         )
 
     if not lines:
@@ -1431,7 +2082,7 @@ async def cmd_debtors_list(message: Message) -> None:
     current_chunk = header
     for line in lines:
         addition = f"\n{line}"
-        if len(current_chunk) + len(addition) > 3900:
+        if len(current_chunk) + len(addition) > 3800:
             chunks.append(current_chunk)
             current_chunk = line
         else:
@@ -1444,7 +2095,98 @@ async def cmd_debtors_list(message: Message) -> None:
             chunk,
             reply_markup=(remind_kb if idx == len(chunks) - 1 else None),
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
+
+
+def _format_parent_debt_reminder_text(
+    grouped_by_group: dict[str, list[dict[str, Any]]],
+    target_lang: str,
+    card_number: str,
+    card_owner: str,
+) -> str:
+    if len(grouped_by_group) == 1:
+        items = next(iter(grouped_by_group.values()))
+        group_name = items[0]["group_name"]
+        fee = items[0]["fee"]
+        if len(items) == 1:
+            it = items[0]
+            return (
+                t(
+                    "reminder_weekly_debt_parent",
+                    target_lang,
+                    student_name=html.escape(it["student_name"]),
+                    group=html.escape(group_name),
+                    debts=html.escape(it["debts_raw"]),
+                    card_number=html.escape(card_number),
+                    card_owner=html.escape(card_owner),
+                )
+                + (
+                    f"\n💰 {it['months']} oy × {_format_uzs(fee)} = <b>{_format_uzs(it['total'])} so‘m</b>"
+                    if target_lang == "latn"
+                    else f"\n💰 {it['months']} ой × {_format_uzs(fee)} = <b>{_format_uzs(it['total'])} сўм</b>"
+                )
+                + _lt("signature_center", target_lang)
+            )
+
+        child_lines = "\n".join(
+            f"{idx}. <b>{html.escape(it['student_name'])}</b> — "
+            f"<i>{html.escape(it['debts_raw'])}</i> "
+            f"({it['months']} {'ой' if target_lang == 'cyrl' else 'oy'} = "
+            f"<b>{_format_uzs(it['total'])} {'сўм' if target_lang == 'cyrl' else 'so‘m'}</b>)"
+            for idx, it in enumerate(items, start=1)
+        )
+        total_sum = sum(it["total"] for it in items)
+        return _lt(
+            "reminder_parent_same_group",
+            target_lang,
+            group=html.escape(group_name),
+            fee=_format_uzs(fee),
+            child_count=len(items),
+            children_lines=child_lines,
+            total=_format_uzs(total_sum),
+            card_number=html.escape(card_number),
+            card_owner=html.escape(card_owner),
+        )
+
+    group_blocks: list[str] = []
+    grand_total = 0
+    for items in grouped_by_group.values():
+        group_name = items[0]["group_name"]
+        fee = items[0]["fee"]
+        group_sum = sum(it["total"] for it in items)
+        grand_total += group_sum
+        child_lines = "\n".join(
+            f"   • <b>{html.escape(it['student_name'])}</b> — "
+            f"<i>{html.escape(it['debts_raw'])}</i> "
+            f"({it['months']} {'ой' if target_lang == 'cyrl' else 'oy'} = "
+            f"<b>{_format_uzs(it['total'])} {'сўм' if target_lang == 'cyrl' else 'so‘m'}</b>)"
+            for it in items
+        )
+        if target_lang == "cyrl":
+            block = (
+                f"📚 <b>{html.escape(group_name)}</b> "
+                f"(Ойлик тўлов: <b>{_format_uzs(fee)} сўм</b>)\n"
+                f"{child_lines}\n"
+                f"   💰 Гуруҳ жами: <b>{_format_uzs(group_sum)} сўм</b>"
+            )
+        else:
+            block = (
+                f"📚 <b>{html.escape(group_name)}</b> "
+                f"(Oylik to‘lov: <b>{_format_uzs(fee)} so‘m</b>)\n"
+                f"{child_lines}\n"
+                f"   💰 Guruh jami: <b>{_format_uzs(group_sum)} so‘m</b>"
+            )
+        group_blocks.append(block)
+
+    return _lt(
+        "reminder_parent_multi_group",
+        target_lang,
+        groups_blocks="\n\n".join(group_blocks),
+        grand_total=_format_uzs(grand_total),
+        card_number=html.escape(card_number),
+        card_owner=html.escape(card_owner),
+    )
 
 
 @router.callback_query(F.data == "debt_remind_all")
@@ -1465,76 +2207,364 @@ async def cb_remind_all_debtors(callback: CallbackQuery) -> None:
         await callback.answer(t("debtors_empty", lang), show_alert=True)
         return
 
+    sheets = get_sheets_manager()
+    all_students = await sheets.a_get_all_students()
     default_fee = _get_default_monthly_fee()
     card_number, card_owner = _get_payment_card_info()
-    stu_sent = 0
-    par_sent = 0
+    # Teacher-initiated reminders are signed by the teacher; admin ones officially.
+    actor_teacher_name = (
+        "" if await _is_admin(user_id) else await _resolve_actor_teacher_name(user_id, None)
+    )
+
+    # Map normalized parent phone -> known parent chat IDs across all students
+    phone_to_parent_cids: dict[str, set[int]] = {}
+    for row in all_students:
+        for chat_col, tel_col in (
+            ("Otasi_Chat_ID", "Otasi_Tel"),
+            ("Onasi_Chat_ID", "Onasi_Tel"),
+            ("OtaOna_Chat_ID", "OtaOna_Tel"),
+        ):
+            c_id = _parse_chat_id(row.get(chat_col))
+            p_key = _normalize_phone_key(row.get(tel_col))
+            if c_id is not None and p_key:
+                phone_to_parent_cids.setdefault(p_key, set()).add(c_id)
+
+    parent_buckets: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    parent_meta: dict[int, dict[str, Any]] = {}
+    parent_cids_by_student: dict[str, set[int]] = {}
+    student_entries: dict[int, list[dict[str, Any]]] = {}
+
+    legacy_map_local = {
+        str(d.get("Talaba_ID", "")).strip(): list(d.get("_legacy_rows") or [])
+        for d in debtors
+    }
+    try:
+        child_debts = await compute_children_debts(
+            sheets, debtors, group_fees, default_fee, legacy_map=legacy_map_local
+        )
+    except Exception:
+        logger.exception("Failed computing combined debts for reminders")
+        child_debts = []
+    child_by_sid = {c["student_id"]: c for c in child_debts}
 
     for d in debtors:
-        stu_name = d.get("F.I.O.", "").strip() or d.get("Talaba_ID", "")
+        stu_id = str(d.get("Talaba_ID", "")).strip()
+        stu_name = d.get("F.I.O.", "").strip() or stu_id
         group_name = d.get("Guruh", "").strip()
         debts_raw = d.get("Qarzdor_Oylar", "").strip()
-        months = _count_debt_months(debts_raw)
+        child_debt = child_by_sid.get(stu_id)
+        months = (
+            child_debt["total_months"] if child_debt else _count_debt_months(debts_raw)
+        )
         if months <= 0:
             continue
 
-        fee = group_fees.get(group_name.lower(), default_fee)
-        total = months * fee
+        stats = await _resolve_debtor_stats(sheets, d, group_name)
+        cycle_title = str(stats.get("cycle_title") or "").strip()
+        debts_display = (
+            f"{debts_raw} ({cycle_title})"
+            if debts_raw.isdigit() and cycle_title
+            else debts_raw
+        )
 
-        def _build_reminder(target_lang: str) -> str:
-            return _lt(
-                "reminder_student",
-                target_lang,
-                student_name=html.escape(stu_name),
-                group=html.escape(group_name),
-                cycles=html.escape(debts_raw),
-                months=months,
-                fee=_format_uzs(fee),
-                total=_format_uzs(total),
-                card_number=html.escape(card_number),
-                card_owner=html.escape(card_owner),
+        fee = group_fees.get(group_name.lower(), default_fee)
+        total = child_debt["total_sum"] if child_debt else months * fee
+        item = {
+            "student_id": stu_id,
+            "student_name": stu_name,
+            "group_name": group_name,
+            "debts_raw": debts_display,
+            "months": months,
+            "fee": fee,
+            "total": total,
+            "stu_tel": d.get("Talaba_Tel", "").strip(),
+            "stu_tg": d.get("Talaba_TG", "").strip(),
+            "total_held_lessons": stats["total_held_lessons"],
+            "attended_lessons": stats["attended_lessons"],
+            "missed_lessons": stats["missed_lessons"],
+        }
+
+        stu_cid = _parse_chat_id(d.get("Talaba_Chat_ID"))
+
+        seen_parents_for_student: set[int] = set()
+        seen_item_keys_for_parent: set[tuple[int, str, str]] = set()
+        for col, role_latn, role_cyrl, tel_col, name_col in (
+            ("Otasi_Chat_ID", "Otasi", "Отаси", "Otasi_Tel", "Otasi_FIO"),
+            ("Onasi_Chat_ID", "Onasi", "Онаси", "Onasi_Tel", "Onasi_FIO"),
+            ("OtaOna_Chat_ID", "Ota-ona", "Ота-она", "OtaOna_Tel", "Otasi_FIO"),
+        ):
+            candidate_cids: list[int] = []
+            direct_cid = _parse_chat_id(d.get(col))
+            if direct_cid is not None:
+                candidate_cids.append(direct_cid)
+            else:
+                p_key = _normalize_phone_key(d.get(tel_col))
+                if p_key and p_key in phone_to_parent_cids:
+                    candidate_cids.extend(sorted(phone_to_parent_cids[p_key]))
+
+            for p_cid in candidate_cids:
+                if p_cid in seen_parents_for_student:
+                    continue
+                seen_parents_for_student.add(p_cid)
+                parent_cids_by_student.setdefault(stu_id, set()).add(p_cid)
+
+                dedup_item_key = (p_cid, stu_id, group_name.lower())
+                if dedup_item_key in seen_item_keys_for_parent:
+                    continue
+                seen_item_keys_for_parent.add(dedup_item_key)
+
+                grp_map = parent_buckets.setdefault(p_cid, {})
+                grp_map.setdefault(group_name.lower(), []).append(item)
+
+                meta = parent_meta.setdefault(
+                    p_cid,
+                    {
+                        "chat_id": p_cid,
+                        "role_latn": role_latn,
+                        "role_cyrl": role_cyrl,
+                        "name": str(d.get(name_col, "")).strip(),
+                        "phone": str(d.get(tel_col, "")).strip(),
+                        "children": [],
+                    },
+                )
+                if not meta["phone"]:
+                    meta["phone"] = str(d.get(tel_col, "")).strip()
+                if not meta["name"]:
+                    meta["name"] = str(d.get(name_col, "")).strip()
+                meta["children"].append(f"{stu_name} ({group_name})")
+
+        if stu_cid is not None and stu_cid not in parent_cids_by_student.get(stu_id, set()):
+            student_entries.setdefault(stu_cid, []).append(item)
+
+    notified_students_lines: list[str] = []
+    notified_parents_lines: list[str] = []
+    stu_sent = 0
+    par_sent = 0
+
+    # 1. Send private reminders to Students (skipping any chat_id already handled as parent for same student)
+    for stu_cid, s_items in student_entries.items():
+        if stu_cid in parent_buckets:
+            s_items = [
+                it
+                for it in s_items
+                if stu_cid not in parent_cids_by_student.get(it["student_id"], set())
+            ]
+            if not s_items:
+                continue
+
+        s_lang = await get_user_lang(stu_cid)
+        s_prefix = (
+            dual_role_header("student", s_lang)
+            if await has_dual_student_parent_role(stu_cid)
+            else ""
+        )
+        s_children = [
+            child_by_sid[it["student_id"]]
+            for it in s_items
+            if it["student_id"] in child_by_sid
+        ]
+        if s_children:
+            s_short, s_detailed = build_debt_notice(
+                s_children,
+                s_lang,
+                audience="student",
+                card_number=card_number,
+                card_owner=card_owner,
+                recipient_name=s_items[0]["student_name"],
+                prefix=s_prefix,
+                teacher_name=actor_teacher_name,
+            )
+        else:
+            grouped_stu: dict[str, list[dict[str, Any]]] = {}
+            for it in s_items:
+                grouped_stu.setdefault(it["group_name"].lower(), []).append(it)
+            s_short = s_detailed = f"{s_prefix}" + _format_parent_debt_reminder_text(
+                grouped_stu, s_lang, card_number, card_owner
             )
 
-        stu_cid_raw = str(d.get("Talaba_Chat_ID", "")).strip()
-        stu_cid = int(stu_cid_raw) if stu_cid_raw.isdigit() else None
-        if stu_cid:
-            try:
-                s_lang = await get_user_lang(stu_cid)
-                await callback.bot.send_message(
-                    chat_id=stu_cid,
-                    text=_build_reminder(s_lang),
-                    parse_mode="HTML",
+        try:
+            delivered = await send_expandable_notice(
+                callback.bot, stu_cid, s_short, s_detailed, s_lang
+            )
+            if not delivered:
+                raise RuntimeError("Telegram delivery failed")
+            stu_sent += 1
+            first = s_items[0]
+            tel_link = _format_tel_link(first["stu_tel"])
+            tg_link = _format_tg_link(
+                first["stu_tg"],
+                stu_cid,
+                fallback_label="Telegram",
+            )
+            for x in s_items:
+                stats_str = _format_lesson_attendance_stats(
+                    x["total_held_lessons"],
+                    x["attended_lessons"],
+                    x["missed_lessons"],
+                    lang,
                 )
-                stu_sent += 1
-            except Exception:
-                pass
-
-        parent_cids: list[int] = []
-        for col in ("Otasi_Chat_ID", "Onasi_Chat_ID", "OtaOna_Chat_ID"):
-            raw = str(d.get(col, "")).strip()
-            if raw.isdigit():
-                cid = int(raw)
-                if cid != stu_cid and cid not in parent_cids:
-                    parent_cids.append(cid)
-
-        for p_cid in parent_cids:
-            try:
-                p_lang = await get_user_lang(p_cid)
-                await callback.bot.send_message(
-                    chat_id=p_cid,
-                    text=_build_reminder(p_lang),
-                    parse_mode="HTML",
+                notified_students_lines.append(
+                    f"• <b>{html.escape(x['student_name'])}</b> ({html.escape(x['group_name'])}) — "
+                    f"<i>{html.escape(x['debts_raw'])}</i> | "
+                    f"<b>{_format_uzs(x['total'])} {'сўм' if lang == 'cyrl' else 'so‘m'}</b>\n"
+                    f"  {stats_str}\n"
+                    f"  📞 {tel_link} | 💬 {tg_link}"
                 )
-                par_sent += 1
-            except Exception:
-                pass
+        except Exception:
+            logger.exception(
+                "Failed to send debt reminder to student chat_id=%s", stu_cid
+            )
+
+    # 2. Send strictly ONE combined private reminder per parent_chat_id
+    for p_cid, grouped_by_group in parent_buckets.items():
+        p_lang = await get_user_lang(p_cid)
+        p_children = [
+            child_by_sid[it["student_id"]]
+            for grp_items in grouped_by_group.values()
+            for it in grp_items
+            if it["student_id"] in child_by_sid
+        ]
+        p_prefix = (
+            dual_role_header(
+                "parent",
+                p_lang,
+                [
+                    str(it.get("student_name") or "")
+                    for grp_items in grouped_by_group.values()
+                    for it in grp_items
+                ],
+            )
+            if await has_dual_student_parent_role(p_cid)
+            else ""
+        )
+        if p_children:
+            p_short, p_detailed = build_debt_notice(
+                p_children,
+                p_lang,
+                audience="parent",
+                card_number=card_number,
+                card_owner=card_owner,
+                prefix=p_prefix,
+                teacher_name=actor_teacher_name,
+            )
+        else:
+            msg_text = _format_parent_debt_reminder_text(
+                grouped_by_group, p_lang, card_number, card_owner
+            )
+            p_short = p_detailed = _safe_truncate_html_lines(
+                f"{p_prefix}{msg_text}", limit=4085
+            )
+
+        try:
+            delivered = await send_expandable_notice(
+                callback.bot, p_cid, p_short, p_detailed, p_lang
+            )
+            if not delivered:
+                raise RuntimeError("Telegram delivery failed")
+            par_sent += 1
+            meta = parent_meta[p_cid]
+            p_name = meta.get("name", "")
+            if not p_name:
+                db_p = await get_user(p_cid)
+                if db_p and db_p.get("full_name"):
+                    p_name = str(db_p["full_name"]).strip()
+            role_lbl = meta["role_cyrl"] if p_lang == "cyrl" else meta["role_latn"]
+            if not p_name:
+                p_name = meta["role_cyrl"] if lang == "cyrl" else meta["role_latn"]
+            else:
+                p_name = f"{p_name} ({role_lbl})"
+
+            grand_p = sum(
+                it["total"]
+                for grp_items in grouped_by_group.values()
+                for it in grp_items
+            )
+            tel_link = _format_tel_link(meta.get("phone", ""))
+            tg_link = _format_tg_link("", p_cid, fallback_label="Telegram")
+            child_detail_lines: list[str] = []
+            for grp_items in grouped_by_group.values():
+                for it in grp_items:
+                    stats_str = _format_lesson_attendance_stats(
+                        it["total_held_lessons"],
+                        it["attended_lessons"],
+                        it["missed_lessons"],
+                        lang,
+                    )
+                    child_detail_lines.append(
+                        f"  ↳ <b>{html.escape(it['student_name'])}</b> ({html.escape(it['group_name'])}) — "
+                        f"<i>{html.escape(it['debts_raw'])}</i> | "
+                        f"<b>{_format_uzs(it['total'])} {'сўм' if lang == 'cyrl' else 'so‘m'}</b>\n"
+                        f"     {stats_str}"
+                    )
+            notified_parents_lines.append(
+                f"• <b>{html.escape(p_name)}</b> "
+                f"(<b>{_format_uzs(grand_p)} {'сўм' if lang == 'cyrl' else 'so‘m'}</b>)\n"
+                + "\n".join(child_detail_lines)
+                + f"\n  📞 {tel_link} | 💬 {tg_link}"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send debt reminder to parent chat_id=%s", p_cid
+            )
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+    short_text = _lt(
+        "reminder_sent_report_short",
+        lang,
+        stu_sent=stu_sent,
+        par_sent=par_sent,
+        total_sent=stu_sent + par_sent,
+    )
+    detailed_text = _lt(
+        "reminder_sent_report_detailed",
+        lang,
+        stu_sent=stu_sent,
+        par_sent=par_sent,
+        student_lines="\n".join(notified_students_lines) if notified_students_lines else "—",
+        parent_lines="\n".join(notified_parents_lines) if notified_parents_lines else "—",
+    )
+
+    notif_id = f"debt_{uuid.uuid4().hex[:12]}"
+    await save_notification_details(notif_id, short_text, detailed_text)
+
     await callback.message.answer(
-        _lt("reminder_sent_report", lang, stu_sent=stu_sent, par_sent=par_sent),
+        short_text,
+        reply_markup=_debt_report_toggle_kb(notif_id, is_detailed=False, lang=lang),
         parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("debt_rep_toggle:"))
+async def cb_debt_report_toggle(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message or not callback.data:
+        await callback.answer()
+        return
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer()
+        return
+
+    notif_id = parts[1]
+    is_detailed = bool(int(parts[2])) if parts[2].isdigit() else False
+    lang = await get_user_lang(callback.from_user.id)
+
+    record = await get_notification_details(notif_id)
+    if not record:
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+
+    raw_text = record["detailed_text"] if is_detailed else record["short_text"]
+    text = _safe_truncate_html_lines(raw_text, limit=3950)
+    await callback.message.edit_text(
+        text,
+        reply_markup=_debt_report_toggle_kb(notif_id, is_detailed=is_detailed, lang=lang),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
     await callback.answer()

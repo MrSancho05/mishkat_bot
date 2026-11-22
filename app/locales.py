@@ -67,6 +67,129 @@ WEEKDAYS_SHORT: dict[str, dict[int, str]] = {
     },
 }
 
+WEEKDAYS_FULL: dict[str, dict[int, str]] = {
+    "latn": {
+        0: "Dushanba",
+        1: "Seshanba",
+        2: "Chorshanba",
+        3: "Payshanba",
+        4: "Juma",
+        5: "Shanba",
+        6: "Yakshanba",
+    },
+    "cyrl": {
+        0: "Душанба",
+        1: "Сешанба",
+        2: "Чоршанба",
+        3: "Пайшанба",
+        4: "Жума",
+        5: "Шанба",
+        6: "Якшанба",
+    },
+}
+
+_WEEKDAY_TOKEN_TO_IDX: dict[str, int] = {
+    "dush": 0,
+    "du": 0,
+    "dushanba": 0,
+    "душ": 0,
+    "ду": 0,
+    "душанба": 0,
+    "mon": 0,
+    "monday": 0,
+    "пн": 0,
+    "понедельник": 0,
+    "sesh": 1,
+    "se": 1,
+    "seshanba": 1,
+    "сеш": 1,
+    "се": 1,
+    "сешанба": 1,
+    "tue": 1,
+    "tuesday": 1,
+    "вт": 1,
+    "вторник": 1,
+    "chor": 2,
+    "cho": 2,
+    "ch": 2,
+    "chorshanba": 2,
+    "чор": 2,
+    "чо": 2,
+    "ч": 2,
+    "чоршанба": 2,
+    "wed": 2,
+    "wednesday": 2,
+    "ср": 2,
+    "среда": 2,
+    "pay": 3,
+    "pa": 3,
+    "payshanba": 3,
+    "пай": 3,
+    "па": 3,
+    "пайшанба": 3,
+    "thu": 3,
+    "thursday": 3,
+    "чт": 3,
+    "четверг": 3,
+    "jum": 4,
+    "ju": 4,
+    "juma": 4,
+    "жум": 4,
+    "жу": 4,
+    "жума": 4,
+    "fri": 4,
+    "friday": 4,
+    "пт": 4,
+    "пятница": 4,
+    "shan": 5,
+    "sha": 5,
+    "sh": 5,
+    "shanba": 5,
+    "шан": 5,
+    "ша": 5,
+    "ш": 5,
+    "шанба": 5,
+    "sat": 5,
+    "saturday": 5,
+    "сб": 5,
+    "суббота": 5,
+    "yak": 6,
+    "ya": 6,
+    "yakshanba": 6,
+    "як": 6,
+    "я": 6,
+    "якшанба": 6,
+    "sun": 6,
+    "sunday": 6,
+    "вс": 6,
+    "воскресенье": 6,
+}
+
+FIELD_LABELS: dict[str, dict[str, str]] = {
+    "latn": {
+        "Guruh_Nomi": "Guruh nomi",
+        "Oylik_Dars_Soni": "Oylik darslar soni",
+        "Dars_Kunlari": "Dars kunlari",
+        "Dars_Vaqti": "Dars vaqti",
+        "Tolov_Summasi": "Oylik to'lov summasi",
+        "Oylik_Tolov_Summa": "Oylik to'lov summasi",
+        "Guruh_TG_Chat_ID": "Guruh Telegram kanali/guruhi",
+        "Ustoz_ID": "Ustoz",
+        "Ustoz": "Ustoz",
+    },
+    "cyrl": {
+        "Guruh_Nomi": "Гуруҳ номи",
+        "Oylik_Dars_Soni": "Ойлик дарслар сони",
+        "Dars_Kunlari": "Дарс кунлари",
+        "Dars_Vaqti": "Дарс вақти",
+        "Tolov_Summasi": "Ойлик тўлов суммаси",
+        "Oylik_Tolov_Summa": "Ойлик тўлов суммаси",
+        "Guruh_TG_Chat_ID": "Гуруҳ Telegram канали/гуруҳи",
+        "Ustoz_ID": "Устоз",
+        "Ustoz": "Устоз",
+    },
+}
+
 TEXTS: dict[str, dict[str, str]] = {
     "latn": {
         # Language selection
@@ -74,8 +197,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "O‘zingizga qulay bo‘lgan tilni tanlang / "
             "Ўзингизга қулай бўлган тилни танланг:"
         ),
-        "btn_lang_latn": "🇺🇿 O'zbekcha (Lotin)",
-        "btn_lang_cyrl": "🇺🇿 Ўзбекча (Кирилл)",
+        "btn_lang_latn": "🇺🇿 O'zbekcha",
+        "btn_lang_cyrl": "🇺🇿 Ўзбекча",
         "lang_saved": "✅ Til muvaffaqiyatli tanlandi: O'zbekcha (Lotin).",
         "btn_change_lang": "🌐 Tilni o'zgartirish",
         "self_marker": "(siz)",
@@ -97,6 +220,26 @@ TEXTS: dict[str, dict[str, str]] = {
             "Siz tizimga <b>{role}</b> sifatida kirdingiz.\n"
             "Kerakli bo‘limni tanlang:"
         ),
+        "welcome_menu_father": (
+            "Assalomu alaykum, <b>{name}</b>!\n"
+            "🧔 Siz Otasi sifatida tizimga kirdingiz!\n"
+            "Kerakli bo‘limni tanlang:"
+        ),
+        "welcome_menu_mother": (
+            "Assalomu alaykum, <b>{name}</b>!\n"
+            "🧕 Siz Onasi sifatida tizimga kirdingiz!\n"
+            "Kerakli bo‘limni tanlang:"
+        ),
+        "profile_role_pick": (
+            "🔄 <b>Otasi / Onasi rolini almashtirish</b>\n\n"
+            "Hozirgi rolingiz: <b>{current_role}</b>\n"
+            "Yangi rolni tanlang:"
+        ),
+        "profile_role_same": "ℹ️ Siz allaqachon <b>{role}</b> sifatida ro‘yxatdan o‘tgansiz.",
+        "profile_role_switched": (
+            "✅ Rolingiz <b>{role}</b> ga o‘zgartirildi.\n"
+            "Barcha farzandlaringiz bo‘yicha ma'lumotlar yangilandi."
+        ),
         "unregistered_user": (
             "Assalomu alaykum!\n"
             "Sizning hisobingiz hali tizimga bog‘lanmagan.\n"
@@ -109,7 +252,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "⚠️ Siz tizimda «{current_role}» sifatida ro'yxatdan o'tgansiz. "
             "Boshqa rolga o'tish uchun avval eski rolingiz bekor qilinishi kerak."
         ),
-        "btn_request_role_change": "📨 Adminga so'rov yuborish",
+        "btn_request_role_change": "📨 So'rov yuborish",
         "role_change_request_sent": (
             "✅ Rolni o'zgartirish bo'yicha so'rovingiz adminga yuborildi. "
             "Tasdiqlanishini kuting."
@@ -120,7 +263,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📌 Joriy roli: <b>{current_role}</b>\n"
             "🎯 So'ralayotgan rol: <b>{requested_role}</b>"
         ),
-        "btn_role_change_approve": "✅ Ruxsat berish (Eski rolni o'chirish)",
+        "btn_role_change_approve": "✅ Almashtirish",
         "btn_role_change_reject": "❌ Rad etish",
         "role_change_approved_user": (
             "✅ Admin so'rovingizni tasdiqladi! Endi yangi rol uchun berilgan "
@@ -134,6 +277,19 @@ TEXTS: dict[str, dict[str, str]] = {
             "Endi u yangi taklif havolasi orqali qayta ro'yxatdan o'tishi mumkin."
         ),
         "role_change_rejected_admin": "❌ Rolni o'zgartirish so'rovi rad etildi.",
+
+        # Dual-Role Admin Prompt & Role Switcher
+        "dual_role_admin_prompt": (
+            "Foydalanuvchi {full_name} tizimda avvaldan {old_role} sifatida mavjud. "
+            "Hozir esa {new_role} bo'lib ham qo'shilmoqchi. Qanday tasdiqlaymiz?"
+        ),
+        "btn_dual_role_keep_both": "➕ Ikkalasi qolsin",
+        "btn_dual_role_replace": "🔄 Faqat yangisi",
+        "btn_dual_role_reject": "❌ Rad etish",
+        "btn_switch_to_parent": "👨‍👩‍👧 Ota-ona rejimi",
+        "btn_switch_to_student": "🎓 Talaba rejimi",
+        "notif_role_header_student": "🎓 <b>Shaxsiy darsingiz bo'yicha:</b>",
+        "notif_role_header_parent": "👨‍👩‍👧 <b>Farzandingiz {talaba_ismi} bo'yicha:</b>",
 
         # Mandatory Name + Phone Sharing (Shared)
         "btn_share_phone": "📱 Telefon raqamni ulashish",
@@ -187,7 +343,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
 
         # Admin Teacher Management (👨‍🏫 Ustozlar boshqaruvi)
-        "menu_admin_manage_teachers": "👨‍🏫 Ustozlar boshqaruvi",
+        "menu_admin_manage_teachers": "👨‍🏫 Ustozlar",
         "teacher_manage_title": (
             "👨‍🏫 <b>Ustozlar boshqaruvi</b>\n\n"
             "Ro‘yxatdan o‘tgan ustozlardan birini tanlang yoki yangi ustoz taklif havolasini yarating:"
@@ -206,7 +362,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📚 Biriktirilgan guruhlar: <b>{groups}</b>"
         ),
         "teacher_manage_no_groups": "Hali biriktirilmagan",
-        "teacher_manage_btn_assign": "📚 Guruhga biriktirish",
+        "teacher_manage_btn_assign": "🔗 Guruh biriktirish",
         "teacher_manage_btn_delete": "🗑 Ustozni o‘chirish",
         "teacher_manage_assign_select_group": (
             "📚 <b>{full_name}</b> ustozni biriktirmoqchi bo‘lgan guruhni tanlang:"
@@ -229,6 +385,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "teacher_manage_delete_success": (
             "✅ Ustoz <b>{full_name}</b> tizimdan muvaffaqiyatli o‘chirildi."
         ),
+        "teacher_manage_delete_purged": (
+            "\n🧹 Ustozning bot hisobi va guruh biriktirmalari to‘liq tozalandi.\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
         "teacher_manage_delete_notify_teacher": (
             "ℹ️ Sizning ustozlik hisobingiz administrator tomonidan tizimdan o‘chirildi."
         ),
@@ -239,8 +399,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "Talaba <b>{student_name}</b> avvalgi «<b>{old_group}</b>» guruhida ham qoldirilsinmi?\n\n"
             "➡️ Yangi tanlangan guruh: <b>{new_group}</b>"
         ),
-        "btn_stu_transfer_keep": "✅ Ha, ikkala guruhda ham qolsin",
-        "btn_stu_transfer_move": "❌ Yo'q, faqat yangi guruhga o'tkazilsin",
+        "btn_stu_transfer_keep": "✅ Ikkalasida qolsin",
+        "btn_stu_transfer_move": "🔀 Faqat yangisida",
         "stu_transfer_success_dual_admin": (
             "✅ <b>Talaba qo‘shimcha guruhga qo‘shildi!</b>\n\n"
             "👤 Talaba: <b>{student_name}</b>\n"
@@ -258,64 +418,64 @@ TEXTS: dict[str, dict[str, str]] = {
             "Assalomu alaykum, <b>{student_name}</b>!\n"
             "Siz avvalgi «<b>{old_group}</b>» guruhingizda qolgan holda qo‘shimcha ravishda "
             "«<b>{new_group}</b>» guruhiga ham qabul qilindingiz.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_move_student": (
             "🔄 <b>Guruhingiz o‘zgartirildi!</b>\n\n"
             "Assalomu alaykum, <b>{student_name}</b>!\n"
             "Siz «<b>{old_group}</b>» guruhidan «<b>{new_group}</b>» guruhiga o‘tkazildingiz.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_dual_father": (
             "📚 <b>Qo‘shimcha guruh xabarnomasi</b>\n\n"
             "Assalomu alaykum, hurmatli <b>{parent_name}</b>!\n"
             "Farzandingiz <b>{student_name}</b> avvalgi «<b>{old_group}</b>» guruhida o‘qishini "
             "davom ettirgan holda qo‘shimcha ravishda «<b>{new_group}</b>» guruhiga ham qo‘shildi.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_dual_mother": (
             "📚 <b>Qo‘shimcha guruh xabarnomasi</b>\n\n"
             "Assalomu alaykum, hurmatli <b>{parent_name}</b>!\n"
             "Farzandingiz <b>{student_name}</b> avvalgi «<b>{old_group}</b>» guruhida o‘qishini "
             "davom ettirgan holda qo‘shimcha ravishda «<b>{new_group}</b>» guruhiga ham qo‘shildi.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_move_father": (
             "🔄 <b>Guruh o‘zgarishi xabarnomasi</b>\n\n"
             "Assalomu alaykum, hurmatli <b>{parent_name}</b>!\n"
             "Farzandingiz <b>{student_name}</b> «<b>{old_group}</b>» guruhidan "
             "«<b>{new_group}</b>» guruhiga o‘tkazildi.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_move_mother": (
             "🔄 <b>Guruh o‘zgarishi xabarnomasi</b>\n\n"
             "Assalomu alaykum, hurmatli <b>{parent_name}</b>!\n"
             "Farzandingiz <b>{student_name}</b> «<b>{old_group}</b>» guruhidan "
             "«<b>{new_group}</b>» guruhiga o‘tkazildi.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_new_teacher": (
             "👨‍🏫 <b>Guruhingizga talaba qo‘shildi!</b>\n\n"
             "📚 Guruh: <b>{new_group}</b>\n"
             "👤 Talaba: <b>{student_name}</b> (<code>{student_id}</code>)\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "stu_transfer_notify_old_teacher_moved": (
             "ℹ️ <b>Talaba boshqa guruhga o‘tkazildi</b>\n\n"
             "👤 Talaba: <b>{student_name}</b>\n"
             "📤 Avvalgi guruh: <b>{old_group}</b>\n"
             "📥 Yangi guruh: <b>{new_group}</b>\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
 
         # Admin Management & Invite (?start=adm_<CODE>)
-        "menu_admin_manage_admins": "👑 Adminlar boshqaruvi",
+        "menu_admin_manage_admins": "👑 Adminlar",
         "admin_manage_title": (
             "👑 <b>Adminlar boshqaruvi</b>\n\n"
             "Yangi admin taklif qilish, mavjud adminlar ro‘yxatini ko‘rish yoki "
             "adminni tizimdan o‘chirish uchun kerakli amalni tanlang:"
         ),
-        "btn_admin_create_invite": "🔗 Yangi admin taklif havolasi",
+        "btn_admin_create_invite": "🔗 Yangi havola",
         "btn_admin_list": "📋 Adminlar ro‘yxati",
         "btn_admin_remove": "🗑 Adminni o‘chirish",
         "admin_invite_created": (
@@ -400,7 +560,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "👤 Talaba: <b>{student_name}</b> ({group})\n"
             "Iltimos, kim ekanligingizni tanlang:"
         ),
-        "btn_parent_father": "🧔‍♂️ Otasi",
+        "btn_parent_father": "🧔 Otasi",
         "btn_parent_mother": "🧕 Onasi",
         "parent_label_father": "Otasi",
         "parent_label_mother": "Onasi",
@@ -421,18 +581,42 @@ TEXTS: dict[str, dict[str, str]] = {
             "Sizning Telegram hisobingiz <b>{student_name}</b> ({group} guruhi) "
             "uchun <b>{parent_role}</b> sifatida muvaffaqiyatli bog‘landi."
         ),
+        "btn_student_no_phone": "📵 Telefon yo‘q",
+        "btn_add_children_via_parent": "👨‍👩‍👧‍👦 Ota-ona orqali",
 
         # Personal Profile Editing
-        "menu_profile": "⚙️ Shaxsiy ma'lumotlar",
+        "menu_profile": "⚙️ Ma'lumotlarim",
+        "profile_view_admin": (
+            "👤 <b>Shaxsiy ma'lumotlarim (Admin)</b>\n\n"
+            "🆔 Telegram ID: <code>{user_id}</code>\n"
+            "👤 F.I.O.: <b>{full_name}</b>\n"
+            "📞 Telefon: <b>{phone}</b>\n"
+            "✈️ Telegram: <b>{tg}</b>"
+        ),
+        "menu_guest_courses": "📚 Kurslarimiz",
+        "menu_guest_enroll": "✍️ Kursga yozilish",
+        "menu_guest_contact": "📍 Manzil va aloqa",
+        "menu_admin_courses": "📚 Kurslarni boshqarish",
+        "guest_welcome": (
+            "Assalomu alaykum, <b>{name}</b>! 🌟\n\n"
+            "<b>Mishkat Nodavlat Ta'lim Muassasasi</b>ning rasmiy botiga xush kelibsiz!\n\n"
+            "Bu yerda siz:\n"
+            "📚 kurslarimiz va narxlari bilan tanishishingiz,\n"
+            "✍️ o‘zingizga ma'qul kursga ariza qoldirishingiz,\n"
+            "📍 manzil va aloqa ma'lumotlarini olishingiz mumkin.\n\n"
+            "Agar siz allaqachon o‘quvchimiz (yoki ota-ona) bo‘lsangiz, ustozingiz yoki "
+            "administrator yuborgan maxsus taklif havolasi orqali kiring.\n\n"
+            "Kerakli bo‘limni tanlang 👇"
+        ),
         "profile_view_teacher": (
-            "⚙️ <b>Shaxsiy ma'lumotlar (Ustoz)</b>\n\n"
+            "👤 <b>Shaxsiy ma'lumotlarim (Ustoz)</b>\n\n"
             "🆔 Ustoz ID: <code>{teacher_id}</code>\n"
             "👤 F.I.O.: <b>{full_name}</b>\n"
             "📞 Telefon: <b>{phone}</b>\n"
             "✈️ Telegram: <b>{tg}</b>"
         ),
         "profile_view_student": (
-            "⚙️ <b>Shaxsiy ma'lumotlar (Talaba)</b>\n\n"
+            "👤 <b>Shaxsiy ma'lumotlarim (Talaba)</b>\n\n"
             "🆔 Talaba ID: <code>{student_id}</code>\n"
             "👤 F.I.O.: <b>{full_name}</b>\n"
             "📚 Guruh: <b>{group}</b>\n"
@@ -440,7 +624,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "✈️ Telegram: <b>{tg}</b>"
         ),
         "profile_view_parent": (
-            "⚙️ <b>Shaxsiy ma'lumotlar ({parent_role})</b>\n\n"
+            "👤 <b>Shaxsiy ma'lumotlarim ({parent_role})</b>\n\n"
             "👤 F.I.O.: <b>{full_name}</b>\n"
             "📞 Telefon: <b>{phone}</b>\n"
             "🎓 Farzandingiz: <b>{student_name}</b> ({group})"
@@ -561,9 +745,11 @@ TEXTS: dict[str, dict[str, str]] = {
             "Qaysi ma'lumotni o‘zgartirmoqchisiz?"
         ),
         "group_edit_saved": "✅ <b>{group}</b> guruhi ma'lumotlari yangilandi!",
-        "btn_group_price": "💰 Guruh to‘lov summasi",
-        "btn_group_full_update": "🔄 Guruh ma'lumotini to'liq yangilash",
-        "btn_keep_current": "⏭ Eski holatida qoldirish",
+        "btn_group_price": "💰 To‘lov summasi",
+        "btn_group_full_update": "🔄 To‘liq yangilash",
+        "btn_archive_group": "🗄 Zaxira guruhi",
+        "btn_delete_group": "🗑 Guruhni o'chirish",
+        "btn_keep_current": "⏭ Eskisi qolsin",
         "group_full_edit_name": (
             "1/6 📝 <b>Guruh nomi</b>\n"
             "Hozirgi qiymat: <b>{current}</b>\n"
@@ -636,7 +822,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_confirm": "✅ Tasdiqlash",
         "btn_edit": "✏️ O‘zgartirish",
         "btn_details": "📄 Batafsil",
+        "btn_detailed": "📄 Batafsil",
         "btn_compact": "🔼 Qisqacha",
+        "btn_short": "📋 Qisqacha",
         "btn_present": "🟢 Qatnashdi",
         "btn_absent": "🔴 Kelmadi",
         "btn_finish": "✅ Yakunlash",
@@ -647,17 +835,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_admin_schedule": "📅 Dars jadvali",
         "menu_admin_cancel_lesson": "🚫 Darsni bekor qilish",
         "menu_admin_attendance": "📋 Yo‘qlama qilish",
-        "menu_admin_payments": "💰 To‘lovni tasdiqlash",
+        "menu_admin_payments": "💳 To‘lovlar",
         "menu_admin_debtors": "⚠️ Qarzdorlar",
 
         # Teacher menu buttons
-        "menu_teacher_topic": "📝 Dars mavzusini kiritish",
-        "menu_teacher_groups": "👥 Mening guruhlarim",
-        "menu_teacher_attendance": "📋 Yo'qlama qilish",
-        "menu_teacher_add_student": "➕ Yangi talaba qo'shish",
+        "menu_teacher_topic": "📝 Dars mavzusi",
+        "menu_teacher_groups": "👥 Guruhlarim",
+        "menu_teacher_attendance": "📋 Yo‘qlama qilish",
+        "menu_teacher_add_student": "➕ Talaba qo‘shish",
         "menu_teacher_schedule": "📅 Dars jadvali",
         "menu_teacher_cancel_lesson": "🚫 Darsni bekor qilish",
-        "menu_teacher_payments": "💳 To'lovlarni tasdiqlash",
+        "menu_teacher_payments": "💳 To‘lovlar",
         "menu_teacher_debtors": "⚠️ Qarzdorlar",
 
         # Teacher detailed group roster view
@@ -678,9 +866,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "roster_bot_status_line": "   🤖 Bot: Talaba ({stu_status}), Ota-ona ({par_status})",
 
         # Lesson Topic & Plan builder + Polite 1-Day Reminder
-        "menu_lesson_topic": "📝 Dars mavzusi va rejasi",
-        "btn_enter_topic_plan": "📝 Mavzu va reja kiritish",
-        "btn_past_topics_history": "📚 Oldingi kiritilgan mavzular",
+        "menu_lesson_topic": "📝 Dars mavzusi",
+        "btn_enter_topic_plan": "📝 Mavzu/reja kiritish",
+        "btn_past_topics_history": "📚 Mavzular tarixi",
         "topic_history_header": "📚 <b>{group} — Oldingi kiritilgan mavzular:</b>\n",
         "topic_history_empty": "ℹ️ Ushbu guruh uchun hali mavzu va reja kiritilmagan.",
         "reminder_teacher_1day_before": (
@@ -722,8 +910,12 @@ TEXTS: dict[str, dict[str, str]] = {
             "Ma'lumotni saqlab, guruh chatiga yuboramizmi?"
         ),
         "btn_topic_broadcast": "📢 Guruhga yuborish",
+        "btn_send_to_group": "📢 Guruhga yuborish",
         "btn_topic_save_only": "💾 Faqat saqlash",
         "btn_topic_edit": "✏️ Tahrirlash",
+        "topic_status_added": "➕ Mavzularga qo'shimcha kiritildi",
+        "topic_status_updated": "✏️ Dars mavzusi o'zgartirildi",
+        "topic_teacher_footer": "Hurmat bilan, guruh ustozi {teacher_name}",
         "topic_saved": (
             "✅ <b>{group} ({date})</b> uchun dars mavzusi va rejasi saqlandi!"
         ),
@@ -740,18 +932,18 @@ TEXTS: dict[str, dict[str, str]] = {
             "📅 Sana: <b>{date}</b>\n"
             "📖 Mavzu: <b>{topic_title}</b>\n\n"
             "📝 <b>Darsda o‘tiladigan mavzular / vazifa:</b>\n{lesson_details}\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "topic_cancelled": "❌ Dars mavzusi va rejasini kiritish bekor qilindi.",
 
         # Student menu buttons
         "menu_student_group": "👥 Mening guruhim",
         "menu_student_schedule": "📅 Dars jadvali",
-        "menu_student_payments": "💳 To‘lovlar va Qarzlar",
+        "menu_student_payments": "💳 To‘lov va qarzlar",
 
         # Parent menu buttons
-        "menu_parent_schedule": "📅 Farzandim dars jadvali",
-        "menu_parent_payments": "💳 To‘lovlar va Qarzlar",
+        "menu_parent_schedule": "📅 Farzandim jadvali",
+        "menu_parent_payments": "💳 To‘lov va qarzlar",
 
         # Human-friendly cycle & lesson labels
         "human_cycle_label": "{num}-o‘quv oyi ({count} ta dars)",
@@ -831,6 +1023,83 @@ TEXTS: dict[str, dict[str, str]] = {
         # Attendance
         "attendance_select_group": "📋 Yo‘qlama qilish uchun guruhni tanlang:",
         "attendance_no_groups_today": "ℹ️ Yo‘qlama uchun guruhlar topilmadi.",
+        "attendance_btn_today": "📅 Bugun, {today_date}",
+        "attendance_btn_other_day": "🗓 Boshqa kun",
+        "attendance_past_date_notice": "⚠️ O'tib ketgan ({sana}) gi dars yo'qlamasi qilindi\n\n",
+        "attendance_topic_line": "📖 Mavzu: \"{mavzu}\"\n",
+        "attendance_signature": "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!",
+        "attendance_student_present": (
+            "🟢 Hurmatli <b>{talaba_ismi}</b>,\n\n"
+            "Siz <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>ga qatnashdingiz.\n"
+            "{mavzu_qatori}Biz sizning bilim olishdagi qat'iyatingiz va ishtiyoqingizni yuqori baholaymiz.\n"
+            "{talaba_qarz_eslatmasi}\n"
+            "Hurmat bilan,\n"
+            "Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "attendance_student_absent": (
+            "🔴 Hurmatli <b>{talaba_ismi}</b>,\n\n"
+            "Siz <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>da qatnashmadingiz.\n"
+            "{mavzu_qatori}Yangi mavzularni o'tkazib yubormaslik uchun dars materiallari va uyga vazifalarni ko'rib chiqishingizni tavsiya qilamiz. Keyingi darsda sizni albatta kutamiz!\n"
+            "{talaba_qarz_eslatmasi}\n"
+            "Hurmat bilan,\n"
+            "Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "attendance_student_debt_note": (
+            "\n💳 Eslatma: Sizning <b>{qarz_summasi} so'm</b> qarzdorligingiz mavjud. "
+            "Yangi o'quv oyi boshlanmasidan avval to'lovni tezroq amalga oshirishingizni so'raymiz.\n"
+        ),
+        "attendance_parent_present": (
+            "🟢 Assalomu alaykum, hurmatli {ota_ona_ismi}!\n\n"
+            "Farzandingiz <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>ga qatnashdi.\n"
+            "{mavzu_qatori}Biz farzandingizning bilim olishdagi qat'iyati va intilishini yuqori baholaymiz!\n"
+            "{ota_ona_qarz_eslatmasi}\n"
+            "Hurmat bilan,\n"
+            "Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "attendance_parent_absent": (
+            "🔴 Assalomu alaykum, hurmatli {ota_ona_ismi}!\n\n"
+            "Farzandingiz <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>da qatnashmadi.\n"
+            "{mavzu_qatori}Yangi mavzularni o'tkazib yubormaslik uchun dars materiallari va uyga vazifalarni ko'rib chiqishini tavsiya qilamiz. Keyingi darsda albatta kutib qolamiz!\n"
+            "{ota_ona_qarz_eslatmasi}\n"
+            "Hurmat bilan,\n"
+            "Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "attendance_parent_debt_note": (
+            "\n💳 Eslatma: Farzandingizning <b>{qarz_summasi} so'm</b> qarzdorligi mavjud. "
+            "Yangi o'quv oyi boshlanmasidan avval to'lovni tezroq amalga oshirishingizni so'raymiz.\n"
+        ),
+        "attendance_multi_header": (
+            "📋 Assalomu alaykum, hurmatli {ota_ona_ismi}!\n\n"
+            "Farzandlaringizning <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan darslar bo'yicha davomat ma'lumoti:\n\n"
+        ),
+        "attendance_multi_child": (
+            "{status_emoji} {tartib}. <b>{talaba_ismi}</b>\n"
+            "📚 Dars/Guruh: <b>{guruh_nomi}</b> • <b>{dars_raqami}-dars</b>\n"
+            "🗓 Dars kuni: {hafta_kuni} | Holati: {holat_matni}\n"
+            "👨‍🏫 Ustoz: {oqituvchi_ismi}\n"
+            "{mavzu_qatori}\n"
+            "──────────────────"
+        ),
+        "attendance_multi_status_present": "Darsga qatnashdi",
+        "attendance_multi_status_absent": "Darsga qatnashmadi",
+        "attendance_multi_debt_title": "💳 To'lov eslatmasi:",
+        "attendance_multi_debt_item": (
+            "• <b>{talaba_ismi}</b> — <b>{qarz_summasi} so'm</b> qarzdorlik mavjud. "
+            "Yangi oy kelmasdan avval to'lovni tezroq amalga oshirishingizni so'raymiz."
+        ),
+        "parent_pay_header": "💳 Farzandlaringizning to'lov va qarzdorlik holati:\n\n",
+        "parent_pay_child": (
+            "👶 {tartib}. {talaba_ismi}\n"
+            "📚 Dars/Guruh: {guruh_nomi}\n"
+            "💵 Oylik to'lov: {oylik_tolov} so'm\n"
+            "📊 Holati: {tolov_holati}\n"
+            "❗️ Qarzdorlik: {qarz_summasi} so'm"
+        ),
+        "parent_pay_separator": "\n\n──────────────────\n\n",
+        "parent_pay_total": "\n\n💰 Umumiy qarzdorlik: {umumiy_qarz} so'm",
+        "parent_pay_status_paid": "✅ To'langan",
+        "parent_pay_status_unpaid": "❌ To'lanmagan",
+        "parent_sched_btn_back": "🔙 Ortga",
         "attendance_select_date": (
             "📅 <b>{group} — Yo‘qlama sanasini tanlang</b>\n\n"
             "Bugungi darsni belgilashingiz, qolib ketgan o‘tgan darsni to‘ldirishingiz "
@@ -878,7 +1147,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Assalomu alaykum, <b>{student_name}</b>!\n"
             "Siz <b>{date}</b> kungi <b>{group}</b> guruhi darsida qatnasha olmadingiz (Kelmadi ❌).\n"
             "Iltimos, keyingi darsgacha o‘tilgan mavzuni ko‘rib chiqib, tayyorlanib keling.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_notify_absent_parent": (
             "🔴 <b>Davomat xabarnomasi</b>\n\n"
@@ -886,7 +1155,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Sizga shuni ma'lum qilamizki, farzandingiz <b>{student_name}</b> "
             "<b>{date}</b> kungi <b>{group}</b> guruhi darsida qatnashmadi (Kelmadi ❌).\n"
             "Iltimos, darslarga muntazam qatnashishini nazorat qilib borishingizni so‘raymiz.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_notify_updated_present": (
             "🔄 <b>Davomat holati yangilandi</b>\n\n"
@@ -901,7 +1170,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "<b>{date}</b> kungi <b>{group}</b> guruhi darsidagi holatingiz "
             "<b>Kelmadi ❌</b> deb yangilandi.\n"
             "Iltimos, o‘tilgan mavzuni mustaqil o‘zlashtirib, keyingi darsga tayyorlanib keling.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_notify_updated_absent_parent": (
             "🔄 <b>Davomat holati yangilandi</b>\n\n"
@@ -909,7 +1178,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Sizga ma'lum qilamizki, farzandingiz <b>{student_name}</b>ning "
             "<b>{date}</b> kungi <b>{group}</b> guruhi darsidagi davomati "
             "<b>Kelmadi ❌</b> deb yangilandi.\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_topic_addon": (
             "\n\n📚 Mavzu: <b>{topic_title}</b>\n"
@@ -960,8 +1229,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "🗓 Yakunlangan davr: <b>{cycle_title}</b>\n"
             "🆕 Yangi o‘quv oyi avtomatik ochildi: <b>{next_cycle_title}</b>"
         ),
-        "btn_payment_confirm": "✅ To'lovni tasdiqlash",
-        "btn_payment_revert": "↩️ To'lovni rad etish (bekor qilish)",
+        "btn_payment_confirm": "✅ Tasdiqlash",
+        "btn_payment_revert": "↩️ Qaytarish",
         "payment_select_group": "💰 To‘lovni tasdiqlash uchun guruhni tanlang:",
         "payment_select_student": "👤 Talabani tanlang (<b>{group}</b>):",
         "payment_select_cycle": "🗓 To‘lov qilinayotgan o‘quv oyini tanlang:",
@@ -1120,8 +1389,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "O‘zingizga qulay bo‘lgan tilni tanlang / "
             "Ўзингизга қулай бўлган тилни танланг:"
         ),
-        "btn_lang_latn": "🇺🇿 O'zbekcha (Lotin)",
-        "btn_lang_cyrl": "🇺🇿 Ўзбекча (Кирилл)",
+        "btn_lang_latn": "🇺🇿 O'zbekcha",
+        "btn_lang_cyrl": "🇺🇿 Ўзбекча",
         "lang_saved": "✅ Тил муваффақиятли танланди: Ўзбекча (Кирилл).",
         "btn_change_lang": "🌐 Тилни ўзгартириш",
         "self_marker": "(сиз)",
@@ -1143,6 +1412,26 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сиз тизимга <b>{role}</b> сифатида кирдингиз.\n"
             "Керакли бўлимни танланг:"
         ),
+        "welcome_menu_father": (
+            "Ассалому алайкум, <b>{name}</b>!\n"
+            "🧔 Сиз Отаси сифатида тизимга кирдингиз!\n"
+            "Керакли бўлимни танланг:"
+        ),
+        "welcome_menu_mother": (
+            "Ассалому алайкум, <b>{name}</b>!\n"
+            "🧕 Сиз Онаси сифатида тизимга кирдингиз!\n"
+            "Керакли бўлимни танланг:"
+        ),
+        "profile_role_pick": (
+            "🔄 <b>Отаси / Онаси ролини алмаштириш</b>\n\n"
+            "Ҳозирги ролингиз: <b>{current_role}</b>\n"
+            "Янги ролни танланг:"
+        ),
+        "profile_role_same": "ℹ️ Сиз аллақачон <b>{role}</b> сифатида рўйхатдан ўтгансиз.",
+        "profile_role_switched": (
+            "✅ Ролингиз <b>{role}</b> га ўзгартирилди.\n"
+            "Барча фарзандларингиз бўйича маълумотлар янгиланди."
+        ),
         "unregistered_user": (
             "Ассалому алайкум!\n"
             "Сизнинг ҳисобингиз ҳали тизимга боғланмаган.\n"
@@ -1155,7 +1444,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "⚠️ Сиз тизимда «{current_role}» сифатида рўйхатдан ўтгансиз. "
             "Бошқа ролга ўтиш учун аввал эски ролингиз бекор қилиниши керак."
         ),
-        "btn_request_role_change": "📨 Админга сўров юбориш",
+        "btn_request_role_change": "📨 Сўров юбориш",
         "role_change_request_sent": (
             "✅ Ролни ўзгартириш бўйича сўровингиз админга юборилди. "
             "Тасдиқланишини кутинг."
@@ -1166,7 +1455,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📌 Жорий роли: <b>{current_role}</b>\n"
             "🎯 Сўралаётган рол: <b>{requested_role}</b>"
         ),
-        "btn_role_change_approve": "✅ Рухсат бериш (Эски ролни ўчириш)",
+        "btn_role_change_approve": "✅ Алмаштириш",
         "btn_role_change_reject": "❌ Рад этиш",
         "role_change_approved_user": (
             "✅ Админ сўровингизни тасдиқлади! Энди янги рол учун берилган "
@@ -1180,6 +1469,19 @@ TEXTS: dict[str, dict[str, str]] = {
             "Энди у янги таклиф ҳаволаси орқали қайта рўйхатдан ўтиши мумкин."
         ),
         "role_change_rejected_admin": "❌ Ролни ўзгартириш сўрови рад этилди.",
+
+        # Dual-Role Admin Prompt & Role Switcher
+        "dual_role_admin_prompt": (
+            "Фойдаланувчи {full_name} тизимда аввалдан {old_role} сифатида мавжуд. "
+            "Ҳозир эса {new_role} бўлиб ҳам қўшилмоқчи. Қандай тасдиқлаймиз?"
+        ),
+        "btn_dual_role_keep_both": "➕ Иккаласи қолсин",
+        "btn_dual_role_replace": "🔄 Фақат янгиси",
+        "btn_dual_role_reject": "❌ Рад этиш",
+        "btn_switch_to_parent": "👨‍👩‍👧 Ота-она режими",
+        "btn_switch_to_student": "🎓 Талаба режими",
+        "notif_role_header_student": "🎓 <b>Шахсий дарсингиз бўйича:</b>",
+        "notif_role_header_parent": "👨‍👩‍👧 <b>Фарзандингиз {talaba_ismi} бўйича:</b>",
 
         # Mandatory Name + Phone Sharing (Shared)
         "btn_share_phone": "📱 Телефон рақамни улашиш",
@@ -1233,7 +1535,7 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
 
         # Admin Teacher Management (👨‍🏫 Устозлар бошқаруви)
-        "menu_admin_manage_teachers": "👨‍🏫 Устозлар бошқаруви",
+        "menu_admin_manage_teachers": "👨‍🏫 Устозлар",
         "teacher_manage_title": (
             "👨‍🏫 <b>Устозлар бошқаруви</b>\n\n"
             "Рўйхатдан ўтган устозлардан бирини танланг ёки янги устоз таклиф ҳаволасини яратинг:"
@@ -1252,7 +1554,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📚 Бириктирилган гуруҳлар: <b>{groups}</b>"
         ),
         "teacher_manage_no_groups": "Ҳали бириктирилмаган",
-        "teacher_manage_btn_assign": "📚 Гуруҳга бириктириш",
+        "teacher_manage_btn_assign": "🔗 Гуруҳ бириктириш",
         "teacher_manage_btn_delete": "🗑 Устозни ўчириш",
         "teacher_manage_assign_select_group": (
             "📚 <b>{full_name}</b> устозни бириктирмоқчи бўлган гуруҳни танланг:"
@@ -1263,7 +1565,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "<b>{group}</b> гуруҳига бириктирилди!"
         ),
         "teacher_manage_assign_notify_teacher": (
-            "👨‍🏫 Сиз <b>{group}</b> гуруҳига устоз сифатида бириктирилдингиз!"
+            "👨‍🏫 Сиз <b>{group}</b> гуруҳига устоз сифада бириктирилдингиз!"
         ),
         "teacher_manage_delete_confirm": (
             "🗑 <b>Устозни ўчиришни тасдиқлайсизми?</b>\n\n"
@@ -1275,6 +1577,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "teacher_manage_delete_success": (
             "✅ Устоз <b>{full_name}</b> тизимдан муваффақиятли ўчирилди."
         ),
+        "teacher_manage_delete_purged": (
+            "\n🧹 Устознинг бот ҳисоби ва гуруҳ бириктирмалари тўлиқ тозаланди.\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
         "teacher_manage_delete_notify_teacher": (
             "ℹ️ Сизнинг устозлик ҳисобингиз администратор томонидан тизимдан ўчирилди."
         ),
@@ -1285,8 +1591,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "Талаба <b>{student_name}</b> аввалги «<b>{old_group}</b>» гуруҳида ҳам қолдирилсинми?\n\n"
             "➡️ Янги танланган гуруҳ: <b>{new_group}</b>"
         ),
-        "btn_stu_transfer_keep": "✅ Ҳа, иккала гуруҳда ҳам қолсин",
-        "btn_stu_transfer_move": "❌ Йўқ, фақат янги гуруҳга ўтказилсин",
+        "btn_stu_transfer_keep": "✅ Иккаласида қолсин",
+        "btn_stu_transfer_move": "🔀 Фақат янгисида",
         "stu_transfer_success_dual_admin": (
             "✅ <b>Талаба қўшимча гуруҳга қўшилди!</b>\n\n"
             "👤 Талаба: <b>{student_name}</b>\n"
@@ -1304,64 +1610,64 @@ TEXTS: dict[str, dict[str, str]] = {
             "Ассалому алайкум, <b>{student_name}</b>!\n"
             "Сиз аввалги «<b>{old_group}</b>» гуруҳингизда қолган ҳолда қўшимча равишда "
             "«<b>{new_group}</b>» гуруҳига ҳам қабул қилиндингиз.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_move_student": (
             "🔄 <b>Гуруҳингиз ўзгартирилди!</b>\n\n"
             "Ассалому алайкум, <b>{student_name}</b>!\n"
             "Сиз «<b>{old_group}</b>» гуруҳидан «<b>{new_group}</b>» гуруҳига ўтказилдингиз.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_dual_father": (
             "📚 <b>Қўшимча гуруҳ хабарномаси</b>\n\n"
             "Ассалому алайкум, ҳурматли <b>{parent_name}</b>!\n"
             "Фарзандингиз <b>{student_name}</b> аввалги «<b>{old_group}</b>» гуруҳида ўқишини "
             "давом эттирган ҳолда қўшимча равишда «<b>{new_group}</b>» гуруҳига ҳам қўшилди.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_dual_mother": (
             "📚 <b>Қўшимча гуруҳ хабарномаси</b>\n\n"
             "Ассалому алайкум, ҳурматли <b>{parent_name}</b>!\n"
             "Фарзандингиз <b>{student_name}</b> аввалги «<b>{old_group}</b>» гуруҳида ўқишини "
             "давом эттирган ҳолда қўшимча равишда «<b>{new_group}</b>» гуруҳига ҳам қўшилди.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_move_father": (
             "🔄 <b>Гуруҳ ўзгариши хабарномаси</b>\n\n"
             "Ассалому алайкум, ҳурматли <b>{parent_name}</b>!\n"
             "Фарзандингиз <b>{student_name}</b> «<b>{old_group}</b>» гуруҳидан "
             "«<b>{new_group}</b>» гуруҳига ўтказилди.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_move_mother": (
             "🔄 <b>Гуруҳ ўзгариши хабарномаси</b>\n\n"
             "Ассалому алайкум, ҳурматли <b>{parent_name}</b>!\n"
             "Фарзандингиз <b>{student_name}</b> «<b>{old_group}</b>» гуруҳидан "
             "«<b>{new_group}</b>» гуруҳига ўтказилди.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_new_teacher": (
             "👨‍🏫 <b>Гуруҳингизга талаба қўшилди!</b>\n\n"
             "📚 Гуруҳ: <b>{new_group}</b>\n"
             "👤 Талаба: <b>{student_name}</b> (<code>{student_id}</code>)\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "stu_transfer_notify_old_teacher_moved": (
             "ℹ️ <b>Талаба бошқа гуруҳга ўтказилди</b>\n\n"
             "👤 Талаба: <b>{student_name}</b>\n"
             "📤 Аввалги гуруҳ: <b>{old_group}</b>\n"
             "📥 Янги гуруҳ: <b>{new_group}</b>\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
 
         # Admin Management & Invite (?start=adm_<CODE>)
-        "menu_admin_manage_admins": "👑 Админлар бошқаруви",
+        "menu_admin_manage_admins": "👑 Админлар",
         "admin_manage_title": (
             "👑 <b>Админлар бошқаруви</b>\n\n"
             "Янги админ таклиф қилиш, мавжуд админлар рўйхатини кўриш ёки "
             "админни тизимдан ўчириш учун керакли амални танланг:"
         ),
-        "btn_admin_create_invite": "🔗 Янги админ таклиф ҳаволаси",
+        "btn_admin_create_invite": "🔗 Янги ҳавола",
         "btn_admin_list": "📋 Админлар рўйхати",
         "btn_admin_remove": "🗑 Админни ўчириш",
         "admin_invite_created": (
@@ -1446,7 +1752,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "👤 Талаба: <b>{student_name}</b> ({group})\n"
             "Илтимос, ким эканлигингизни танланг:"
         ),
-        "btn_parent_father": "🧔‍♂️ Отаси",
+        "btn_parent_father": "🧔 Отаси",
         "btn_parent_mother": "🧕 Онаси",
         "parent_label_father": "Отаси",
         "parent_label_mother": "Онаси",
@@ -1467,18 +1773,42 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сизнинг Telegram ҳисобингиз <b>{student_name}</b> ({group} гуруҳи) "
             "учун <b>{parent_role}</b> сифатида муваффақиятли боғланди."
         ),
+        "btn_student_no_phone": "📵 Телефон йўқ",
+        "btn_add_children_via_parent": "👨‍👩‍👧‍👦 Ота-она орқали",
 
         # Personal Profile Editing
-        "menu_profile": "⚙️ Шахсий маълумотлар",
+        "menu_profile": "⚙️ Маълумотларим",
+        "profile_view_admin": (
+            "👤 <b>Шахсий маълумотларим (Админ)</b>\n\n"
+            "🆔 Telegram ID: <code>{user_id}</code>\n"
+            "👤 Ф.И.О.: <b>{full_name}</b>\n"
+            "📞 Телефон: <b>{phone}</b>\n"
+            "✈️ Telegram: <b>{tg}</b>"
+        ),
+        "menu_guest_courses": "📚 Курсларимиз",
+        "menu_guest_enroll": "✍️ Курсга ёзилиш",
+        "menu_guest_contact": "📍 Манзил ва алоқа",
+        "menu_admin_courses": "📚 Курсларни бошқариш",
+        "guest_welcome": (
+            "Ассалому алайкум, <b>{name}</b>! 🌟\n\n"
+            "<b>Мишкат Нодавлат Таълим Муассасаси</b>нинг расмий ботига хуш келибсиз!\n\n"
+            "Бу ерда сиз:\n"
+            "📚 курсларимиз ва нархлари билан танишишингиз,\n"
+            "✍️ ўзингизга маъқул курсга ариза қолдиришингиз,\n"
+            "📍 манзил ва алоқа маълумотларини олишингиз мумкин.\n\n"
+            "Агар сиз аллақачон ўқувчимиз (ёки ота-она) бўлсангиз, устозингиз ёки "
+            "администратор юборган махсус таклиф ҳаволаси орқали киринг.\n\n"
+            "Керакли бўлимни танланг 👇"
+        ),
         "profile_view_teacher": (
-            "⚙️ <b>Шахсий маълумотлар (Устоз)</b>\n\n"
+            "👤 <b>Шахсий маълумотларим (Устоз)</b>\n\n"
             "🆔 Устоз ID: <code>{teacher_id}</code>\n"
             "👤 Ф.И.О.: <b>{full_name}</b>\n"
             "📞 Телефон: <b>{phone}</b>\n"
             "✈️ Telegram: <b>{tg}</b>"
         ),
         "profile_view_student": (
-            "⚙️ <b>Шахсий маълумотлар (Талаба)</b>\n\n"
+            "👤 <b>Шахсий маълумотларим (Талаба)</b>\n\n"
             "🆔 Талаба ID: <code>{student_id}</code>\n"
             "👤 Ф.И.О.: <b>{full_name}</b>\n"
             "📚 Гуруҳ: <b>{group}</b>\n"
@@ -1486,7 +1816,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "✈️ Telegram: <b>{tg}</b>"
         ),
         "profile_view_parent": (
-            "⚙️ <b>Шахсий маълумотлар ({parent_role})</b>\n\n"
+            "👤 <b>Шахсий маълумотларим ({parent_role})</b>\n\n"
             "👤 Ф.И.О.: <b>{full_name}</b>\n"
             "📞 Телефон: <b>{phone}</b>\n"
             "🎓 Фарзандингиз: <b>{student_name}</b> ({group})"
@@ -1607,9 +1937,11 @@ TEXTS: dict[str, dict[str, str]] = {
             "Қайси маълумотни ўзгартирмоқчисиз?"
         ),
         "group_edit_saved": "✅ <b>{group}</b> гуруҳи маълумотлари янгиланди!",
-        "btn_group_price": "💰 Гуруҳ тўлов суммаси",
-        "btn_group_full_update": "🔄 Гуруҳ маълумотини тўлиқ янгилаш",
-        "btn_keep_current": "⏭ Эски ҳолатида қолдириш",
+        "btn_group_price": "💰 Тўлов суммаси",
+        "btn_group_full_update": "🔄 Тўлиқ янгилаш",
+        "btn_archive_group": "🗄 Захира гуруҳи",
+        "btn_delete_group": "🗑 Гуруҳни ўчириш",
+        "btn_keep_current": "⏭ Эскиси қолсин",
         "group_full_edit_name": (
             "1/6 📝 <b>Гуруҳ номи</b>\n"
             "Ҳозирги қиймат: <b>{current}</b>\n"
@@ -1682,7 +2014,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_confirm": "✅ Тасдиқлаш",
         "btn_edit": "✏️ Ўзгартириш",
         "btn_details": "📄 Батафсил",
+        "btn_detailed": "📄 Батафсил",
         "btn_compact": "🔼 Қисқача",
+        "btn_short": "📋 Қисқача",
         "btn_present": "🟢 Қатнашди",
         "btn_absent": "🔴 Келмади",
         "btn_finish": "✅ Якунлаш",
@@ -1693,17 +2027,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "menu_admin_schedule": "📅 Дарс жадвали",
         "menu_admin_cancel_lesson": "🚫 Дарсни бекор қилиш",
         "menu_admin_attendance": "📋 Йўқлама қилиш",
-        "menu_admin_payments": "💰 Тўловни тасдиқлаш",
+        "menu_admin_payments": "💳 Тўловлар",
         "menu_admin_debtors": "⚠️ Қарздорлар",
 
         # Teacher menu buttons
-        "menu_teacher_topic": "📝 Дарс мавзусини киритиш",
-        "menu_teacher_groups": "👥 Менинг гуруҳларим",
+        "menu_teacher_topic": "📝 Дарс мавзуси",
+        "menu_teacher_groups": "👥 Гуруҳларим",
         "menu_teacher_attendance": "📋 Йўқлама қилиш",
-        "menu_teacher_add_student": "➕ Янги талаба қўшиш",
+        "menu_teacher_add_student": "➕ Талаба қўшиш",
         "menu_teacher_schedule": "📅 Дарс жадвали",
         "menu_teacher_cancel_lesson": "🚫 Дарсни бекор қилиш",
-        "menu_teacher_payments": "💳 Тўловларни тасдиқлаш",
+        "menu_teacher_payments": "💳 Тўловлар",
         "menu_teacher_debtors": "⚠️ Қарздорлар",
 
         # Teacher detailed group roster view
@@ -1724,9 +2058,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "roster_bot_status_line": "   🤖 Бот: Талаба ({stu_status}), Ота-она ({par_status})",
 
         # Lesson Topic & Plan builder + Polite 1-Day Reminder
-        "menu_lesson_topic": "📝 Дарс мавзуси ва режаси",
-        "btn_enter_topic_plan": "📝 Мавзу ва режа киритиш",
-        "btn_past_topics_history": "📚 Олдинги киритилган мавзулар",
+        "menu_lesson_topic": "📝 Дарс мавзуси",
+        "btn_enter_topic_plan": "📝 Мавзу/режа киритиш",
+        "btn_past_topics_history": "📚 Мавзулар тарихи",
         "topic_history_header": "📚 <b>{group} — Олдинги киритилган мавзулар:</b>\n",
         "topic_history_empty": "ℹ️ Ушбу гуруҳ учун ҳали мавзу ва режа киритилмаган.",
         "reminder_teacher_1day_before": (
@@ -1768,8 +2102,12 @@ TEXTS: dict[str, dict[str, str]] = {
             "Маълумотни сақлаб, гуруҳ чатига юборамизми?"
         ),
         "btn_topic_broadcast": "📢 Гуруҳга юбориш",
+        "btn_send_to_group": "📢 Гуруҳга юбориш",
         "btn_topic_save_only": "💾 Фақат сақлаш",
         "btn_topic_edit": "✏️ Таҳрирлаш",
+        "topic_status_added": "➕ Мавзуларга қўшимча киритилди",
+        "topic_status_updated": "✏️ Дарс мавзуси ўзгартирилди",
+        "topic_teacher_footer": "Ҳурмат билан, гуруҳ устози {teacher_name}",
         "topic_saved": (
             "✅ <b>{group} ({date})</b> учун дарс мавзуси ва режаси сақланди!"
         ),
@@ -1786,18 +2124,18 @@ TEXTS: dict[str, dict[str, str]] = {
             "📅 Сана: <b>{date}</b>\n"
             "📖 Мавзу: <b>{topic_title}</b>\n\n"
             "📝 <b>Дарсда ўтиладиган мавзулар / вазифа:</b>\n{lesson_details}\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "topic_cancelled": "❌ Дарс мавзуси ва режасини киритиш бекор қилинди.",
 
         # Student menu buttons
         "menu_student_group": "👥 Менинг гуруҳим",
         "menu_student_schedule": "📅 Дарс жадвали",
-        "menu_student_payments": "💳 Тўловлар ва Қарзлар",
+        "menu_student_payments": "💳 Тўлов ва қарзлар",
 
         # Parent menu buttons
-        "menu_parent_schedule": "📅 Фарзандим дарс жадвали",
-        "menu_parent_payments": "💳 Тўловлар ва Қарзлар",
+        "menu_parent_schedule": "📅 Фарзандим жадвали",
+        "menu_parent_payments": "💳 Тўлов ва қарзлар",
 
         # Human-friendly cycle & lesson labels
         "human_cycle_label": "{num}-ўқув ойи ({count} та дарс)",
@@ -1877,6 +2215,83 @@ TEXTS: dict[str, dict[str, str]] = {
         # Attendance
         "attendance_select_group": "📋 Йўқлама қилиш учун гуруҳни танланг:",
         "attendance_no_groups_today": "ℹ️ Йўқлама учун гуруҳлар топилмади.",
+        "attendance_btn_today": "📅 Бугун, {today_date}",
+        "attendance_btn_other_day": "🗓 Бошқа кун",
+        "attendance_past_date_notice": "⚠️ Ўтиб кетган ({sana}) ги дарс йўқламаси қилинди\n\n",
+        "attendance_topic_line": "📖 Мавзу: \"{mavzu}\"\n",
+        "attendance_signature": "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!",
+        "attendance_student_present": (
+            "🟢 Ҳурматли <b>{talaba_ismi}</b>,\n\n"
+            "Сиз <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>га қатнашдингиз.\n"
+            "{mavzu_qatori}Биз сизнинг билим олишдаги қатъиятингиз ва иштиёқингизни юқори баҳолаймиз.\n"
+            "{talaba_qarz_eslatmasi}\n"
+            "Ҳурмат билан,\n"
+            "Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "attendance_student_absent": (
+            "🔴 Ҳурматли <b>{talaba_ismi}</b>,\n\n"
+            "Сиз <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>да қатнашмадингиз.\n"
+            "{mavzu_qatori}Янги мавзуларни ўтказиб юбормаслик учун дарс материаллари ва уйга вазифаларни кўриб чиқишингизни тавсия қиламиз. Кейинги дарсда сизни албатта кутамиз!\n"
+            "{talaba_qarz_eslatmasi}\n"
+            "Ҳурмат билан,\n"
+            "Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "attendance_student_debt_note": (
+            "\n💳 Эслатма: Сизнинг <b>{qarz_summasi} сўм</b> қарздорлигингиз мавжуд. "
+            "Янги ўқув ойи бошланмасидан аввал тўловни тезроқ амалга оширишингизни сўраймиз.\n"
+        ),
+        "attendance_parent_present": (
+            "🟢 Ассалому алайкум, ҳурматли {ota_ona_ismi}!\n\n"
+            "Фарзандингиз <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>га қатнашди.\n"
+            "{mavzu_qatori}Биз фарзандингизнинг билим олишдаги қатъияти ва интилишини юқори баҳолаймиз!\n"
+            "{ota_ona_qarz_eslatmasi}\n"
+            "Ҳурмат билан,\n"
+            "Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "attendance_parent_absent": (
+            "🔴 Ассалому алайкум, ҳурматли {ota_ona_ismi}!\n\n"
+            "Фарзандингиз <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>да қатнашмади.\n"
+            "{mavzu_qatori}Янги мавзуларни ўтказиб юбормаслик учун дарс материаллари ва уйга вазифаларни кўриб чиқишини тавсия қиламиз. Кейинги дарсда албатта кутиб қоламиз!\n"
+            "{ota_ona_qarz_eslatmasi}\n"
+            "Ҳурмат билан,\n"
+            "Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "attendance_parent_debt_note": (
+            "\n💳 Эслатма: Фарзандингизнинг <b>{qarz_summasi} сўм</b> қарздорлиги мавжуд. "
+            "Янги ўқув ойи бошланмасидан аввал тўловни тезроқ амалга оширишингизни сўраймиз.\n"
+        ),
+        "attendance_multi_header": (
+            "📋 Ассалому алайкум, ҳурматли {ota_ona_ismi}!\n\n"
+            "Фарзандларингизнинг <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган дарслар бўйича давомат маълумоти:\n\n"
+        ),
+        "attendance_multi_child": (
+            "{status_emoji} {tartib}. <b>{talaba_ismi}</b>\n"
+            "📚 Дарс/Гуруҳ: <b>{guruh_nomi}</b> • <b>{dars_raqami}-дарс</b>\n"
+            "🗓 Дарс куни: {hafta_kuni} | Ҳолати: {holat_matni}\n"
+            "👨‍🏫 Устоз: {oqituvchi_ismi}\n"
+            "{mavzu_qatori}\n"
+            "──────────────────"
+        ),
+        "attendance_multi_status_present": "Дарсга қатнашди",
+        "attendance_multi_status_absent": "Дарсга қатнашмади",
+        "attendance_multi_debt_title": "💳 Тўлов эслатмаси:",
+        "attendance_multi_debt_item": (
+            "• <b>{talaba_ismi}</b> — <b>{qarz_summasi} сўм</b> қарздорлик мавжуд. "
+            "Янги ой келмасдан аввал тўловни тезроқ амалга оширишингизни сўраймиз."
+        ),
+        "parent_pay_header": "💳 Фарзандларингизнинг тўлов ва қарздорлик ҳолати:\n\n",
+        "parent_pay_child": (
+            "👶 {tartib}. {talaba_ismi}\n"
+            "📚 Дарс/Гуруҳ: {guruh_nomi}\n"
+            "💵 Ойлик тўлов: {oylik_tolov} сўм\n"
+            "📊 Ҳолати: {tolov_holati}\n"
+            "❗️ Қарздорлик: {qarz_summasi} сўм"
+        ),
+        "parent_pay_separator": "\n\n──────────────────\n\n",
+        "parent_pay_total": "\n\n💰 Умумий қарздорлик: {umumiy_qarz} сўм",
+        "parent_pay_status_paid": "✅ Тўланган",
+        "parent_pay_status_unpaid": "❌ Тўланмаган",
+        "parent_sched_btn_back": "🔙 Ортга",
         "attendance_select_date": (
             "📅 <b>{group} — Йўқлама санасини танланг</b>\n\n"
             "Бугунги дарсни белгилашингиз, қолиб кетган ўтган дарсни тўлдиришинги "
@@ -1924,7 +2339,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Ассалому алайкум, <b>{student_name}</b>!\n"
             "Сиз <b>{date}</b> кунги <b>{group}</b> гуруҳи дарсида қатнаша олмадингиз (Келмади ❌).\n"
             "Илтимос, кейинги дарсгача ўтилган мавзуни кўриб чиқиб, тайёрланиб келинг.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_notify_absent_parent": (
             "🔴 <b>Давомат хабарномаси</b>\n\n"
@@ -1932,7 +2347,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сизга шуни маълум қиламизки, фарзандингиз <b>{student_name}</b> "
             "<b>{date}</b> кунги <b>{group}</b> гуруҳи дарсида қатнашмади (Келмади ❌).\n"
             "Илтимос, дарсларга мунтазам қатнашишини назорат қилиб боришингизни сўраймиз.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_notify_updated_present": (
             "🔄 <b>Давомат ҳолати янгиланди</b>\n\n"
@@ -1947,7 +2362,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "<b>{date}</b> кунги <b>{group}</b> гуруҳи дарсидаги ҳолатингиз "
             "<b>Келмади ❌</b> деб янгиланди.\n"
             "Илтимос, ўтилган мавзуни мустақил ўзлаштириб, кейинги дарсга тайёрланиб келинг.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_notify_updated_absent_parent": (
             "🔄 <b>Давомат ҳолати янгиланди</b>\n\n"
@@ -1955,7 +2370,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сизга маълум қиламизки, фарзандингиз <b>{student_name}</b>нинг "
             "<b>{date}</b> кунги <b>{group}</b> гуруҳи дарсидаги давомати "
             "<b>Келмади ❌</b> деб янгиланди.\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_topic_addon": (
             "\n\n📚 Мавзу: <b>{topic_title}</b>\n"
@@ -2006,8 +2421,8 @@ TEXTS: dict[str, dict[str, str]] = {
             "🗓 Якунланган давр: <b>{cycle_title}</b>\n"
             "🆕 Янги ўқув ойи автоматик очилди: <b>{next_cycle_title}</b>"
         ),
-        "btn_payment_confirm": "✅ Тўловни тасдиқлаш",
-        "btn_payment_revert": "↩️ Тўловни рад этиш (бекор қилиш)",
+        "btn_payment_confirm": "✅ Тасдиқлаш",
+        "btn_payment_revert": "↩️ Қайтариш",
         "payment_select_group": "💰 Тўловни тасдиқлаш учун гуруҳни танланг:",
         "payment_select_student": "👤 Талабани танланг (<b>{group}</b>):",
         "payment_select_cycle": "🗓 Тўлов қилинаётган ўқув ойини танланг:",
@@ -2129,7 +2544,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "reminder_evening_before": (
             "🌙 <b>Эртанги дарс эслатмаси</b>\n\n"
             "📚 Гуруҳ: <b>{group}</b>\n"
-            "⏰ Эртага соат <b>{time}</b> да дарсингиз бор. Вақтида келишни унутманг!"
+            "⏰ Эртага соat <b>{time}</b> да дарсингиз бор. Вақтида келишни унутманг!"
         ),
         "reminder_morning_today": (
             "☀️ <b>Бугунги дарс эслатмаси</b>\n\n"
@@ -2162,6 +2577,93 @@ TEXTS: dict[str, dict[str, str]] = {
     },
 }
 
+# Previous ReplyKeyboard labels. Users may still have an older menu on screen;
+# handlers match these through button_texts() so old buttons keep working.
+LEGACY_BUTTON_TEXTS: dict[str, tuple[str, ...]] = {
+    "btn_change_lang": (
+        "🌐 Tilni o‘zgartirish",
+    ),
+    "btn_switch_to_parent": (
+        "👨‍👩‍👧 Ota-ona rejimiga o'tish",
+        "👨‍👩‍👧 Ота-она режимига ўтиш",
+    ),
+    "btn_switch_to_student": (
+        "🎓 Talaba rejimiga o'tish",
+        "🎓 Талаба режимига ўтиш",
+    ),
+    "menu_admin_attendance": (
+        "📋 Yo'qlama qilish",
+    ),
+    "menu_admin_manage_admins": (
+        "👑 Adminlar boshqaruvi",
+        "👑 Админлар бошқаруви",
+    ),
+    "menu_admin_manage_teachers": (
+        "👨‍🏫 Ustozlar boshqaruvi",
+        "👨‍🏫 Устозлар бошқаруви",
+    ),
+    "menu_admin_payments": (
+        "💰 To'lovni tasdiqlash",
+        "💰 To‘lovni tasdiqlash",
+        "💰 Тўловни тасдиқлаш",
+    ),
+    "menu_lesson_topic": (
+        "📝 Dars mavzusi va rejasi",
+        "📝 Дарс мавзуси ва режаси",
+    ),
+    "menu_parent_payments": (
+        "💳 To‘lovlar va Qarzlar",
+        "💳 Тўловлар ва Қарзлар",
+    ),
+    "menu_parent_schedule": (
+        "📅 Farzandim dars jadvali",
+        "📅 Farzandimning dars jadvali",
+        "📅 Фарзандим дарс жадвали",
+        "📅 Фарзандимнинг дарс жадвали",
+    ),
+    "menu_profile": (
+        "⚙️ Shaxsiy ma'lumotlar",
+        "⚙️ Шахсий маълумотлар",
+        "👤 Shaxsiy ma'lumotlarim",
+        "👤 Шахсий маълумотларим",
+    ),
+    "menu_student_payments": (
+        "💳 To‘lovlar va Qarzlar",
+        "💳 Тўловлар ва Қарзлар",
+    ),
+    "menu_teacher_add_student": (
+        "➕ Yangi talaba qo'shish",
+        "➕ Янги талаба қўшиш",
+    ),
+    "menu_teacher_attendance": (
+        "📋 Yo'qlama qilish",
+    ),
+    "menu_teacher_groups": (
+        "👥 Mening guruhlarim",
+        "👥 Менинг гуруҳларим",
+    ),
+    "menu_teacher_payments": (
+        "💳 To'lovlarni tasdiqlash",
+        "💳 Тўловларни тасдиқлаш",
+    ),
+    "menu_teacher_topic": (
+        "📝 Dars mavzusini kiritish",
+        "📝 Дарс мавзусини киритиш",
+    ),
+}
+
+
+def button_texts(*keys: str) -> set[str]:
+    """Every label (current latn/cyrl and legacy) a ReplyKeyboard button may send."""
+    result: set[str] = set()
+    for key in keys:
+        for lang in ("latn", "cyrl"):
+            value = TEXTS[lang].get(key)
+            if value:
+                result.add(value)
+        result.update(LEGACY_BUTTON_TEXTS.get(key, ()))
+    return result
+
 
 class _SafeFormatDict(dict[str, Any]):
     def __missing__(self, key: str) -> str:
@@ -2177,6 +2679,35 @@ def t(key: str, lang: str = "latn", **kwargs: Any) -> str:
         except KeyError:
             return template.format_map(_SafeFormatDict(kwargs))
     return template
+
+
+def format_field_label(field_key: str, lang: str = "latn") -> str:
+    safe_lang = lang if lang in FIELD_LABELS else "latn"
+    return (
+        FIELD_LABELS[safe_lang].get(field_key)
+        or FIELD_LABELS["latn"].get(field_key)
+        or field_key
+    )
+
+
+def format_full_weekdays(days_str: str, lang: str = "latn") -> str:
+    cleaned = str(days_str or "").strip()
+    if not cleaned:
+        return ""
+    safe_lang = lang if lang in WEEKDAYS_FULL else "latn"
+    full_map = WEEKDAYS_FULL[safe_lang]
+    raw_tokens = [tok.strip() for tok in cleaned.split(",") if tok.strip()]
+    if len(raw_tokens) <= 1 and " " in cleaned and "," not in cleaned:
+        raw_tokens = [tok.strip() for tok in cleaned.split() if tok.strip()]
+    result: list[str] = []
+    for tok in raw_tokens:
+        norm = tok.lower().strip(".- ")
+        idx = _WEEKDAY_TOKEN_TO_IDX.get(norm)
+        if idx is not None:
+            result.append(full_map[idx])
+        else:
+            result.append(tok)
+    return ", ".join(result)
 
 
 def format_human_cycle_title(
@@ -2252,6 +2783,20 @@ def format_uz_date(date_str: str, lang: str = "latn") -> str:
     if not month_name:
         return cleaned
     return f"{day}-{month_name.lower()}"
+
+
+def format_uz_date_long(d_val: Any, lang: str = "latn") -> str:
+    """date -> '2026-yil 22-Noyabr' (Cyrillic: '2026-йил 22-Ноябрь')."""
+    safe_lang = lang if lang in MONTHS_UZ else "latn"
+    year_word = "йил" if safe_lang == "cyrl" else "yil"
+    month_name = MONTHS_UZ[safe_lang].get(d_val.month, "")
+    return f"{d_val.year}-{year_word} {d_val.day}-{month_name}"
+
+
+def format_weekday_full(d_val: Any, lang: str = "latn") -> str:
+    """date -> full Uzbek weekday name (e.g. 'Yakshanba')."""
+    safe_lang = lang if lang in WEEKDAYS_FULL else "latn"
+    return WEEKDAYS_FULL[safe_lang][d_val.weekday()]
 
 
 def format_uz_date_list(dates: list[str], lang: str = "latn") -> str:

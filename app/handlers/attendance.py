@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import logging
 import os
 import re
 from datetime import date, datetime
@@ -17,9 +18,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app import database
+from app.utils import dual_role_header, now_tashkent, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
     get_all_dynamic_admins,
@@ -27,14 +28,24 @@ from app.database import (
     get_teacher_by_telegram_id,
     get_user,
     get_user_lang,
+    has_dual_student_parent_role,
     upsert_group_counter,
 )
 from app.keyboards import (
+    InlineKeyboardBuilder,
     admin_attendance_report_kb,
     attendance_marking_kb,
+    build_attendance_mode_kb,
     groups_inline_kb,
 )
-from app.locales import WEEKDAYS_SHORT, format_uz_date, t
+from app.debt_view import compute_total_debt_map, format_uzs
+from app.locales import (
+    button_texts,
+    format_uz_date,
+    format_uz_date_long,
+    format_weekday_full,
+    t,
+)
 from app.sheets import (
     SheetsManager,
     get_next_lesson_date_after,
@@ -43,45 +54,92 @@ from app.sheets import (
 )
 from app.states import AttendanceStates
 
+logger = logging.getLogger(__name__)
+
 router = Router(name="attendance")
 
 
 class _FallbackAttendanceStates(StatesGroup):
+    selecting_mode = State()
     selecting_date = State()
 
 
+ATT_SELECTING_MODE = getattr(
+    AttendanceStates, "selecting_mode", _FallbackAttendanceStates.selecting_mode
+)
 ATT_SELECTING_DATE = getattr(
     AttendanceStates, "selecting_date", _FallbackAttendanceStates.selecting_date
 )
 
-ATTENDANCE_MENU_TEXTS = {
-    t("menu_teacher_attendance", "latn"),
-    t("menu_teacher_attendance", "cyrl"),
-    t("menu_admin_attendance", "latn"),
-    t("menu_admin_attendance", "cyrl"),
-}
+ATTENDANCE_MENU_TEXTS = button_texts(
+    "menu_teacher_attendance", "menu_admin_attendance"
+)
 
 CANCEL_TEXTS = {t("btn_cancel", "latn"), t("btn_cancel", "cyrl"), "/cancel"}
 
 LOCAL_TEXTS: dict[str, dict[str, str]] = {
     "latn": {
-        "select_date_title": (
-            "📅 <b>{group}</b> — yo‘qlama qilish yoki tahrirlash uchun dars sanasini tanlang:\n"
-            "<i>(✅ — belgilangan, ⏳ — hali belgilanmagan)</i>"
+        "select_mode_title": (
+            "📋 <b>Yo‘qlama qilish</b>\n\n"
+            "Kerakli bo‘limni tanlang:"
         ),
-        "absent_topic_appendix": (
-            "\n\n📝 <b>Dars mavzusi:</b> {topic}"
-            "\n📖 <b>O‘tiladigan mavzu / Uyga vazifa:</b> {content}"
+        "select_past_date_title": (
+            "🗓 <b>{group}</b> — o‘tgan darslardan birini tanlang:\n"
+            "<i>(✅ — belgilangan, ⏳ — hali belgilanmagan, 🚫 — bekor qilingan)</i>"
+        ),
+        "no_past_lessons": (
+            "ℹ️ <b>{group}</b> guruhi uchun o‘tgan dars sanalari topilmadi."
+        ),
+        "future_date_forbidden": (
+            "⚠️ Kelajakdagi dars sanasi uchun yo‘qlama qilish mumkin emas."
+        ),
+        "default_parent_name": "ota-ona",
+        "cycle_end_notice": (
+            "🔔 <b>O‘quv oyi yakunlandi!</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "🗓 Yakunlangan o‘quv oyi: <b>{cycle_title}</b>"
+            "{next_cycle_line}\n\n"
+            "Joriy o‘quv oyi yakunlandi. Keyingi o‘quv oyining 1-darsidan kechikmasdan "
+            "oylik to‘lovni amalga oshirishingizni so‘raymiz.\n\n"
+            "💳 To‘lov uchun karta: <code>{card_number}</code>\n"
+            "👤 Karta egasi: <b>{card_owner}</b>\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "cycle_end_next_line": (
+            "\n🆕 Navbatdagi o‘quv oyi: <b>{next_cycle_title}</b> "
+            "(1-dars: <b>{next_start_date}</b>)"
         ),
     },
     "cyrl": {
-        "select_date_title": (
-            "📅 <b>{group}</b> — йўқлама қилиш ёки таҳрирлаш учун дарс санасини танланг:\n"
-            "<i>(✅ — белгиланган, ⏳ — ҳали белгиланмаган)</i>"
+        "select_mode_title": (
+            "📋 <b>Йўқлама қилиш</b>\n\n"
+            "Керакли бўлимни танланг:"
         ),
-        "absent_topic_appendix": (
-            "\n\n📝 <b>Дарс мавзуси:</b> {topic}"
-            "\n📖 <b>Ўтиладиган мавзу / Уйга вазифа:</b> {content}"
+        "select_past_date_title": (
+            "🗓 <b>{group}</b> — ўтган дарслардан бирини танланг:\n"
+            "<i>(✅ — белгиланган, ⏳ — ҳали белгиланмаган, 🚫 — бекор қилинган)</i>"
+        ),
+        "no_past_lessons": (
+            "ℹ️ <b>{group}</b> гуруҳи учун ўтган дарс саналари топилмади."
+        ),
+        "future_date_forbidden": (
+            "⚠️ Келажакдаги дарс санаси учун йўқлама қилиш мумкин эмас."
+        ),
+        "default_parent_name": "ота-она",
+        "cycle_end_notice": (
+            "🔔 <b>Ўқув ойи якунланди!</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "🗓 Якунланган ўқув ойи: <b>{cycle_title}</b>"
+            "{next_cycle_line}\n\n"
+            "Жорий ўқув ойи якунланди. Кейинги ўқув ойининг 1-дарсидан кечикмасдан "
+            "ойлик тўловни амалга оширишингизни сўраймиз.\n\n"
+            "💳 Тўлов учун карта: <code>{card_number}</code>\n"
+            "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "cycle_end_next_line": (
+            "\n🆕 Навбатдаги ўқув ойи: <b>{next_cycle_title}</b> "
+            "(1-дарс: <b>{next_start_date}</b>)"
         ),
     },
 }
@@ -94,8 +152,16 @@ def _lt(key: str, lang: str = "latn", **kwargs: Any) -> str:
 
 
 def _get_card_info() -> tuple[str, str]:
-    card_number = os.getenv("CARD_NUMBER", "").strip() or os.getenv("PAYMENT_CARD_NUMBER", "").strip() or "—"
-    card_owner = os.getenv("CARD_OWNER", "").strip() or os.getenv("PAYMENT_CARD_OWNER", "").strip() or "—"
+    card_number = (
+        os.getenv("CARD_NUMBER", "").strip()
+        or os.getenv("PAYMENT_CARD_NUMBER", "").strip()
+        or "—"
+    )
+    card_owner = (
+        os.getenv("CARD_OWNER", "").strip()
+        or os.getenv("PAYMENT_CARD_OWNER", "").strip()
+        or "—"
+    )
     return card_number, card_owner
 
 
@@ -176,8 +242,9 @@ async def _get_silent_lesson_topic(
     group_name: str, selected_date: date
 ) -> Optional[dict[str, str]]:
     date_dm = selected_date.strftime("%d.%m")
+    date_dmy = selected_date.strftime("%d.%m.%Y")
     date_iso = selected_date.isoformat()
-    for d_key in (date_dm, date_iso):
+    for d_key in (date_dm, date_dmy, date_iso):
         try:
             rec = await get_lesson_topic(group_name, d_key)
         except Exception:
@@ -193,9 +260,19 @@ async def _get_silent_lesson_topic(
 async def _is_admin(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
+    db_fn = getattr(database, "is_admin", None)
+    if callable(db_fn):
+        try:
+            if await db_fn(user_id):
+                return True
+        except Exception:
+            pass
     db_user = await get_user(user_id)
-    if db_user and db_user.get("role") == "admin":
-        return True
+    if db_user:
+        if db_user.get("role") == "admin" or db_user.get("active_role") == "admin":
+            return True
+        if "admin" in (db_user.get("roles") or []):
+            return True
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
@@ -225,29 +302,68 @@ async def _get_authorized_groups(user_id: int) -> tuple[bool, list[dict[str, Any
     sheets = get_sheets_manager()
     is_admin = await _is_admin(user_id)
     if is_admin:
-        groups = await asyncio.to_thread(sheets.get_all_groups)
+        if hasattr(sheets, "a_get_groups_for_role"):
+            groups = await sheets.a_get_groups_for_role(user_id, is_admin=True)
+        elif hasattr(sheets, "get_groups_for_role"):
+            groups = await asyncio.to_thread(
+                sheets.get_groups_for_role, user_id, True
+            )
+        else:
+            groups = await asyncio.to_thread(sheets.get_all_groups)
         return True, groups
 
-    raw_groups = await asyncio.to_thread(sheets.get_teacher_groups, user_id)
-    groups = [
-        g
-        for g in raw_groups
-        if str(g.get("Ustoz_Chat_ID", "")).strip() == str(user_id)
-    ]
+    if hasattr(sheets, "a_get_groups_for_role"):
+        groups = await sheets.a_get_groups_for_role(user_id, is_admin=False)
+    elif hasattr(sheets, "get_groups_for_role"):
+        groups = await asyncio.to_thread(
+            sheets.get_groups_for_role, user_id, False
+        )
+    else:
+        raw_groups = await asyncio.to_thread(sheets.get_teacher_groups, user_id)
+        groups = [
+            g
+            for g in raw_groups
+            if str(g.get("Ustoz_Chat_ID") or "").strip() == str(user_id)
+        ]
+
     if not groups:
         return False, []
     return True, groups
+
+
+async def _filter_today_groups(
+    sheets: SheetsManager,
+    groups: list[dict[str, Any]],
+    today_str: str,
+    lang: str,
+) -> list[dict[str, Any]]:
+    def _filter_sync() -> list[dict[str, Any]]:
+        matched: list[dict[str, Any]] = []
+        for grp in groups:
+            g_name = str(grp.get("Guruh_Nomi") or "").strip()
+            if not g_name:
+                continue
+            cat = sheets.get_group_lesson_dates_categorized(
+                g_name, today_str=today_str, lang=lang
+            )
+            if cat.get("today_lessons"):
+                matched.append(grp)
+        return matched
+
+    return await asyncio.to_thread(_filter_sync)
 
 
 async def _can_manage_group(user_id: int, group_name: str) -> bool:
     if await _is_admin(user_id):
         return True
     sheets = get_sheets_manager()
-    teacher_groups = await asyncio.to_thread(sheets.get_teacher_groups, user_id)
+    if hasattr(sheets, "a_get_groups_for_role"):
+        teacher_groups = await sheets.a_get_groups_for_role(user_id, is_admin=False)
+    else:
+        teacher_groups = await asyncio.to_thread(sheets.get_teacher_groups, user_id)
     target = group_name.strip().lower()
     return any(
-        g.get("Guruh_Nomi", "").strip().lower() == target
-        and str(g.get("Ustoz_Chat_ID", "")).strip() == str(user_id)
+        str(g.get("Guruh_Nomi") or "").strip().lower() == target
         for g in teacher_groups
     )
 
@@ -258,7 +374,7 @@ async def _resolve_teacher_name(
     fallback_user_id: int,
     fallback_name: str,
 ) -> str:
-    raw_tid = str(group.get("Ustoz_Chat_ID", "") if group else "").strip()
+    raw_tid = str(group.get("Ustoz_Chat_ID") or "" if group else "").strip()
     tid = _parse_int(raw_tid) or fallback_user_id
 
     def _lookup_sheet() -> str:
@@ -290,60 +406,6 @@ async def _resolve_teacher_name(
     if db_u and db_u.get("full_name"):
         return db_u["full_name"]
     return fallback_name or str(tid)
-
-
-def _get_current_cycle_dates_sync(
-    sheets: SheetsManager, group_name: str, reference_date: date
-) -> tuple[str, list[dict[str, Any]]]:
-    with sheets._lock:
-        ss = sheets._get_spreadsheet()
-        for year_candidate in (reference_date.year, reference_date.year - 1):
-            try:
-                ws = ss.worksheet(f"{group_name.strip()}_{year_candidate}")
-            except Exception:
-                continue
-            cycles = sheets.parse_cycles_from_sheet(ws)
-            if not cycles:
-                continue
-            cycle = cycles[-1]
-            prev_d: Optional[date] = None
-            running_year = year_candidate
-            items: list[dict[str, Any]] = []
-            for dc in cycle.get("date_columns", []):
-                d_str = str(dc.get("date_str", "")).strip()
-                try:
-                    d_val, m_val = map(int, d_str.split("."))
-                except ValueError:
-                    continue
-                if prev_d and m_val < prev_d.month:
-                    running_year += 1
-                lesson_d = date(running_year, m_val, d_val)
-                prev_d = lesson_d
-
-                col_idx = dc["col_idx"]
-                is_marked = any(
-                    s_row["marks"].get(col_idx, "").strip() in {"✅", "❌"}
-                    for s_row in cycle.get("student_rows", [])
-                )
-                items.append(
-                    {
-                        "date_iso": lesson_d.isoformat(),
-                        "date_str": d_str,
-                        "weekday_idx": lesson_d.weekday(),
-                        "is_marked": is_marked,
-                    }
-                )
-            if items:
-                return cycle["title"], items
-
-        return "", [
-            {
-                "date_iso": reference_date.isoformat(),
-                "date_str": reference_date.strftime("%d.%m"),
-                "weekday_idx": reference_date.weekday(),
-                "is_marked": False,
-            }
-        ]
 
 
 def _get_existing_attendance_for_date_sync(
@@ -442,7 +504,30 @@ def _collect_parent_chat_ids(
     return parent_ids
 
 
-async def _safe_send(bot: Any, chat_id: int, text: str, reply_markup: Any = None) -> bool:
+def _collect_parent_targets(
+    student: dict[str, Any], exclude_chat_id: Optional[int]
+) -> list[tuple[int, str]]:
+    """Returns unique list of (parent_chat_id, parent_name_from_sheet)."""
+    targets: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for cid_col, name_col in (
+        ("Otasi_Chat_ID", "Otasi_FIO"),
+        ("Onasi_Chat_ID", "Onasi_FIO"),
+        ("OtaOna_Chat_ID", "Otasi_FIO"),
+    ):
+        cid = _parse_int(student.get(cid_col))
+        if cid and cid != exclude_chat_id and cid not in seen:
+            seen.add(cid)
+            p_name = str(student.get(name_col) or "").strip()
+            if not p_name and cid_col == "OtaOna_Chat_ID":
+                p_name = str(student.get("Onasi_FIO") or "").strip()
+            targets.append((cid, p_name))
+    return targets
+
+
+async def _safe_send(
+    bot: Any, chat_id: int, text: str, reply_markup: Any = None
+) -> bool:
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -456,21 +541,32 @@ async def _safe_send(bot: Any, chat_id: int, text: str, reply_markup: Any = None
         return False
 
 
-def _attendance_dates_kb(
-    date_items: list[dict[str, Any]], lang: str
+def _past_attendance_dates_kb(
+    past_lessons: list[dict[str, Any]], lang: str
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    wd_names = WEEKDAYS_SHORT.get(lang, WEEKDAYS_SHORT["latn"])
-    buttons = [
-        InlineKeyboardButton(
-            text=(
-                f"{format_uz_date(item['date_str'], lang)} ({wd_names.get(item['weekday_idx'], '')}) "
-                f"{'✅' if item['is_marked'] else '⏳'}"
-            ),
-            callback_data=f"att_date:{item['date_iso']}",
+    buttons: list[InlineKeyboardButton] = []
+    for item in past_lessons:
+        date_str = item.get("date_str", "")
+        full_date = item.get("full_date", "")
+        weekday = item.get("weekday", "")
+        if item.get("is_cancelled"):
+            icon = "🚫"
+        elif item.get("is_marked"):
+            icon = "✅"
+        else:
+            icon = "⏳"
+        label = (
+            f"{format_uz_date(date_str, lang)} ({weekday}) {icon}"
+            if weekday
+            else f"{format_uz_date(date_str, lang)} {icon}"
         )
-        for item in date_items
-    ]
+        buttons.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"att_date:{full_date}",
+            )
+        )
     for i in range(0, len(buttons), 2):
         builder.row(*buttons[i : i + 2])
     builder.row(
@@ -479,6 +575,19 @@ def _attendance_dates_kb(
         ),
         InlineKeyboardButton(
             text=t("btn_cancel", lang), callback_data="att_date:__cancel__"
+        ),
+    )
+    return builder.as_markup()
+
+
+def _no_groups_nav_kb(lang: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=t("btn_back", lang), callback_data="att_grp:__back__"
+        ),
+        InlineKeyboardButton(
+            text=t("btn_cancel", lang), callback_data="att_grp:__cancel__"
         ),
     )
     return builder.as_markup()
@@ -540,15 +649,25 @@ def _format_admin_report_text(
         parent_parts: list[str] = []
         if item.get("father_tel"):
             lbl = "Otasi" if lang == "latn" else "Отаси"
-            parent_parts.append(f"{lbl}: {_format_clickable_phone(item['father_tel'])}")
+            parent_parts.append(
+                f"{lbl}: {_format_clickable_phone(item['father_tel'])}"
+            )
         if item.get("mother_tel"):
             lbl = "Onasi" if lang == "latn" else "Онаси"
-            parent_parts.append(f"{lbl}: {_format_clickable_phone(item['mother_tel'])}")
+            parent_parts.append(
+                f"{lbl}: {_format_clickable_phone(item['mother_tel'])}"
+            )
         if not parent_parts and item.get("parent_tel"):
             lbl = "Ota-ona" if lang == "latn" else "Ота-она"
-            parent_parts.append(f"{lbl}: {_format_clickable_phone(item['parent_tel'])}")
+            parent_parts.append(
+                f"{lbl}: {_format_clickable_phone(item['parent_tel'])}"
+            )
         par_str = " | ".join(parent_parts) if parent_parts else "—"
-        return f"• <b>{name}</b> ({dm_tags})\n  📞 {stu_tel} | {stu_tg}\n  👨‍👩‍👧 {par_str}"
+        return (
+            f"• <b>{name}</b> ({dm_tags})\n"
+            f"  📞 {stu_tel} | {stu_tg}\n"
+            f"  👨‍👩‍👧 {par_str}"
+        )
 
     present_lines = (
         "\n".join(_build_student_detail_line(it) for it in present_items)
@@ -625,57 +744,66 @@ async def _trigger_cycle_completion(
     card_number, card_owner = _get_card_info()
     grp_esc = html.escape(group_name)
     cyc_esc = html.escape(cycle_title)
+    card_esc = html.escape(card_number)
+    owner_esc = html.escape(card_owner)
+
+    def _build_cycle_end_text(target_lang: str) -> str:
+        next_line = ""
+        if next_cycle_info:
+            next_start_fmt = format_uz_date(
+                str(next_cycle_info.get("start_date") or ""), target_lang
+            )
+            next_line = _lt(
+                "cycle_end_next_line",
+                target_lang,
+                next_cycle_title=html.escape(
+                    str(next_cycle_info.get("cycle_title") or "")
+                ),
+                next_start_date=html.escape(next_start_fmt or "—"),
+            )
+        return _lt(
+            "cycle_end_notice",
+            target_lang,
+            group=grp_esc,
+            cycle_title=cyc_esc,
+            next_cycle_line=next_line,
+            card_number=card_esc,
+            card_owner=owner_esc,
+        )
 
     group_tg_id = _parse_int(group.get("Guruh_TG_Chat_ID"))
     if group_tg_id:
-        group_msg = (
-            "🔔 <b>Oylik o‘quv sikli yakunlandi!</b>\n\n"
-            f"📚 Guruh: <b>{grp_esc}</b>\n"
-            f"🗓 Davr: <b>{cyc_esc}</b>\n\n"
-            "Keyingi darslar uchun oylik to‘lovni o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
-            f"💳 Karta: <code>{html.escape(card_number)}</code>\n"
-            f"👤 Karta egasi: <b>{html.escape(card_owner)}</b>\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
-        )
-        await _safe_send(bot, group_tg_id, group_msg)
+        await _safe_send(bot, group_tg_id, _build_cycle_end_text("latn"))
 
-    for uid in unpaid_ids:
-        student = students_by_id.get(uid)
-        if not student:
-            continue
-        stu_name_esc = html.escape(student.get("F.I.O.", "").strip())
+    active_students = [
+        s
+        for s in students_by_id.values()
+        if str(s.get("Status") or "").strip() == "O'qiyapti"
+    ]
+    if not active_students:
+        active_students = list(students_by_id.values())
 
+    group_key = group_name.strip().lower()
+    seen_dm_group: set[tuple[int, str]] = set()
+    seen_parent_group: set[tuple[int, str]] = set()
+
+    for student in active_students:
         stu_cid = _parse_int(student.get("Talaba_Chat_ID"))
         if stu_cid:
-            s_lang = await get_user_lang(stu_cid)
-            await _safe_send(
-                bot,
-                stu_cid,
-                t(
-                    "cycle_completed_remind_student",
-                    s_lang,
-                    group=grp_esc,
-                    cycle_title=cyc_esc,
-                    card_number=html.escape(card_number),
-                    card_owner=html.escape(card_owner),
-                ),
-            )
+            stu_key = (stu_cid, group_key)
+            if stu_key not in seen_dm_group:
+                seen_dm_group.add(stu_key)
+                s_lang = await get_user_lang(stu_cid)
+                await _safe_send(bot, stu_cid, _build_cycle_end_text(s_lang))
 
         for par_cid in _collect_parent_chat_ids(student, stu_cid):
+            parent_key = (par_cid, group_key)
+            if parent_key in seen_parent_group or parent_key in seen_dm_group:
+                continue
+            seen_parent_group.add(parent_key)
+            seen_dm_group.add(parent_key)
             p_lang = await get_user_lang(par_cid)
-            await _safe_send(
-                bot,
-                par_cid,
-                t(
-                    "cycle_completed_remind_parent",
-                    p_lang,
-                    student_name=stu_name_esc,
-                    group=grp_esc,
-                    cycle_title=cyc_esc,
-                    card_number=html.escape(card_number),
-                    card_owner=html.escape(card_owner),
-                ),
-            )
+            await _safe_send(bot, par_cid, _build_cycle_end_text(p_lang))
 
     ustoz_cid = _parse_int(group.get("Ustoz_Chat_ID")) or initiating_teacher_id
     if ustoz_cid and next_cycle_info:
@@ -694,7 +822,7 @@ async def _trigger_cycle_completion(
 
 
 # ----------------------------------------------------------------------
-# Attendance Handlers (📋 Yo'qlama qilish) — NO Topic Prompts
+# Attendance Handlers (📋 Yo'qlama qilish) — Two-Button Mode Entry
 # ----------------------------------------------------------------------
 
 
@@ -713,16 +841,20 @@ async def cmd_attendance_start(message: Message, state: FSMContext) -> None:
         await message.answer(t("contacts_empty", lang))
         return
 
-    await state.set_state(AttendanceStates.selecting_group)
+    today_str = now_tashkent().strftime("%d.%m.%Y")
+    await state.set_state(ATT_SELECTING_MODE)
+    await state.update_data(att_today_str=today_str)
     await message.answer(
-        t("attendance_select_group", lang),
-        reply_markup=groups_inline_kb(
-            groups, prefix="att_grp", lang=lang, include_back=False, include_cancel=True
-        ),
+        _lt("select_mode_title", lang),
+        reply_markup=build_attendance_mode_kb(today_str, lang),
+        parse_mode="HTML",
     )
 
 
-@router.message(StateFilter(AttendanceStates), F.text.in_(CANCEL_TEXTS))
+@router.message(
+    StateFilter(AttendanceStates, _FallbackAttendanceStates),
+    F.text.in_(CANCEL_TEXTS),
+)
 async def msg_attendance_cancel(message: Message, state: FSMContext) -> None:
     if not message.from_user:
         return
@@ -731,8 +863,77 @@ async def msg_attendance_cancel(message: Message, state: FSMContext) -> None:
     await message.answer(t("attendance_cancelled", lang))
 
 
-@router.callback_query(AttendanceStates.selecting_group, F.data.startswith("att_grp:"))
-async def cb_attendance_select_group(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(StateFilter(ATT_SELECTING_MODE), F.data.startswith("att_mode:"))
+async def cb_attendance_select_mode(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message or not callback.data:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    mode = callback.data.split(":", 1)[1].strip()
+    if mode not in {"today", "other"}:
+        await callback.answer()
+        return
+
+    authorized, groups = await _get_authorized_groups(user_id)
+    if not authorized:
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+
+    today_str = now_tashkent().strftime("%d.%m.%Y")
+    sheets = get_sheets_manager()
+
+    if mode == "today":
+        today_groups = await _filter_today_groups(sheets, groups, today_str, lang)
+        await state.set_state(AttendanceStates.selecting_group)
+        await state.update_data(att_mode="today", att_today_str=today_str)
+        if not today_groups:
+            await callback.message.edit_text(
+                t("attendance_no_groups_today", lang),
+                reply_markup=_no_groups_nav_kb(lang),
+                parse_mode="HTML",
+            )
+            await callback.answer()
+            return
+
+        await callback.message.edit_text(
+            t("attendance_select_group", lang),
+            reply_markup=groups_inline_kb(
+                today_groups,
+                prefix="att_grp",
+                lang=lang,
+                include_back=True,
+                include_cancel=True,
+            ),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    await state.set_state(AttendanceStates.selecting_group)
+    await state.update_data(att_mode="other", att_today_str=today_str)
+    await callback.message.edit_text(
+        t("attendance_select_group", lang),
+        reply_markup=groups_inline_kb(
+            groups,
+            prefix="att_grp",
+            lang=lang,
+            include_back=True,
+            include_cancel=True,
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    AttendanceStates.selecting_group, F.data.startswith("att_grp:")
+)
+async def cb_attendance_select_group(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if not callback.from_user or not callback.message:
         return
     user_id = callback.from_user.id
@@ -742,6 +943,18 @@ async def cb_attendance_select_group(callback: CallbackQuery, state: FSMContext)
     if group_name == "__cancel__":
         await state.clear()
         await callback.message.edit_text(t("attendance_cancelled", lang))
+        await callback.answer()
+        return
+
+    if group_name == "__back__":
+        today_str = now_tashkent().strftime("%d.%m.%Y")
+        await state.set_state(ATT_SELECTING_MODE)
+        await state.update_data(att_today_str=today_str)
+        await callback.message.edit_text(
+            _lt("select_mode_title", lang),
+            reply_markup=build_attendance_mode_kb(today_str, lang),
+            parse_mode="HTML",
+        )
         await callback.answer()
         return
 
@@ -759,26 +972,103 @@ async def cb_attendance_select_group(callback: CallbackQuery, state: FSMContext)
         await callback.answer()
         return
 
-    today = datetime.now(TZ).date()
-    cycle_title, date_items = await asyncio.to_thread(
-        _get_current_cycle_dates_sync, sheets, group_name, today
-    )
+    data = await state.get_data()
+    att_mode = data.get("att_mode", "other")
+    today_date = today_tashkent()
+    today_str = today_date.strftime("%d.%m.%Y")
 
+    categorized = await sheets.a_get_group_lesson_dates_categorized(
+        group_name, today_str=today_str, lang=lang
+    )
+    cycle_title = categorized.get("cycle_title", "")
+
+    if att_mode == "today":
+        today_lessons = categorized.get("today_lessons") or []
+        if not today_lessons:
+            await callback.answer(
+                t("attendance_no_groups_today", lang), show_alert=True
+            )
+            return
+
+        lesson_date = today_date
+        try:
+            if today_lessons[0].get("full_date"):
+                lesson_date = date.fromisoformat(today_lessons[0]["full_date"])
+        except ValueError:
+            lesson_date = today_date
+
+        existing_marks = await asyncio.to_thread(
+            _get_existing_attendance_for_date_sync, sheets, group_name, lesson_date
+        )
+        students_min = [
+            {"Talaba_ID": s["Talaba_ID"], "F.I.O.": s["F.I.O."]}
+            for s in active_students
+        ]
+        marks_map = {
+            s["Talaba_ID"]: (
+                existing_marks[s["Talaba_ID"]]
+                if existing_marks.get(s["Talaba_ID"]) in {"✅", "❌"}
+                else "✅"
+            )
+            for s in students_min
+        }
+
+        await state.set_state(AttendanceStates.marking_students)
+        await state.update_data(
+            group_name=group_name,
+            cycle_title_hint=cycle_title,
+            lesson_date=lesson_date.isoformat(),
+            students=students_min,
+            marks_map=marks_map,
+        )
+        await callback.message.edit_text(
+            t(
+                "attendance_mark_title",
+                lang,
+                group=html.escape(group_name),
+                date=format_uz_date(lesson_date.strftime("%d.%m"), lang),
+            ),
+            reply_markup=attendance_marking_kb(
+                students_min,
+                marks_map,
+                lang,
+                back_cb="att_back:group",
+                include_topic_btn=False,
+            ),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    # Mode == "other": ONLY strictly past lesson dates (< today_dd_mm_yyyy)
+    past_lessons = categorized.get("past_lessons") or []
     await state.set_state(ATT_SELECTING_DATE)
     await state.update_data(
         group_name=group_name,
         cycle_title_hint=cycle_title,
+        att_today_str=today_str,
     )
+    if not past_lessons:
+        await callback.message.edit_text(
+            _lt("no_past_lessons", lang, group=html.escape(group_name)),
+            reply_markup=_past_attendance_dates_kb([], lang),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
-        _lt("select_date_title", lang, group=html.escape(group_name)),
-        reply_markup=_attendance_dates_kb(date_items, lang),
+        _lt("select_past_date_title", lang, group=html.escape(group_name)),
+        reply_markup=_past_attendance_dates_kb(past_lessons, lang),
         parse_mode="HTML",
     )
     await callback.answer()
 
 
 @router.callback_query(StateFilter(ATT_SELECTING_DATE), F.data.startswith("att_date:"))
-async def cb_attendance_select_date(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_attendance_select_date(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if not callback.from_user or not callback.message:
         return
     user_id = callback.from_user.id
@@ -805,9 +1095,10 @@ async def cb_attendance_select_date(callback: CallbackQuery, state: FSMContext) 
                 groups,
                 prefix="att_grp",
                 lang=lang,
-                include_back=False,
+                include_back=True,
                 include_cancel=True,
             ),
+            parse_mode="HTML",
         )
         await callback.answer()
         return
@@ -818,8 +1109,16 @@ async def cb_attendance_select_date(callback: CallbackQuery, state: FSMContext) 
         await callback.answer(t("error_generic", lang), show_alert=True)
         return
 
+    today_date = today_tashkent()
+    if lesson_date >= today_date:
+        await callback.answer(_lt("future_date_forbidden", lang), show_alert=True)
+        return
+
     data = await state.get_data()
     group_name: str = data["group_name"]
+    if not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
 
     sheets = get_sheets_manager()
     active_students = await asyncio.to_thread(
@@ -883,35 +1182,53 @@ async def cb_attendance_back(callback: CallbackQuery, state: FSMContext) -> None
     lang = await get_user_lang(user_id)
     data = await state.get_data()
     group_name = data.get("group_name", "")
+    att_mode = data.get("att_mode", "other")
+    today_str = now_tashkent().strftime("%d.%m.%Y")
+    sheets = get_sheets_manager()
 
-    if callback.data == "att_back:date" and group_name:
-        today = datetime.now(TZ).date()
-        cycle_title, date_items = await asyncio.to_thread(
-            _get_current_cycle_dates_sync, get_sheets_manager(), group_name, today
+    if callback.data == "att_back:date" and group_name and att_mode != "today":
+        categorized = await sheets.a_get_group_lesson_dates_categorized(
+            group_name, today_str=today_str, lang=lang
         )
+        past_lessons = categorized.get("past_lessons") or []
         await state.set_state(ATT_SELECTING_DATE)
-        await state.update_data(cycle_title_hint=cycle_title)
+        await state.update_data(
+            cycle_title_hint=categorized.get("cycle_title", "")
+        )
         await callback.message.edit_text(
-            _lt("select_date_title", lang, group=html.escape(group_name)),
-            reply_markup=_attendance_dates_kb(date_items, lang),
+            _lt("select_past_date_title", lang, group=html.escape(group_name)),
+            reply_markup=_past_attendance_dates_kb(past_lessons, lang),
             parse_mode="HTML",
         )
         await callback.answer()
         return
 
     _, groups = await _get_authorized_groups(user_id)
+    if att_mode == "today":
+        groups = await _filter_today_groups(sheets, groups, today_str, lang)
+
+    await state.set_state(AttendanceStates.selecting_group)
     if not groups:
-        await state.clear()
-        await callback.message.edit_text(t("contacts_empty", lang))
+        await callback.message.edit_text(
+            t("attendance_no_groups_today", lang)
+            if att_mode == "today"
+            else t("contacts_empty", lang),
+            reply_markup=_no_groups_nav_kb(lang),
+            parse_mode="HTML",
+        )
         await callback.answer()
         return
 
-    await state.set_state(AttendanceStates.selecting_group)
     await callback.message.edit_text(
         t("attendance_select_group", lang),
         reply_markup=groups_inline_kb(
-            groups, prefix="att_grp", lang=lang, include_back=False, include_cancel=True
+            groups,
+            prefix="att_grp",
+            lang=lang,
+            include_back=True,
+            include_cancel=True,
         ),
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -919,7 +1236,9 @@ async def cb_attendance_back(callback: CallbackQuery, state: FSMContext) -> None
 @router.callback_query(
     AttendanceStates.marking_students, F.data.startswith("att_toggle:")
 )
-async def cb_attendance_toggle_student(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_attendance_toggle_student(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if not callback.from_user or not callback.message:
         return
     lang = await get_user_lang(callback.from_user.id)
@@ -928,6 +1247,8 @@ async def cb_attendance_toggle_student(callback: CallbackQuery, state: FSMContex
     data = await state.get_data()
     students = data.get("students", [])
     marks_map: dict[str, str] = dict(data.get("marks_map", {}))
+    att_mode = data.get("att_mode", "other")
+    back_cb = "att_back:group" if att_mode == "today" else "att_back:date"
 
     current = marks_map.get(student_id, "✅")
     marks_map[student_id] = "❌" if current == "✅" else "✅"
@@ -938,7 +1259,7 @@ async def cb_attendance_toggle_student(callback: CallbackQuery, state: FSMContex
             students,
             marks_map,
             lang,
-            back_cb="att_back:date",
+            back_cb=back_cb,
             include_topic_btn=False,
         )
     )
@@ -946,7 +1267,9 @@ async def cb_attendance_toggle_student(callback: CallbackQuery, state: FSMContex
 
 
 @router.callback_query(AttendanceStates.marking_students, F.data == "att_cancel")
-async def cb_attendance_cancel_marking(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_attendance_cancel_marking(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if not callback.from_user or not callback.message:
         return
     lang = await get_user_lang(callback.from_user.id)
@@ -956,7 +1279,9 @@ async def cb_attendance_cancel_marking(callback: CallbackQuery, state: FSMContex
 
 
 @router.callback_query(AttendanceStates.marking_students, F.data == "att_finish")
-async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContext) -> None:
+async def cb_attendance_finish_instant(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
     if not callback.from_user or not callback.message:
         return
     user_id = callback.from_user.id
@@ -964,10 +1289,17 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
     data = await state.get_data()
 
     group_name: str = data["group_name"]
+    if not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+
     lesson_date = date.fromisoformat(data["lesson_date"])
     marks_map: dict[str, str] = data["marks_map"]
     cycle_title_hint: str = data.get("cycle_title_hint", "")
     date_dm = lesson_date.strftime("%d.%m")
+    sana_dmy = lesson_date.strftime("%d.%m.%Y")
+    today_dmy = today_tashkent().strftime("%d.%m.%Y")
+    is_past_date = sana_dmy != today_dmy
     date_display = format_uz_date(date_dm, lang)
 
     sheets = get_sheets_manager()
@@ -997,6 +1329,8 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
         or 12
     )
     await upsert_group_counter(group_name, lesson_count=new_count)
+    # Exact ordinal of the lesson date inside its monthly cycle (1-dars ... N-dars).
+    dars_raqami = _parse_int(mark_result.get("lesson_number")) or new_count or 1
 
     all_students = await asyncio.to_thread(
         sheets.get_all_students, group_name=group_name, active_only=False
@@ -1007,6 +1341,10 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
     absent_count = sum(1 for m in marks_map.values() if m == "❌")
 
     lesson_topic = await _get_silent_lesson_topic(group_name, lesson_date)
+    mavzu = str(lesson_topic.get("topic") or "").strip() if lesson_topic else ""
+    teacher_name = await _resolve_teacher_name(
+        sheets, group, user_id, callback.from_user.full_name or str(user_id)
+    )
 
     students_sent = 0
     parents_sent = 0
@@ -1014,95 +1352,224 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
     present_items: list[dict[str, Any]] = []
     absent_items: list[dict[str, Any]] = []
 
+    marked_students = [
+        students_by_id[sid] for sid in marks_map if sid in students_by_id
+    ]
+    debt_map = await compute_total_debt_map(sheets, marked_students)
+    weekday_cache: dict[str, str] = {}
+    sana_cache: dict[str, str] = {}
+
+    def _date_parts(l_code: str) -> tuple[str, str]:
+        if l_code not in sana_cache:
+            sana_cache[l_code] = format_uz_date_long(lesson_date, l_code)
+            weekday_cache[l_code] = format_weekday_full(lesson_date, l_code)
+        return sana_cache[l_code], weekday_cache[l_code]
+
+    def _topic_line(l_code: str) -> str:
+        if not mavzu:
+            return ""
+        return t("attendance_topic_line", l_code, mavzu=html.escape(mavzu))
+
+    student_dm_ok: dict[str, bool] = {}
+    parent_dm_ok_count: dict[str, int] = {}
+    # parent_chat_id -> {"name": str, "children": [(sid, stu_name, mark, debt)]}
+    parent_buckets: dict[int, dict[str, Any]] = {}
+
     for sid, mark in marks_map.items():
         student = students_by_id.get(sid)
         if not student:
             continue
 
-        stu_name = student.get("F.I.O.", "").strip() or sid
-        prev_mark = previous_marks.get(sid, "")
-        should_notify = (not prev_was_marked) or (prev_mark != mark)
-
+        stu_name = str(student.get("F.I.O.") or "").strip() or sid
         stu_cid = _parse_int(student.get("Talaba_Chat_ID"))
-        par_cids = _collect_parent_chat_ids(student, stu_cid)
+        parent_targets = _collect_parent_targets(student, stu_cid)
+        total_debt = int(debt_map.get(sid, 0) or 0)
 
-        stu_dm_ok = False
-        par_dm_ok_count = 0
+        student_dm_ok[sid] = False
+        parent_dm_ok_count[sid] = 0
 
-        if should_notify:
-            if prev_was_marked:
-                msg_key = (
-                    "attendance_notify_updated_present"
-                    if mark == "✅"
-                    else "attendance_notify_updated_absent"
+        if stu_cid:
+            s_lang = await get_user_lang(stu_cid)
+            stu_has_dual = await has_dual_student_parent_role(stu_cid)
+            sana_uz, hafta_kuni = _date_parts(s_lang)
+            s_key = (
+                "attendance_student_present"
+                if mark == "✅"
+                else "attendance_student_absent"
+            )
+            s_debt_note = (
+                t(
+                    "attendance_student_debt_note",
+                    s_lang,
+                    qarz_summasi=format_uzs(total_debt),
                 )
-            else:
-                msg_key = (
-                    "attendance_notify_present"
-                    if mark == "✅"
-                    else "attendance_notify_absent"
+                if total_debt > 0
+                else ""
+            )
+            s_body = t(
+                s_key,
+                s_lang,
+                talaba_ismi=html.escape(stu_name),
+                guruh_nomi=html.escape(group_name),
+                sana_uz=sana_uz,
+                hafta_kuni=hafta_kuni,
+                dars_raqami=dars_raqami,
+                mavzu_qatori=_topic_line(s_lang),
+                talaba_qarz_eslatmasi=s_debt_note,
+            )
+            s_prefix = ""
+            if stu_has_dual:
+                s_prefix += dual_role_header("student", s_lang)
+            if is_past_date:
+                s_prefix += t(
+                    "attendance_past_date_notice",
+                    s_lang,
+                    sana=html.escape(sana_dmy),
                 )
+            student_dm_ok[sid] = await _safe_send(
+                callback.bot, stu_cid, f"{s_prefix}{s_body}"
+            )
+            if student_dm_ok[sid]:
+                students_sent += 1
 
-            def _compose_dm_text(target_lang: str, is_parent: bool = False) -> str:
-                resolved_key = msg_key
-                if mark == "❌" and is_parent:
-                    resolved_key = (
-                        "attendance_notify_updated_absent_parent"
-                        if prev_was_marked
-                        else "attendance_notify_absent_parent"
-                    )
-                base_msg = t(
-                    resolved_key,
-                    target_lang,
-                    student_name=html.escape(stu_name),
-                    group=html.escape(group_name),
-                    date=format_uz_date(date_dm, target_lang),
+        for p_cid, p_sheet_name in parent_targets:
+            bucket = parent_buckets.setdefault(
+                p_cid, {"name": "", "children": []}
+            )
+            if p_sheet_name and not bucket["name"]:
+                bucket["name"] = p_sheet_name
+            bucket["children"].append((sid, stu_name, mark, total_debt))
+
+    # One consolidated message per parent chat (siblings are grouped together).
+    for p_cid, bucket in parent_buckets.items():
+        p_lang = await get_user_lang(p_cid)
+        par_has_dual = await has_dual_student_parent_role(p_cid)
+        p_name = bucket["name"]
+        if not p_name:
+            db_p = await get_user(p_cid)
+            if db_p and db_p.get("full_name"):
+                p_name = str(db_p["full_name"]).strip()
+        if not p_name:
+            p_name = _lt("default_parent_name", p_lang)
+
+        sana_uz, hafta_kuni = _date_parts(p_lang)
+        children_list: list[tuple[str, str, str, int]] = bucket["children"]
+
+        if len(children_list) == 1:
+            _sid, c_name, c_mark, c_debt = children_list[0]
+            p_key = (
+                "attendance_parent_present"
+                if c_mark == "✅"
+                else "attendance_parent_absent"
+            )
+            p_debt_note = (
+                t(
+                    "attendance_parent_debt_note",
+                    p_lang,
+                    qarz_summasi=format_uzs(c_debt),
                 )
-                if mark == "❌" and lesson_topic:
-                    appendix = _lt(
-                        "absent_topic_appendix",
-                        target_lang,
-                        topic=html.escape(lesson_topic.get("topic") or "—"),
-                        content=html.escape(lesson_topic.get("content") or "—"),
-                    )
-                    return f"{base_msg}{appendix}"
-                return base_msg
-
-            if stu_cid:
-                s_lang = await get_user_lang(stu_cid)
-                stu_dm_ok = await _safe_send(
-                    callback.bot, stu_cid, _compose_dm_text(s_lang, is_parent=False)
-                )
-                if stu_dm_ok:
-                    students_sent += 1
-
-            for p_cid in par_cids:
-                p_lang = await get_user_lang(p_cid)
-                if await _safe_send(
-                    callback.bot, p_cid, _compose_dm_text(p_lang, is_parent=True)
-                ):
-                    par_dm_ok_count += 1
-                    parents_sent += 1
-
-            if stu_dm_ok or par_dm_ok_count > 0:
-                recipients_names.append(stu_name)
-
-        dm_status_parts: list[str] = []
-        if should_notify:
-            dm_status_parts.append("🎓✅" if stu_dm_ok else "🎓❌")
-            dm_status_parts.append(
-                f"👨‍👩‍👧✅({par_dm_ok_count})" if par_dm_ok_count > 0 else "👨‍👩‍👧❌"
+                if c_debt > 0
+                else ""
+            )
+            p_body = t(
+                p_key,
+                p_lang,
+                ota_ona_ismi=html.escape(p_name),
+                talaba_ismi=html.escape(c_name),
+                guruh_nomi=html.escape(group_name),
+                sana_uz=sana_uz,
+                hafta_kuni=hafta_kuni,
+                dars_raqami=dars_raqami,
+                mavzu_qatori=_topic_line(p_lang),
+                ota_ona_qarz_eslatmasi=p_debt_note,
             )
         else:
-            dm_status_parts.append("o‘zgarmadi")
+            blocks: list[str] = []
+            debt_items: list[str] = []
+            for idx, (_sid, c_name, c_mark, c_debt) in enumerate(children_list, 1):
+                is_present = c_mark == "✅"
+                blocks.append(
+                    t(
+                        "attendance_multi_child",
+                        p_lang,
+                        status_emoji="🟢" if is_present else "🔴",
+                        tartib=idx,
+                        talaba_ismi=html.escape(c_name),
+                        guruh_nomi=html.escape(group_name),
+                        dars_raqami=dars_raqami,
+                        hafta_kuni=hafta_kuni,
+                        holat_matni=t(
+                            "attendance_multi_status_present"
+                            if is_present
+                            else "attendance_multi_status_absent",
+                            p_lang,
+                        ),
+                        oqituvchi_ismi=html.escape(teacher_name),
+                        mavzu_qatori=_topic_line(p_lang),
+                    )
+                )
+                if c_debt > 0:
+                    debt_items.append(
+                        t(
+                            "attendance_multi_debt_item",
+                            p_lang,
+                            talaba_ismi=html.escape(c_name),
+                            qarz_summasi=format_uzs(c_debt),
+                        )
+                    )
+            p_body = t(
+                "attendance_multi_header",
+                p_lang,
+                ota_ona_ismi=html.escape(p_name),
+                sana_uz=sana_uz,
+                hafta_kuni=hafta_kuni,
+            ) + "\n\n".join(blocks)
+            if debt_items:
+                p_body += (
+                    f"\n\n{t('attendance_multi_debt_title', p_lang)}\n"
+                    + "\n".join(debt_items)
+                )
+            p_body += f"\n\n{t('attendance_signature', p_lang)}"
+
+        p_prefix = ""
+        if par_has_dual:
+            p_prefix += dual_role_header(
+                "parent", p_lang, [c[1] for c in children_list]
+            )
+        if is_past_date:
+            p_prefix += t(
+                "attendance_past_date_notice",
+                p_lang,
+                sana=html.escape(sana_dmy),
+            )
+        if await _safe_send(callback.bot, p_cid, f"{p_prefix}{p_body}"):
+            parents_sent += 1
+            for c_sid, _n, _m, _d in children_list:
+                parent_dm_ok_count[c_sid] = parent_dm_ok_count.get(c_sid, 0) + 1
+
+    for sid, mark in marks_map.items():
+        student = students_by_id.get(sid)
+        if not student:
+            continue
+        stu_name = str(student.get("F.I.O.") or "").strip() or sid
+        stu_dm_ok = student_dm_ok.get(sid, False)
+        par_dm_ok_count = parent_dm_ok_count.get(sid, 0)
+
+        if stu_dm_ok or par_dm_ok_count > 0:
+            recipients_names.append(stu_name)
+
+        dm_status_parts = [
+            "🎓✅" if stu_dm_ok else "🎓❌",
+            f"👨‍👩‍👧✅({par_dm_ok_count})" if par_dm_ok_count > 0 else "👨‍👩‍👧❌",
+        ]
 
         item_payload = {
             "name": stu_name,
-            "stu_tel": student.get("Talaba_Tel", "").strip(),
-            "stu_tg": student.get("Talaba_TG", "").strip(),
-            "father_tel": student.get("Otasi_Tel", "").strip(),
-            "mother_tel": student.get("Onasi_Tel", "").strip(),
-            "parent_tel": student.get("OtaOna_Tel", "").strip(),
+            "stu_tel": str(student.get("Talaba_Tel") or "").strip(),
+            "stu_tg": str(student.get("Talaba_TG") or "").strip(),
+            "father_tel": str(student.get("Otasi_Tel") or "").strip(),
+            "mother_tel": str(student.get("Onasi_Tel") or "").strip(),
+            "parent_tel": str(student.get("OtaOna_Tel") or "").strip(),
             "dm_status": " ".join(dm_status_parts),
         }
         if mark == "✅":
@@ -1111,12 +1578,9 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
             absent_items.append(item_payload)
 
     await state.clear()
-    confirm_key = (
-        "attendance_updated_instant" if is_resubmit else "attendance_saved_instant"
-    )
     await callback.message.edit_text(
         t(
-            confirm_key,
+            "attendance_saved_instant",
             lang,
             group=html.escape(group_name),
             date=date_display,
@@ -1141,25 +1605,22 @@ async def cb_attendance_finish_instant(callback: CallbackQuery, state: FSMContex
     group_debtors = await asyncio.to_thread(sheets.get_debtors, group_name)
     debtor_items = [
         {
-            "name": d.get("F.I.O.", "").strip() or d.get("Talaba_ID", ""),
-            "debts": d.get("Qarzdor_Oylar", "").strip(),
+            "name": str(d.get("F.I.O.") or "").strip() or str(d.get("Talaba_ID") or ""),
+            "debts": str(d.get("Qarzdor_Oylar") or "").strip(),
             "debt_count": len(
-                [x for x in d.get("Qarzdor_Oylar", "").split(";") if x.strip()]
+                [x for x in str(d.get("Qarzdor_Oylar") or "").split(";") if x.strip()]
             ),
-            "stu_tel": d.get("Talaba_Tel", "").strip(),
+            "stu_tel": str(d.get("Talaba_Tel") or "").strip(),
             "parent_tel": (
-                d.get("Otasi_Tel", "").strip()
-                or d.get("Onasi_Tel", "").strip()
-                or d.get("OtaOna_Tel", "").strip()
+                str(d.get("Otasi_Tel") or "").strip()
+                or str(d.get("Onasi_Tel") or "").strip()
+                or str(d.get("OtaOna_Tel") or "").strip()
             ),
         }
         for d in group_debtors
     ]
 
-    teacher_name = await _resolve_teacher_name(
-        sheets, group, user_id, callback.from_user.full_name or str(user_id)
-    )
-    lesson_time = (group.get("Dars_Vaqti", "").strip() if group else "") or "—"
+    lesson_time = (str(group.get("Dars_Vaqti") or "").strip() if group else "") or "—"
 
     report_payload = {
         "group_name": group_name,

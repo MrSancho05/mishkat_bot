@@ -15,6 +15,7 @@ class GroupAddStates(StatesGroup):
     selecting_lesson_count = State()
     selecting_days = State()
     entering_time = State()
+    entering_fee = State()
     confirming = State()
 
 
@@ -28,6 +29,7 @@ class GroupEditStates(StatesGroup):
     entering_time = State()
     editing_price = State()
     confirming = State()
+    confirm_delete_group = State()
 
 
 class FullGroupEditStates(StatesGroup):
@@ -98,6 +100,12 @@ class StudentAddStates(StatesGroup):
     entering_mother_phone = State()
     entering_parent_phone = State()
     confirming = State()
+    parent_batch_type = State()
+    parent_batch_name = State()
+    parent_batch_phone = State()
+    parent_batch_child_name = State()
+    parent_batch_child_group = State()
+    parent_batch_add_more = State()
 
 
 class StudentManageStates(StatesGroup):
@@ -109,6 +117,8 @@ class StudentManageStates(StatesGroup):
     selecting_new_group = State()
     confirm_keep_in_old_group = State()
     confirming_delete = State()
+    select_reserve_student = State()
+    select_restore_group = State()
 
 
 class AttendanceStates(StatesGroup):
@@ -145,3 +155,26 @@ class ProfileEditStates(StatesGroup):
     choosing_field = State()
     entering_full_name = State()
     sharing_phone = State()
+
+class LegacyDebtStates(StatesGroup):
+    entering_label = State()
+    entering_dates = State()
+    entering_months = State()
+    entering_amount = State()
+    confirming = State()
+
+
+class GuestLeadStates(StatesGroup):
+    choosing_course = State()
+    entering_full_name = State()
+    sharing_phone = State()
+    confirming = State()
+
+
+class CourseManageStates(StatesGroup):
+    viewing = State()
+    entering_name = State()
+    entering_description = State()
+    entering_price = State()
+    entering_duration = State()
+    editing_price = State()

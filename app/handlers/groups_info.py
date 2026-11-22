@@ -19,18 +19,25 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+import app.config as _app_config
 from app import database
+from app.utils import now_tashkent, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
 from app.database import (
     create_teacher_invite,
     get_active_teachers,
+    get_notification_details,
     get_teacher_by_invite_code,
     get_teacher_by_telegram_id,
     get_user,
     get_user_lang,
     reset_user_role,
+    save_notification_details,
 )
 from app.keyboards import (
+    balance_inline_markup,
+    pair_buttons,
+    build_expandable_notif_kb,
     full_group_edit_confirm_kb,
     full_group_edit_count_kb,
     full_group_edit_step_kb,
@@ -40,6 +47,7 @@ from app.keyboards import (
     group_add_lesson_count_kb,
     group_add_teacher_kb,
     group_add_weekdays_kb,
+    group_delete_confirm_kb,
     group_edit_lesson_count_kb,
     group_edit_teacher_kb,
     group_edit_weekdays_kb,
@@ -51,7 +59,15 @@ from app.keyboards import (
     teacher_manage_confirm_delete_kb,
     teacher_manage_list_kb,
 )
-from app.locales import WEEKDAYS_SHORT, format_uz_date, format_uz_date_list, t
+from app.locales import (
+    WEEKDAYS_SHORT,
+    button_texts,
+    format_field_label,
+    format_uz_date,
+    format_uz_date_list,
+    format_uzs,
+    t,
+)
 from app.sheets import (
     COLOR_HEADER_GRAY,
     STUDENT_HEADERS,
@@ -101,10 +117,7 @@ TEACHER_HEADERS = [
 ]
 PLACEHOLDER_TEXT = "Ma'lumot kiritilmagan"
 
-ADMIN_MANAGE_MENU_TEXTS = {
-    "👑 Adminlar boshqaruvi",
-    "👑 Админлар бошқаруви",
-}
+ADMIN_MANAGE_MENU_TEXTS = button_texts("menu_admin_manage_admins")
 for _adm_key in (
     "menu_admin_admins",
     "menu_admins",
@@ -116,9 +129,11 @@ for _adm_key in (
         if _val != _adm_key:
             ADMIN_MANAGE_MENU_TEXTS.add(_val)
 
-TEACHER_MANAGE_MENU_TEXTS = {
-    t("menu_admin_manage_teachers", "latn"),
-    t("menu_admin_manage_teachers", "cyrl"),
+TEACHER_MANAGE_MENU_TEXTS = button_texts("menu_admin_manage_teachers")
+
+DELETE_GROUP_BTN_TEXTS = {
+    t("btn_delete_group", "latn"),
+    t("btn_delete_group", "cyrl"),
 }
 
 LOCAL_TEXTS: dict[str, dict[str, str]] = {
@@ -126,11 +141,11 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         "choose_groups_mode": "📚 <b>Guruhlar bo‘limi</b>\nKerakli bo‘limni tanlang:",
         "btn_all_groups": "📚 Barcha guruhlar",
         "btn_today_groups": "📅 Bugungi guruhlar",
-        "btn_add_group": "➕ Yangi guruh qo‘shish",
+        "btn_add_group": "➕ Yangi guruh",
         "btn_edit_group": "✏️ Guruhni tahrirlash",
         "btn_edit_group_name": "📝 Guruh nomi",
-        "btn_edit_group_price": "💰 To‘lov summasini belgilash",
-        "btn_admins_manage": "👑 Adminlar boshqaruvi",
+        "btn_edit_group_price": "💰 To‘lov summasi",
+        "btn_admins_manage": "👑 Adminlar",
         "no_groups_all": "ℹ️ Sizga biriktirilgan guruhlar topilmadi.",
         "no_groups_today": "ℹ️ Bugun darsi belgilangan guruhlaringiz topilmadi.",
         "select_group_all": "📚 <b>Barcha guruhlar:</b>\nBatafsil ma'lumotlarni ko‘rish uchun guruhni tanlang:",
@@ -172,7 +187,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Ustozni qaysi guruhga biriktirmoqchisiz? Guruhni tanlang "
             "(avtomatik bir martalik taklif havolasi yaratiladi):"
         ),
-        "add_teacher_no_group_btn": "🔗 Guruhsiz umumiy havola yaratish",
+        "add_teacher_no_group_btn": "🔗 Guruhsiz havola",
         "add_teacher_invite_ready": (
             "✅ <b>Ustoz taklif havolasi yaratildi!</b>\n\n"
             "📚 Guruh: <b>{group}</b>\n"
@@ -209,6 +224,12 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Endi bir o‘quv oyidagi darslar sonini tanlang:"
         ),
         "add_group_select_days_alert": "Kamida bitta dars kunini tanlang!",
+        "add_group_enter_fee": (
+            "💰 <b>{group}</b> guruhi uchun <b>oylik to‘lov summasini</b> kiriting:\n\n"
+            "<i>Masalan: <code>500000</code> yoki <code>500</code> "
+            "(10 000 dan kichik son avtomatik 1000 ga ko‘paytiriladi).</i>"
+        ),
+        "add_group_fee_line": "💰 Oylik to‘lov summasi: <b>{amount} so‘m</b>",
         "add_group_confirm_summary": (
             "📋 <b>Yangi guruh ma'lumotlarini tasdiqlang:</b>\n\n"
             "📚 Guruh nomi: <b>{group}</b>\n"
@@ -225,7 +246,8 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "👨‍🏫 Ustoz: <b>{teacher_label}</b>\n"
             "📆 Kunlar: <b>{days}</b> | ⏰ Vaqt: <b>{time}</b>\n"
             "📄 Jadval varag‘i: <b>{sheet_title}</b>\n"
-            "🗓 Birinchi sikl: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "🗓 Birinchi sikl: <b>{cycle_title}</b> ({start_date} — {end_date})\n"
+            "💳 <i>Eslatma: Yangi o'quv oyi uchun to'lov 1-darsdan boshlab to'lanishi lozim.</i>\n\n"
             "🔗 Talabalar o‘zi ro‘yxatdan o‘tishi uchun havola:\n<code>{join_link}</code>\n\n"
             "💬 Telegram guruh chatini ulash uchun guruh ichida yuboring:\n"
             "<code>/link_group {group}</code>"
@@ -259,7 +281,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>{group}</b> guruhining oylik to‘lov summasi "
             "<b>{amount} so'm</b> etib belgilandi!"
         ),
-        "btn_confirm_and_update": "✅ Tasdiqlash va yangilash",
+        "btn_confirm_and_update": "✅ Tasdiqlash",
         "edit_schedule_confirm_preview": (
             "📅 <b>Jadval o‘zgarishini tasdiqlaysizmi?</b>\n\n"
             "📚 Guruh: <b>{group}</b>\n"
@@ -294,16 +316,63 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         "full_edit_saved_notice": (
             "✅ <b>{group}</b> guruhi ma'lumotlari to‘liq yangilandi! (Xabar yuborildi: <b>{sent_count} ta</b>)"
         ),
-        "universal_group_broadcast": (
+        "broadcast_short": (
             "📢 <b>Guruh ma'lumotlari yangilandi!</b>\n\n"
             "📚 Guruh: <b>{group}</b>\n"
-            "👨‍🏫 Ustoz: <b>{teacher_name}</b>\n"
+            "📝 <b>O‘zgarishlar:</b>\n{changes}\n\n"
+            "<i>{signature}</i>"
+        ),
+        "broadcast_detailed": (
+            "📢 <b>Guruh ma'lumotlari yangilandi (Batafsil)</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "{teacher_block}\n"
             "📆 Dars kunlari: <b>{days}</b>\n"
             "⏰ Dars vaqti: <b>{time}</b>\n"
             "🔢 Oylik darslar soni: <b>{count} ta</b>\n"
             "💰 Oylik to‘lov: <b>{price}</b>\n\n"
-            "📝 <i>O‘zgarishlar: {changes}</i>{dates_block}\n\n"
-            "Hurmat bilan, Mishkat o'quv muassasasi"
+            "📝 <b>Kiritilgan o‘zgarishlar:</b>\n{changes}{dates_block}\n\n"
+            "<i>{signature}</i>"
+        ),
+        "signature_admin": "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!",
+        "notif_not_found": "⚠️ Xabarnoma tafsilotlari topilmadi.",
+        "delete_group_select": "🗑 O‘chirmoqchi bo‘lgan guruhingizni tanlang:",
+        "delete_group_confirm": (
+            "⚠️ «<b>{group}</b>» guruhi va uning Google Sheets'dagi "
+            "<code>{group}_{year}</code> jadval listi butunlay o'chiriladi. "
+            "Talabalar, ota-onalar va ustoz ma'lumotlari saqlanib qoladi "
+            "(talabalar Zaxira guruhiga o'tkaziladi). Tasdiqlaysizmi?"
+        ),
+        "delete_group_success": (
+            "✅ «<b>{group}</b>» guruhi va uning jadval varaqalari tizimdan butunlay o‘chirildi.\n"
+            "ℹ️ Guruhdagi talabalar ma'lumotlari saqlanib qoldi va <b>Zaxira</b> ro‘yxatiga o‘tkazildi."
+        ),
+        "delete_group_cancelled": "❌ Guruhni o‘chirish bekor qilindi.",
+        "upfront_cycle_group_notice": (
+            "🆕 <b>Yangi o‘quv oyi boshlandi!</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "🗓 Davr: <b>{cycle_title}</b> ({start_date} — {end_date})\n"
+            "💳 <b>Muhim eslatma:</b> Yangi o‘quv oyi uchun to‘lov 1-darsdan oldin "
+            "(1-darsdan boshlab) amalga oshirilishi lozim.{fee_block}{card_block}\n\n"
+            "<i>Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!</i>"
+        ),
+        "upfront_cycle_student_notice": (
+            "🆕 <b>Yangi o‘quv oyi ochildi!</b>\n\n"
+            "Assalomu alaykum, <b>{student_name}</b>!\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "🗓 Davr: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "💳 Yangi o‘quv oyi uchun oylik to‘lov <b>1-darsdan boshlab (1-darsdan oldin)</b> "
+            "to‘lanishi lozim.{fee_block}{card_block}\n\n"
+            "<i>Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!</i>"
+        ),
+        "upfront_cycle_parent_notice": (
+            "🆕 <b>Yangi o‘quv oyi boshlandi!</b>\n\n"
+            "Assalomu alaykum!\n"
+            "🎓 Farzand(lar)ingiz: <b>{children_names}</b>\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "🗓 Davr: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "💳 Yangi o‘quv oyi uchun to‘lov <b>1-darsdan boshlab (1-darsdan oldin)</b> "
+            "amalga oshirilishi lozim.{fee_block}{card_block}\n\n"
+            "<i>Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!</i>"
         ),
         "admins_panel_title": (
             "👑 <b>Adminlar boshqaruvi</b>\n\n"
@@ -311,7 +380,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         ),
         "admins_static_tag": "Asosiy admin",
         "admins_dynamic_tag": "Tayinlangan admin",
-        "admins_btn_invite": "🔗 Bir martalik admin havolasi",
+        "admins_btn_invite": "🔗 Admin havolasi",
         "admins_invite_created": (
             "🔗 <b>Yangi admin uchun bir martalik taklif havolasi yaratildi!</b>\n\n"
             "👉 Havola:\n<code>{invite_link}</code>\n\n"
@@ -332,11 +401,11 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         "choose_groups_mode": "📚 <b>Гуруҳлар бўлими</b>\nКеракли бўлимни танланг:",
         "btn_all_groups": "📚 Барча гуруҳлар",
         "btn_today_groups": "📅 Бугунги гуруҳлар",
-        "btn_add_group": "➕ Янги гуруҳ қўшиш",
+        "btn_add_group": "➕ Янги гуруҳ",
         "btn_edit_group": "✏️ Гуруҳни таҳрирлаш",
         "btn_edit_group_name": "📝 Гуруҳ номи",
-        "btn_edit_group_price": "💰 Тўлов суммасини белгилаш",
-        "btn_admins_manage": "👑 Админлар бошқаруви",
+        "btn_edit_group_price": "💰 Тўлов суммаси",
+        "btn_admins_manage": "👑 Админлар",
         "no_groups_all": "ℹ️ Сизга бириктирилган гуруҳлар топилмади.",
         "no_groups_today": "ℹ️ Бугун дарси белгиланган гуруҳларингиз топилмади.",
         "select_group_all": "📚 <b>Барча гуруҳлар:</b>\nБатафсил маълумотларни кўриш учун гуруҳни танланг:",
@@ -378,7 +447,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Устозни қайси гуруҳга бириктирмоқчисиз? Гуруҳни танланг "
             "(автоматик бир марталик таклиф ҳаволаси яратилади):"
         ),
-        "add_teacher_no_group_btn": "🔗 Гуруҳсиз умумий ҳавола яратиш",
+        "add_teacher_no_group_btn": "🔗 Гуруҳсиз ҳавола",
         "add_teacher_invite_ready": (
             "✅ <b>Устоз таклиф ҳаволаси яратилди!</b>\n\n"
             "📚 Гуруҳ: <b>{group}</b>\n"
@@ -415,6 +484,12 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Энди бир ўқув ойидаги дарслар сонини танланг:"
         ),
         "add_group_select_days_alert": "Камида битта дарс кунини танланг!",
+        "add_group_enter_fee": (
+            "💰 <b>{group}</b> гуруҳи учун <b>ойлик тўлов суммасини</b> киритинг:\n\n"
+            "<i>Масалан: <code>500000</code> ёки <code>500</code> "
+            "(10 000 дан кичик сон автоматик 1000 га кўпайтирилади).</i>"
+        ),
+        "add_group_fee_line": "💰 Ойлик тўлов суммаси: <b>{amount} сўм</b>",
         "add_group_confirm_summary": (
             "📋 <b>Янги гуруҳ маълумотларини тасдиқланг:</b>\n\n"
             "📚 Гуруҳ номи: <b>{group}</b>\n"
@@ -431,7 +506,8 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "👨‍🏫 Устоз: <b>{teacher_label}</b>\n"
             "📆 Кунлар: <b>{days}</b> | ⏰ Вақт: <b>{time}</b>\n"
             "📄 Жадвал варағи: <b>{sheet_title}</b>\n"
-            "🗓 Биринчи сикл: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "🗓 Биринчи сикл: <b>{cycle_title}</b> ({start_date} — {end_date})\n"
+            "💳 <i>Эслатма: Янги ўқув ойи учун тўлов 1-дарсдан бошлаб тўланиши лозим.</i>\n\n"
             "🔗 Талабалар ўзи рўйхатдан ўтиши учун ҳавола:\n<code>{join_link}</code>\n\n"
             "💬 Telegram гуруҳ чатини улаш учун гуруҳ ичида юборинг:\n"
             "<code>/link_group {group}</code>"
@@ -465,7 +541,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>{group}</b> гуруҳининг ойлик тўлов суммаси "
             "<b>{amount} сўм</b> этиб белгиланди!"
         ),
-        "btn_confirm_and_update": "✅ Тасдиқлаш ва янгилаш",
+        "btn_confirm_and_update": "✅ Тасдиқлаш",
         "edit_schedule_confirm_preview": (
             "📅 <b>Жадвал ўзгаришини тасдиқлайсизми?</b>\n\n"
             "📚 Гуруҳ: <b>{group}</b>\n"
@@ -500,16 +576,63 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         "full_edit_saved_notice": (
             "✅ <b>{group}</b> гуруҳи маълумотлари тўлиқ янгиланди! (Хабар юборилди: <b>{sent_count} та</b>)"
         ),
-        "universal_group_broadcast": (
+        "broadcast_short": (
             "📢 <b>Гуруҳ маълумотлари янгиланди!</b>\n\n"
             "📚 Гуруҳ: <b>{group}</b>\n"
-            "👨‍🏫 Устоз: <b>{teacher_name}</b>\n"
+            "📝 <b>Ўзгаришлар:</b>\n{changes}\n\n"
+            "<i>{signature}</i>"
+        ),
+        "broadcast_detailed": (
+            "📢 <b>Гуруҳ маълумотлари янгиланди (Батафсил)</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "{teacher_block}\n"
             "📆 Дарс кунлари: <b>{days}</b>\n"
             "⏰ Дарс вақти: <b>{time}</b>\n"
             "🔢 Ойлик дарслар сони: <b>{count} та</b>\n"
             "💰 Ойлик тўлов: <b>{price}</b>\n\n"
-            "📝 <i>Ўзгаришлар: {changes}</i>{dates_block}\n\n"
-            "Ҳурмат билан, Мишкат ўқув муассасаси"
+            "📝 <b>Киритилган ўзгаришлар:</b>\n{changes}{dates_block}\n\n"
+            "<i>{signature}</i>"
+        ),
+        "signature_admin": "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!",
+        "notif_not_found": "⚠️ Хабарнома тафсилотлари топилмади.",
+        "delete_group_select": "🗑 Ўчирмоқчи бўлган гуруҳингизни танланг:",
+        "delete_group_confirm": (
+            "⚠️ «<b>{group}</b>» гуруҳи ва унинг Google Sheets'даги "
+            "<code>{group}_{year}</code> жадвал листи бутунлай ўчирилади. "
+            "Талабалар, ота-оналар ва устоз маълумотлари сақланиб қолади "
+            "(талабалар Захира гуруҳига ўтказилади). Тасдиқлайсизми?"
+        ),
+        "delete_group_success": (
+            "✅ «<b>{group}</b>» гуруҳи ва унинг жадвал варақалари тизимдан бутунлай ўчирилди.\n"
+            "ℹ️ Гуруҳдаги талабалар маълумотлари сақланиб қолди ва <b>Захира</b> рўйхатига ўтказилди."
+        ),
+        "delete_group_cancelled": "❌ Гуруҳни ўчириш бекор қилинди.",
+        "upfront_cycle_group_notice": (
+            "🆕 <b>Янги ўқув ойи бошланди!</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "🗓 Давр: <b>{cycle_title}</b> ({start_date} — {end_date})\n"
+            "💳 <b>Муҳим эслатма:</b> Янги ўқув ойи учун тўлов 1-дарсдан олдин "
+            "(1-дарсдан бошлаб) амалга оширилиши лозим.{fee_block}{card_block}\n\n"
+            "<i>Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!</i>"
+        ),
+        "upfront_cycle_student_notice": (
+            "🆕 <b>Янги ўқув ойи очилди!</b>\n\n"
+            "Ассалому алайкум, <b>{student_name}</b>!\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "🗓 Давр: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "💳 Янги ўқув ойи учун ойлик тўлов <b>1-дарсдан бошлаб (1-дарсдан олдин)</b> "
+            "тўланиши лозим.{fee_block}{card_block}\n\n"
+            "<i>Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!</i>"
+        ),
+        "upfront_cycle_parent_notice": (
+            "🆕 <b>Янги ўқув ойи бошланди!</b>\n\n"
+            "Ассалому алайкум!\n"
+            "🎓 Фарзанд(лар)ингиз: <b>{children_names}</b>\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "🗓 Давр: <b>{cycle_title}</b> ({start_date} — {end_date})\n\n"
+            "💳 Янги ўқув ойи учун тўлов <b>1-дарсдан бошлаб (1-дарсдан олдин)</b> "
+            "амалга оширилиши лозим.{fee_block}{card_block}\n\n"
+            "<i>Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!</i>"
         ),
         "admins_panel_title": (
             "👑 <b>Админлар бошқаруви</b>\n\n"
@@ -517,7 +640,7 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
         ),
         "admins_static_tag": "Асосий админ",
         "admins_dynamic_tag": "Тайинланган админ",
-        "admins_btn_invite": "🔗 Бир марталик админ ҳаволаси",
+        "admins_btn_invite": "🔗 Админ ҳаволаси",
         "admins_invite_created": (
             "🔗 <b>Янги админ учун бир марталик таклиф ҳаволаси яратилди!</b>\n\n"
             "👉 Ҳавола:\n<code>{invite_link}</code>\n\n"
@@ -591,7 +714,7 @@ async def _is_admin(user_id: int) -> bool:
 
 async def _create_admin_invite_record(invite_code: str, created_by: int) -> None:
     await _ensure_admin_tables()
-    now_iso = datetime.now(TZ).isoformat()
+    now_iso = now_tashkent().isoformat()
     db_fn = getattr(database, "create_admin_invite", None)
     if callable(db_fn):
         try:
@@ -846,6 +969,19 @@ async def _clear_group_link_in_teacher_meta(group_name: str) -> None:
         await db.commit()
 
 
+async def _cleanup_deleted_group_in_sqlite(group_name: str) -> None:
+    await _clear_group_link_in_teacher_meta(group_name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "DELETE FROM group_counters WHERE LOWER(group_name) = LOWER(?);",
+                (group_name.strip(),),
+            )
+        except Exception:
+            pass
+        await db.commit()
+
+
 async def _rename_group_in_sqlite(old_name: str, new_name: str) -> None:
     await _ensure_teacher_meta_table()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -975,9 +1111,11 @@ def _make_join_slug(group_name: str) -> str:
 
 
 def _format_clickable_phone(raw_phone: str, fallback: str = "—") -> str:
-    cleaned = raw_phone.strip()
+    cleaned = str(raw_phone or "").strip()
     if not cleaned or cleaned == PLACEHOLDER_TEXT:
         return fallback
+    if cleaned.lower() in {"yo'q", "yoq", "йўқ"}:
+        return html.escape(cleaned)
     compact = re.sub(r"[^\d+]", "", cleaned)
     if re.fullmatch(r"\d{9}", compact):
         compact = f"+998{compact}"
@@ -985,21 +1123,32 @@ def _format_clickable_phone(raw_phone: str, fallback: str = "—") -> str:
         compact = f"+{compact}"
     elif compact and not compact.startswith("+") and len(compact) >= 7:
         compact = f"+{compact}"
-    return html.escape(compact or cleaned)
+    if compact and re.fullmatch(r"\+\d{7,15}", compact):
+        safe_tel = html.escape(compact)
+        return f'<a href="tel:{safe_tel}">{safe_tel}</a>'
+    return html.escape(cleaned)
 
 
-def _format_clickable_tg(raw_tg: str, fallback: str = "—") -> str:
-    cleaned = raw_tg.strip()
-    if not cleaned or cleaned == PLACEHOLDER_TEXT:
-        return fallback
-    if cleaned.startswith(("https://t.me/", "http://t.me/", "t.me/")):
-        username = cleaned.rstrip("/").split("/")[-1].lstrip("@")
-    else:
-        username = cleaned.lstrip("@")
-    if not re.fullmatch(r"[A-Za-z0-9_]{3,}", username):
+def _format_clickable_tg(
+    raw_tg: str,
+    fallback: str = "—",
+    chat_id: Optional[str | int] = None,
+) -> str:
+    cleaned = str(raw_tg or "").strip()
+    if cleaned and cleaned != PLACEHOLDER_TEXT and cleaned != "-":
+        if cleaned.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+            username = cleaned.rstrip("/").split("/")[-1].lstrip("@")
+        else:
+            username = cleaned.lstrip("@")
+        if re.fullmatch(r"[A-Za-z0-9_]{3,}", username):
+            safe_u = html.escape(username)
+            return f'<a href="https://t.me/{safe_u}">@{safe_u}</a>'
+    clean_cid = str(chat_id or "").strip()
+    if clean_cid.isdigit():
+        return f'<a href="tg://user?id={clean_cid}">Telegram</a>'
+    if cleaned and cleaned != PLACEHOLDER_TEXT:
         return html.escape(cleaned)
-    safe_u = html.escape(username)
-    return f'<a href="https://t.me/{safe_u}">@{safe_u}</a>'
+    return fallback
 
 
 async def _resolve_group_teacher_info(
@@ -1046,7 +1195,7 @@ async def _resolve_group_teacher_info(
     )
 
     phone_fmt = _format_clickable_phone(raw_phone, none_val)
-    tg_fmt = _format_clickable_tg(raw_tg, none_val)
+    tg_fmt = _format_clickable_tg(raw_tg, none_val, chat_id=clean_id)
     display_name = html.escape(raw_name)
     if viewer_user_id is not None and clean_id == str(viewer_user_id):
         display_name = f"{display_name} {t('self_marker', lang)}"
@@ -1078,18 +1227,54 @@ def _format_days_from_indices(day_indices: list[int], lang: str) -> str:
     return ", ".join(names[idx] for idx in day_indices if idx in names)
 
 
+def _format_change_value(field_key: str, val: str, lang: str) -> str:
+    cleaned = str(val or "").strip()
+    if field_key == "Oylik_Dars_Soni":
+        if not cleaned:
+            return "—"
+        unit = "та" if lang == "cyrl" else "ta"
+        return f"{html.escape(cleaned)} {unit}"
+    if field_key == "Dars_Kunlari":
+        return _format_days(cleaned, lang) if cleaned else "—"
+    if field_key in {"Oylik_Tolov_Summa", "Tolov_Summasi"}:
+        if cleaned.isdigit() and int(cleaned) > 0:
+            return html.escape(format_uzs(cleaned, lang))
+        return html.escape(t("group_price_not_set", lang))
+    return html.escape(cleaned) if cleaned else "—"
+
+
+def _format_change_item(
+    field_key: str, old_val: str, new_val: str, lang: str
+) -> str:
+    label = html.escape(format_field_label(field_key, lang))
+    old_fmt = _format_change_value(field_key, old_val, lang)
+    new_fmt = _format_change_value(field_key, new_val, lang)
+    return f"• <b>{label}:</b> {old_fmt} ➡️ {new_fmt}"
+
+
+def _format_changes_list(
+    change_items: list[tuple[str, str, str]], lang: str
+) -> str:
+    if not change_items:
+        return "• —"
+    return "\n".join(
+        _format_change_item(fk, ov, nv, lang) for fk, ov, nv in change_items
+    )
+
+
 async def _broadcast_group_update(
     bot: Any,
     sheets: SheetsManager,
     group_name: str,
-    changes_latn: str,
-    changes_cyrl: str,
+    change_items: list[tuple[str, str, str]],
     dates_list: Optional[list[str]] = None,
+    triggered_by_user_id: Optional[int] = None,
 ) -> int:
     """
-    Universal broadcast on ANY group change (Name, Teacher, Fee, Days, Time, Count).
-    Sends formatted notification to Group chat, Teacher, active Students, and
-    each active Student's Father and Mother.
+    Universal broadcast on ANY group change (Name, Teacher, Fee, Days, Time, Count, TG Chat).
+    Uses plain human-readable labels (no raw column names), builds short + detailed texts,
+    saves them via database.save_notification_details(...), and sends the short version
+    with a `📄 Batafsil` / `📋 Qisqacha` inline toggle button.
     """
     group = await sheets.a_get_group(group_name)
     if not group:
@@ -1122,55 +1307,260 @@ async def _broadcast_group_update(
         _add_recipient(stu.get("Onasi_Chat_ID"))
         _add_recipient(stu.get("OtaOna_Chat_ID"))
 
-    teacher_info = await _resolve_group_teacher_info(
-        sheets, str(group.get("Ustoz_Chat_ID", "")), "latn"
-    )
-    teacher_name_esc = html.escape(teacher_info["name"] or "—")
+    if not recipient_ids:
+        return 0
+
+    is_teacher_actor = False
+    actor_teacher_name = ""
+    if triggered_by_user_id is not None and not await _is_admin(triggered_by_user_id):
+        is_teacher_actor = True
+        actor_info = await _resolve_group_teacher_info(
+            sheets, str(triggered_by_user_id), "latn"
+        )
+        actor_teacher_name = actor_info["name"] or str(triggered_by_user_id)
+
     raw_fee = str(group.get("Oylik_Tolov_Summa", "")).strip()
     count_val = str(group.get("Oylik_Dars_Soni", "")).strip() or "12"
     time_val = html.escape(str(group.get("Dars_Vaqti", "")).strip() or "—")
     days_raw = str(group.get("Dars_Kunlari", "")).strip()
+    teacher_cid = str(group.get("Ustoz_Chat_ID", "")).strip()
 
+    base_notif_id = f"grp_{secrets.token_hex(4)}"
+    cached_by_lang: dict[str, tuple[str, str, str]] = {}
     sent_count = 0
+
     for cid in recipient_ids:
         try:
             r_lang = await get_user_lang(cid) if cid > 0 else "latn"
-            price_str = (
-                f"{_format_uzs(int(raw_fee))} {'сўм' if r_lang == 'cyrl' else 'so‘m'}"
-                if raw_fee.isdigit() and int(raw_fee) > 0
-                else t("group_price_not_set", r_lang)
-            )
-            dates_block = ""
-            if dates_list:
-                dates_fmt = format_uz_date_list(dates_list, r_lang)
-                lbl = (
-                    "🗓 <b>Янгиланган саналар:</b> "
-                    if r_lang == "cyrl"
-                    else "🗓 <b>Yangilangan sanalar:</b> "
+            if r_lang not in cached_by_lang:
+                notif_id = f"{base_notif_id}_{r_lang}"
+                changes_str = _format_changes_list(change_items, r_lang)
+                teacher_info = await _resolve_group_teacher_info(
+                    sheets, teacher_cid, r_lang
                 )
-                dates_block = f"\n{lbl}<code>{dates_fmt}</code>"
+                price_str = (
+                    html.escape(format_uzs(raw_fee, r_lang))
+                    if raw_fee.isdigit() and int(raw_fee) > 0
+                    else html.escape(t("group_price_not_set", r_lang))
+                )
+                dates_block = ""
+                if dates_list:
+                    dates_fmt = format_uz_date_list(dates_list, r_lang)
+                    lbl = (
+                        "🗓 <b>Янгиланган саналар:</b> "
+                        if r_lang == "cyrl"
+                        else "🗓 <b>Yangilangan sanalar:</b> "
+                    )
+                    dates_block = f"\n{lbl}<code>{html.escape(dates_fmt)}</code>"
 
-            msg_text = _lt(
-                "universal_group_broadcast",
-                r_lang,
-                group=html.escape(canonical),
-                teacher_name=teacher_name_esc,
-                days=_format_days(days_raw, r_lang),
-                time=time_val,
-                count=html.escape(count_val),
-                price=price_str,
-                changes=html.escape(changes_cyrl if r_lang == "cyrl" else changes_latn),
-                dates_block=dates_block,
-            )
+                if is_teacher_actor:
+                    signature = t(
+                        "topic_teacher_footer",
+                        r_lang,
+                        teacher_name=html.escape(actor_teacher_name),
+                    )
+                else:
+                    signature = _lt("signature_admin", r_lang)
+
+                short_text = _lt(
+                    "broadcast_short",
+                    r_lang,
+                    group=html.escape(canonical),
+                    changes=changes_str,
+                    signature=signature,
+                )
+                detailed_text = _lt(
+                    "broadcast_detailed",
+                    r_lang,
+                    group=html.escape(canonical),
+                    teacher_block=teacher_info["block"],
+                    days=_format_days(days_raw, r_lang),
+                    time=time_val,
+                    count=html.escape(count_val),
+                    price=price_str,
+                    changes=changes_str,
+                    dates_block=dates_block,
+                    signature=signature,
+                )
+                await save_notification_details(notif_id, short_text, detailed_text)
+                cached_by_lang[r_lang] = (notif_id, short_text, detailed_text)
+
+            notif_id, short_text, _ = cached_by_lang[r_lang]
+            kb = build_expandable_notif_kb(notif_id, expanded=False, lang=r_lang)
             await bot.send_message(
                 chat_id=cid,
-                text=msg_text,
+                text=short_text,
+                reply_markup=kb,
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
             sent_count += 1
         except Exception:
             pass
     return sent_count
+
+
+async def _notify_upfront_cycle_payment(
+    bot: Any,
+    sheets: SheetsManager,
+    group_name: str,
+    cycle_info: dict[str, Any],
+) -> None:
+    """
+    Announces that payment for the newly created group/cycle is due starting
+    before Lesson 1, and sends deduplicated parent notices (combining siblings
+    in the same group into ONE message with accurate summed fee).
+    """
+    group = await sheets.a_get_group(group_name)
+    if not group:
+        return
+    canonical = group["Guruh_Nomi"].strip()
+    active_students = await asyncio.to_thread(
+        sheets.get_all_students, group_name=canonical, active_only=True
+    )
+
+    raw_fee = str(group.get("Oylik_Tolov_Summa", "")).strip()
+    fee_per_student = int(raw_fee) if raw_fee.isdigit() and int(raw_fee) > 0 else 0
+    card_number = str(getattr(_app_config, "CARD_NUMBER", "") or "").strip()
+    card_owner = str(getattr(_app_config, "CARD_OWNER", "") or "").strip()
+
+    cycle_title = str(cycle_info.get("cycle_title") or "").strip()
+    start_raw = str(cycle_info.get("start_date") or "").strip()
+    end_raw = str(cycle_info.get("end_date") or "").strip()
+
+    def _card_block_for(lang: str) -> str:
+        if not card_number:
+            return ""
+        return "\n\n" + t(
+            "payment_card_block",
+            lang,
+            card_number=html.escape(card_number),
+            card_owner=html.escape(card_owner or "—"),
+        )
+
+    # 1. Group TG chat announcement (if linked)
+    group_tg_cid = str(group.get("Guruh_TG_Chat_ID", "")).strip()
+    if group_tg_cid and re.fullmatch(r"-?\d+", group_tg_cid):
+        g_lang = "latn"
+        fee_blk = (
+            f"\n💰 Oylik to‘lov summasi: <b>{html.escape(format_uzs(fee_per_student, g_lang))}</b>"
+            if fee_per_student > 0
+            else ""
+        )
+        try:
+            await bot.send_message(
+                chat_id=int(group_tg_cid),
+                text=_lt(
+                    "upfront_cycle_group_notice",
+                    g_lang,
+                    group=html.escape(canonical),
+                    cycle_title=html.escape(cycle_title),
+                    start_date=html.escape(format_uz_date(start_raw, g_lang)),
+                    end_date=html.escape(format_uz_date(end_raw, g_lang)),
+                    fee_block=fee_blk,
+                    card_block=_card_block_for(g_lang),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    if not active_students:
+        return
+
+    # 2. Individual student notices + aggregate parent -> children mapping
+    parent_children: dict[int, list[dict[str, Any]]] = {}
+    parent_seen_sids: dict[int, set[str]] = {}
+
+    for stu in active_students:
+        sid = str(stu.get("Talaba_ID", "")).strip()
+        stu_name = str(stu.get("F.I.O.", "")).strip() or sid
+        stu_cid_str = str(stu.get("Talaba_Chat_ID", "")).strip()
+        if stu_cid_str.isdigit():
+            s_cid = int(stu_cid_str)
+            try:
+                s_lang = await get_user_lang(s_cid)
+                fee_blk = (
+                    f"\n💰 Oylik to‘lov summasi: <b>{html.escape(format_uzs(fee_per_student, s_lang))}</b>"
+                    if fee_per_student > 0
+                    else ""
+                )
+                if s_lang == "cyrl" and fee_per_student > 0:
+                    fee_blk = f"\n💰 Ойлик тўлов суммаси: <b>{html.escape(format_uzs(fee_per_student, s_lang))}</b>"
+                await bot.send_message(
+                    chat_id=s_cid,
+                    text=_lt(
+                        "upfront_cycle_student_notice",
+                        s_lang,
+                        student_name=html.escape(stu_name),
+                        group=html.escape(canonical),
+                        cycle_title=html.escape(cycle_title),
+                        start_date=html.escape(format_uz_date(start_raw, s_lang)),
+                        end_date=html.escape(format_uz_date(end_raw, s_lang)),
+                        fee_block=fee_blk,
+                        card_block=_card_block_for(s_lang),
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        for col in ("Otasi_Chat_ID", "Onasi_Chat_ID", "OtaOna_Chat_ID"):
+            raw_p = str(stu.get(col, "")).strip()
+            if raw_p.isdigit():
+                p_cid = int(raw_p)
+                seen_for_parent = parent_seen_sids.setdefault(p_cid, set())
+                if sid not in seen_for_parent:
+                    seen_for_parent.add(sid)
+                    parent_children.setdefault(p_cid, []).append(stu)
+
+    # 3. Deduplicated parent notices (1 message per parent per group with summed fee)
+    for p_cid, children in parent_children.items():
+        try:
+            p_lang = await get_user_lang(p_cid)
+            children_names = ", ".join(
+                html.escape(str(c.get("F.I.O.", "")).strip() or str(c.get("Talaba_ID", "")))
+                for c in children
+            )
+            fee_blk = ""
+            if fee_per_student > 0:
+                total_fee = fee_per_student * len(children)
+                single_fmt = html.escape(format_uzs(fee_per_student, p_lang))
+                total_fmt = html.escape(format_uzs(total_fee, p_lang))
+                if len(children) > 1:
+                    if p_lang == "cyrl":
+                        fee_blk = (
+                            f"\n💰 Жами тўлов суммаси ({len(children)} та фарзанд × {single_fmt}): "
+                            f"<b>{total_fmt}</b>"
+                        )
+                    else:
+                        fee_blk = (
+                            f"\n💰 Jami to‘lov summasi ({len(children)} ta farzand × {single_fmt}): "
+                            f"<b>{total_fmt}</b>"
+                        )
+                else:
+                    if p_lang == "cyrl":
+                        fee_blk = f"\n💰 Ойлик тўлов суммаси: <b>{total_fmt}</b>"
+                    else:
+                        fee_blk = f"\n💰 Oylik to‘lov summasi: <b>{total_fmt}</b>"
+
+            await bot.send_message(
+                chat_id=p_cid,
+                text=_lt(
+                    "upfront_cycle_parent_notice",
+                    p_lang,
+                    children_names=children_names,
+                    group=html.escape(canonical),
+                    cycle_title=html.escape(cycle_title),
+                    start_date=html.escape(format_uz_date(start_raw, p_lang)),
+                    end_date=html.escape(format_uz_date(end_raw, p_lang)),
+                    fee_block=fee_blk,
+                    card_block=_card_block_for(p_lang),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 def _format_student_contact_block(
@@ -1187,16 +1577,22 @@ def _format_student_contact_block(
         name = f"{name} {t('self_marker', lang)}"
 
     stu_phone = _format_clickable_phone(student.get("Talaba_Tel", ""), none_val)
-    tg_link = _format_clickable_tg(student.get("Talaba_TG", ""), none_val)
+    tg_link = _format_clickable_tg(
+        student.get("Talaba_TG", ""), none_val, chat_id=stu_cid
+    )
     lines = [
         f"{index}. <b>{name}</b>",
         f"   {_lt('student_phone_label', lang)}: {stu_phone} | {_lt('telegram_label', lang)}: {tg_link}",
     ]
 
     father_fio = str(student.get("Otasi_FIO", "")).strip()
+    if father_fio == PLACEHOLDER_TEXT:
+        father_fio = ""
     father_tel = str(student.get("Otasi_Tel", "")).strip()
     father_cid = str(student.get("Otasi_Chat_ID", "")).strip()
     mother_fio = str(student.get("Onasi_FIO", "")).strip()
+    if mother_fio == PLACEHOLDER_TEXT:
+        mother_fio = ""
     mother_tel = str(student.get("Onasi_Tel", "")).strip()
     mother_cid = str(student.get("Onasi_Chat_ID", "")).strip()
     legacy_tel = str(student.get("OtaOna_Tel", "")).strip()
@@ -1214,8 +1610,13 @@ def _format_student_contact_block(
         if viewer_user_id is not None and father_cid == str(viewer_user_id):
             f_name_disp = f"{f_name_disp} {t('self_marker', lang)}"
         f_tel_disp = _format_clickable_phone(father_tel, none_val)
+        f_tg_part = (
+            f" | {_format_clickable_tg('', none_val, chat_id=father_cid)}"
+            if father_cid.isdigit()
+            else ""
+        )
         lines.append(
-            f"   {_lt('father_label', lang)}: <b>{f_name_disp}</b> | 📞 {f_tel_disp}"
+            f"   {_lt('father_label', lang)}: <b>{f_name_disp}</b> | 📞 {f_tel_disp}{f_tg_part}"
         )
 
     if include_bot_status or mother_fio or mother_tel or (
@@ -1225,8 +1626,13 @@ def _format_student_contact_block(
         if viewer_user_id is not None and mother_cid == str(viewer_user_id):
             m_name_disp = f"{m_name_disp} {t('self_marker', lang)}"
         m_tel_disp = _format_clickable_phone(mother_tel, none_val)
+        m_tg_part = (
+            f" | {_format_clickable_tg('', none_val, chat_id=mother_cid)}"
+            if mother_cid.isdigit()
+            else ""
+        )
         lines.append(
-            f"   {_lt('mother_label', lang)}: <b>{m_name_disp}</b> | 📞 {m_tel_disp}"
+            f"   {_lt('mother_label', lang)}: <b>{m_name_disp}</b> | 📞 {m_tel_disp}{m_tg_part}"
         )
 
     if include_bot_status:
@@ -1300,6 +1706,13 @@ def _mode_keyboard(lang: str, is_admin: bool = False) -> InlineKeyboardMarkup:
                 ),
             ]
         )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=t("btn_delete_group", lang), callback_data="grp_menu:delete"
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1309,19 +1722,18 @@ def _groups_list_keyboard(
     lang: str,
     include_back: bool = True,
 ) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=(
-                    f"📚 {g.get('Guruh_Nomi', '').strip()} ({g.get('Dars_Vaqti', '').strip()})"
-                    if g.get("Dars_Vaqti", "").strip()
-                    else f"📚 {g.get('Guruh_Nomi', '').strip()}"
-                ),
-                callback_data=f"groups_info:view:{mode}:{idx}",
-            )
-        ]
+    group_buttons = [
+        InlineKeyboardButton(
+            text=(
+                f"📚 {g.get('Guruh_Nomi', '').strip()} ({g.get('Dars_Vaqti', '').strip()})"
+                if g.get("Dars_Vaqti", "").strip()
+                else f"📚 {g.get('Guruh_Nomi', '').strip()}"
+            ),
+            callback_data=f"groups_info:view:{mode}:{idx}",
+        )
         for idx, g in enumerate(groups)
     ]
+    rows = pair_buttons(group_buttons)
     if include_back:
         rows.append(
             [
@@ -1330,7 +1742,7 @@ def _groups_list_keyboard(
                 )
             ]
         )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return balance_inline_markup(InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 def _group_detail_kb(
@@ -1343,7 +1755,11 @@ def _group_detail_kb(
                 InlineKeyboardButton(
                     text=_lt("btn_edit_group", lang),
                     callback_data=f"grp_edit:open:{group_name}",
-                )
+                ),
+                InlineKeyboardButton(
+                    text=t("btn_delete_group", lang),
+                    callback_data=f"grp_del_ask:{group_name}",
+                ),
             ]
         )
     rows.append(
@@ -1384,8 +1800,6 @@ def _group_edit_fields_kb(group_name: str, lang: str) -> InlineKeyboardMarkup:
                     text="⏰ Dars vaqti" if lang == "latn" else "⏰ Дарс вақти",
                     callback_data=f"grp_edit_fld:{group_name}:time",
                 ),
-            ],
-            [
                 InlineKeyboardButton(
                     text=_lt("btn_edit_group_price", lang),
                     callback_data=f"grp_edit_fld:{group_name}:price",
@@ -1395,6 +1809,10 @@ def _group_edit_fields_kb(group_name: str, lang: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=t("btn_group_full_update", lang),
                     callback_data=f"grp_edit_fld:{group_name}:full_update",
+                ),
+                InlineKeyboardButton(
+                    text=t("btn_delete_group", lang),
+                    callback_data=f"grp_del_ask:{group_name}",
                 ),
             ],
             [
@@ -1417,15 +1835,15 @@ def _schedule_confirm_kb(group_name: str, lang: str) -> InlineKeyboardMarkup:
                     text=_lt("btn_confirm_and_update", lang),
                     callback_data="grp_edit:sched_confirm",
                 ),
+                InlineKeyboardButton(
+                    text=t("btn_cancel", lang),
+                    callback_data="grp_edit:cancel",
+                ),
             ],
             [
                 InlineKeyboardButton(
                     text=t("btn_back", lang),
                     callback_data=f"grp_edit:back:fields:{group_name}",
-                ),
-                InlineKeyboardButton(
-                    text=t("btn_cancel", lang),
-                    callback_data="grp_edit:cancel",
                 ),
             ],
         ]
@@ -1439,7 +1857,7 @@ async def _build_schedule_preview_dates(
     new_count: int,
     new_days_indices: list[int],
 ) -> tuple[list[str], int]:
-    today = datetime.now(TZ).date()
+    today = today_tashkent()
     completed_lessons = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
     existing_info = await asyncio.to_thread(
         sheets.get_cycle_dates_with_status, group_name
@@ -1500,7 +1918,7 @@ async def _prompt_schedule_edit_confirmation(
     if not group:
         await state.clear()
         await (target_msg.edit_text if edit else target_msg.answer)(
-            _lt("group_not_found", lang)
+            _lt("group_not_found", lang), parse_mode="HTML"
         )
         return
 
@@ -1613,11 +2031,265 @@ async def _get_accessible_groups(user_id: int, mode: str) -> list[dict[str, Any]
             if str(g.get("Ustoz_Chat_ID", "")).strip() == str(user_id)
         ]
     if mode == "today":
-        wd = datetime.now(TZ).weekday()
+        wd = now_tashkent().weekday()
         groups = [
             g for g in groups if wd in parse_weekdays(g.get("Dars_Kunlari", ""))
         ]
     return groups
+
+
+# ----------------------------------------------------------------------
+# Expandable Notification Toggle (`📄 Batafsil` / `📋 Qisqacha`)
+# ----------------------------------------------------------------------
+
+
+@router.callback_query(F.data.startswith("notif_toggle:"))
+async def cb_notif_toggle(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        await callback.answer()
+        return
+    notif_id = parts[1].strip()
+    mode = parts[2].strip().lower()
+    is_expanded = mode in {"1", "detail", "detailed", "true"}
+
+    user_lang = await get_user_lang(callback.from_user.id)
+    details = await get_notification_details(notif_id)
+    if not details:
+        await callback.answer(_lt("notif_not_found", user_lang), show_alert=True)
+        return
+
+    if notif_id.endswith("_latn"):
+        kb_lang = "latn"
+    elif notif_id.endswith("_cyrl"):
+        kb_lang = "cyrl"
+    else:
+        kb_lang = user_lang
+
+    new_text = details["detailed_text"] if is_expanded else details["short_text"]
+    kb = build_expandable_notif_kb(notif_id, expanded=is_expanded, lang=kb_lang)
+    try:
+        await callback.message.edit_text(
+            new_text,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+# ----------------------------------------------------------------------
+# Complete Group Deletion (`🗑 Guruhni o'chirish`)
+# ----------------------------------------------------------------------
+
+
+async def _show_delete_group_list(
+    target_msg: Message, state: FSMContext, lang: str, edit: bool
+) -> None:
+    await state.clear()
+    groups = await asyncio.to_thread(get_sheets_manager().get_all_groups)
+    if not groups:
+        back_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=t("btn_back", lang), callback_data="groups_info:modes"
+                    )
+                ]
+            ]
+        )
+        await (target_msg.edit_text if edit else target_msg.answer)(
+            _lt("no_groups_all", lang),
+            reply_markup=back_kb if edit else None,
+            parse_mode="HTML",
+        )
+        return
+
+    kb = groups_inline_kb(
+        groups, "grp_del_sel", lang, include_back=True, include_cancel=True
+    )
+    await (target_msg.edit_text if edit else target_msg.answer)(
+        _lt("delete_group_select", lang),
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+async def _prompt_delete_group_confirmation(
+    target_msg: Message, group_name: str, lang: str, edit: bool = True
+) -> None:
+    sheets = get_sheets_manager()
+    group = await sheets.a_get_group(group_name)
+    canonical = group["Guruh_Nomi"].strip() if group else group_name.strip()
+    now_year = now_tashkent().year
+    await (target_msg.edit_text if edit else target_msg.answer)(
+        _lt(
+            "delete_group_confirm",
+            lang,
+            group=html.escape(canonical),
+            year=now_year,
+        ),
+        reply_markup=group_delete_confirm_kb(canonical, lang),
+        parse_mode="HTML",
+    )
+
+
+@router.message(F.text.in_(DELETE_GROUP_BTN_TEXTS))
+async def msg_delete_group_menu(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
+        return
+    await _show_delete_group_list(message, state, lang, edit=False)
+
+
+@router.callback_query(F.data.startswith("grp_menu:"))
+async def cb_groups_root_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    action = (callback.data or "").split(":", 1)[1].strip()
+
+    if action == "cancel":
+        await state.clear()
+        await callback.message.edit_text(
+            _lt("delete_group_cancelled", lang), parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    if not await _is_admin(user_id):
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+
+    if action == "delete":
+        await _show_delete_group_list(callback.message, state, lang, edit=True)
+    elif action == "add":
+        await cb_add_group_start(callback, state)
+        return
+    elif action == "edit":
+        await cb_edit_group_start(callback, state)
+        return
+    elif action == "add_teacher":
+        await cb_add_teacher_start(callback, state)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("grp_del_sel:"))
+async def cb_delete_group_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    val = (callback.data or "").split(":", 1)[1].strip()
+    if val == "__cancel__":
+        await state.clear()
+        await callback.message.edit_text(
+            _lt("delete_group_cancelled", lang), parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    if val == "__back__":
+        await state.clear()
+        await callback.message.edit_text(
+            _lt("choose_groups_mode", lang),
+            reply_markup=_mode_keyboard(lang, is_admin=True),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    await _prompt_delete_group_confirmation(callback.message, val, lang, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("grp_del_ask:"))
+async def cb_delete_group_ask_direct(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    group_name = (callback.data or "").split("grp_del_ask:", 1)[1].strip()
+    await state.clear()
+    await _prompt_delete_group_confirmation(
+        callback.message, group_name, lang, edit=True
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("grp_del_ok:"))
+async def cb_delete_group_confirm(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+
+    group_name = (callback.data or "").split("grp_del_ok:", 1)[1].strip()
+    sheets = get_sheets_manager()
+    group = await sheets.a_get_group(group_name)
+    canonical = group["Guruh_Nomi"].strip() if group else group_name
+    old_teacher_chat_id = (
+        str(group.get("Ustoz_Chat_ID", "")).strip() if group else ""
+    )
+
+    deleted = await sheets.a_delete_group_completely(canonical)
+    await state.clear()
+
+    if not deleted:
+        await callback.message.edit_text(
+            _lt("group_not_found", lang), parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    await _cleanup_deleted_group_in_sqlite(canonical)
+    if old_teacher_chat_id:
+        await asyncio.to_thread(
+            _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
+        )
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=_lt("admins_btn_groups", lang),
+                    callback_data="groups_info:modes",
+                )
+            ]
+        ]
+    )
+    await callback.message.edit_text(
+        _lt("delete_group_success", lang, group=html.escape(canonical)),
+        reply_markup=back_kb,
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 # ----------------------------------------------------------------------
@@ -1628,12 +2300,13 @@ async def _get_accessible_groups(user_id: int, mode: str) -> list[dict[str, Any]
 def _build_teacher_card_text(teacher: dict[str, Any], lang: str) -> str:
     none_val = _lt("not_provided", lang)
     t_id = html.escape(str(teacher.get("Ustoz_ID", "")).strip() or none_val)
+    t_cid = str(teacher.get("Chat_ID") or teacher.get("Ustoz_Chat_ID") or "").strip()
     full_name = html.escape(str(teacher.get("F.I.O.", "")).strip() or none_val)
     phone_fmt = _format_clickable_phone(str(teacher.get("Telefon", "")), none_val)
     raw_tg = str(
         teacher.get("TG_Username") or teacher.get("Telegram") or ""
     ).strip()
-    tg_fmt = _format_clickable_tg(raw_tg, none_val)
+    tg_fmt = _format_clickable_tg(raw_tg, none_val, chat_id=t_cid)
     assigned_groups = teacher.get("assigned_groups") or []
     groups_str = (
         ", ".join(html.escape(str(g)) for g in assigned_groups)
@@ -1687,7 +2360,7 @@ async def handle_teachers_manage_menu(
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     await state.clear()
     await _show_teacher_list_panel(message, state, lang, edit=False)
@@ -1703,7 +2376,7 @@ async def msg_teacher_manage_cancel(
     if message.from_user:
         lang = await get_user_lang(message.from_user.id)
         await state.clear()
-        await message.answer(t("teacher_manage_cancelled", lang))
+        await message.answer(t("teacher_manage_cancelled", lang), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "tch_mgr:back_menu")
@@ -1713,7 +2386,9 @@ async def cb_teacher_manage_close(
     lang = await get_user_lang(callback.from_user.id)
     await state.clear()
     if callback.message:
-        await callback.message.edit_text(t("teacher_manage_cancelled", lang))
+        await callback.message.edit_text(
+            t("teacher_manage_cancelled", lang), parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -1831,6 +2506,12 @@ async def cb_teacher_manage_assign_execute(
     old_teacher_chat_id = (
         str(old_group.get("Ustoz_Chat_ID", "")).strip() if old_group else ""
     )
+    old_teacher_name = "—"
+    if old_teacher_chat_id:
+        old_t_info = await _resolve_group_teacher_info(
+            sheets, old_teacher_chat_id, "latn"
+        )
+        old_teacher_name = old_t_info["name"] or old_teacher_chat_id
 
     try:
         result = await sheets.a_assign_teacher_to_group(teacher_id, group_name)
@@ -1874,8 +2555,8 @@ async def cb_teacher_manage_assign_execute(
         callback.bot,
         sheets,
         canonical_group,
-        changes_latn=f"Guruh ustozi yangilandi: {teacher_name}",
-        changes_cyrl=f"Гуруҳ устози янгиланди: {teacher_name}",
+        change_items=[("Ustoz", old_teacher_name, teacher_name)],
+        triggered_by_user_id=user_id,
     )
 
     teachers = await sheets.a_get_all_teachers_detailed()
@@ -1974,13 +2655,19 @@ async def cb_teacher_manage_delete_confirm(
         str(teacher.get("F.I.O.", teacher_id)).strip() if teacher else teacher_id
     )
 
-    chat_id = await sheets.a_delete_teacher_completely(teacher_id)
-    await _reset_teacher_role_in_sqlite(teacher_id, chat_id)
+    payload = await sheets.a_purge_teacher_completely(teacher_id)
+    t_cid_int = payload.get("teacher_chat_id")
+    teacher_lang_before = await get_user_lang(int(t_cid_int)) if t_cid_int else "latn"
+    chat_id = str(t_cid_int) if t_cid_int else ""
+    real_tid = str(payload.get("teacher_id") or teacher_id).strip()
+    if t_cid_int:
+        await database.purge_deleted_person_from_db(int(t_cid_int), "teacher")
+    await _reset_teacher_role_in_sqlite(real_tid, "")
 
     if chat_id.isdigit() and int(chat_id) != user_id:
         target_cid = int(chat_id)
         try:
-            t_lang = await get_user_lang(target_cid)
+            t_lang = teacher_lang_before
             await callback.bot.send_message(
                 chat_id=target_cid,
                 text=t("teacher_manage_delete_notify_teacher", t_lang),
@@ -1991,6 +2678,7 @@ async def cb_teacher_manage_delete_confirm(
                 chat_id=target_cid,
                 text=t("choose_language", "latn"),
                 reply_markup=lang_selection_kb(),
+                parse_mode="HTML",
             )
         except Exception:
             pass
@@ -2000,6 +2688,7 @@ async def cb_teacher_manage_delete_confirm(
         lang,
         full_name=html.escape(teacher_name),
     )
+    notice += t("teacher_manage_delete_purged", lang)
     if callback.message:
         await _show_teacher_list_panel(
             callback.message, state, lang, edit=True, notice=notice
@@ -2032,12 +2721,12 @@ async def handle_student_my_group(message: Message) -> None:
         if found:
             student = found[0]
     if not student:
-        await message.answer(t("unregistered_user", lang))
+        await message.answer(t("unregistered_user", lang), parse_mode="HTML")
         return
 
     group_name = student.get("Guruh", "").strip()
     if not group_name:
-        await message.answer(t("contacts_empty", lang))
+        await message.answer(t("contacts_empty", lang), parse_mode="HTML")
         return
     group = await sheets.a_get_group(group_name)
     classmates = await asyncio.to_thread(
@@ -2065,7 +2754,9 @@ async def handle_student_my_group(message: Message) -> None:
     )
     if not classmates:
         await message.answer(
-            f"{header}\n\n{t('contacts_empty', lang)}", disable_web_page_preview=True
+            f"{header}\n\n{t('contacts_empty', lang)}",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         return
     blocks = [
@@ -2075,7 +2766,9 @@ async def handle_student_my_group(message: Message) -> None:
         for idx, s in enumerate(classmates, start=1)
     ]
     for chunk in _chunk_lines(header, blocks):
-        await message.answer(chunk, disable_web_page_preview=True)
+        await message.answer(
+            chunk, parse_mode="HTML", disable_web_page_preview=True
+        )
 
 
 # ----------------------------------------------------------------------
@@ -2090,7 +2783,7 @@ async def handle_admins_manage_menu(message: Message, state: FSMContext) -> None
     user_id = message.from_user.id
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     await state.clear()
     text, kb = await _render_admins_panel(lang)
@@ -2239,14 +2932,7 @@ async def cb_admins_manage_delete_confirm(callback: CallbackQuery) -> None:
 
 
 @router.message(
-    F.text.in_(
-        {
-            t("menu_teacher_groups", "latn"),
-            t("menu_teacher_groups", "cyrl"),
-            t("menu_admin_groups", "latn"),
-            t("menu_admin_groups", "cyrl"),
-        }
-    )
+    F.text.in_(button_texts("menu_teacher_groups", "menu_admin_groups"))
 )
 async def handle_teacher_groups_menu(message: Message, state: FSMContext) -> None:
     if not message.from_user:
@@ -2260,23 +2946,25 @@ async def handle_teacher_groups_menu(message: Message, state: FSMContext) -> Non
         or (await get_teacher_by_telegram_id(user_id) is not None)
         or await sheets.a_is_teacher(user_id)
     ):
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     await state.clear()
     if is_admin:
         await message.answer(
             _lt("choose_groups_mode", lang),
             reply_markup=_mode_keyboard(lang, is_admin=True),
+            parse_mode="HTML",
         )
         return
 
     groups = await _get_accessible_groups(user_id, "all")
     if not groups:
-        await message.answer(_lt("no_groups_all", lang))
+        await message.answer(_lt("no_groups_all", lang), parse_mode="HTML")
         return
     await message.answer(
         _lt("select_teacher_groups", lang),
         reply_markup=_groups_list_keyboard(groups, "all", lang, include_back=False),
+        parse_mode="HTML",
     )
 
 
@@ -2289,13 +2977,16 @@ async def cb_groups_modes(callback: CallbackQuery) -> None:
         groups = await _get_accessible_groups(user_id, "all")
         if callback.message:
             if not groups:
-                await callback.message.edit_text(_lt("no_groups_all", lang))
+                await callback.message.edit_text(
+                    _lt("no_groups_all", lang), parse_mode="HTML"
+                )
             else:
                 await callback.message.edit_text(
                     _lt("select_teacher_groups", lang),
                     reply_markup=_groups_list_keyboard(
                         groups, "all", lang, include_back=False
                     ),
+                    parse_mode="HTML",
                 )
         await callback.answer()
         return
@@ -2304,6 +2995,7 @@ async def cb_groups_modes(callback: CallbackQuery) -> None:
         await callback.message.edit_text(
             _lt("choose_groups_mode", lang),
             reply_markup=_mode_keyboard(lang, is_admin=True),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2336,6 +3028,7 @@ async def cb_groups_list_by_mode(callback: CallbackQuery) -> None:
             await callback.message.edit_text(
                 _lt("no_groups_today" if mode == "today" else "no_groups_all", lang),
                 reply_markup=back_kb,
+                parse_mode="HTML",
             )
         await callback.answer()
         return
@@ -2350,6 +3043,7 @@ async def cb_groups_list_by_mode(callback: CallbackQuery) -> None:
             reply_markup=_groups_list_keyboard(
                 groups, mode, lang, include_back=is_admin
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2376,9 +3070,12 @@ async def cb_group_contacts_detail(callback: CallbackQuery) -> None:
                 await callback.message.edit_text(
                     _lt("group_not_found", lang),
                     reply_markup=_mode_keyboard(lang, is_admin=True),
+                    parse_mode="HTML",
                 )
             else:
-                await callback.message.edit_text(_lt("group_not_found", lang))
+                await callback.message.edit_text(
+                    _lt("group_not_found", lang), parse_mode="HTML"
+                )
         await callback.answer()
         return
 
@@ -2415,6 +3112,7 @@ async def cb_group_contacts_detail(callback: CallbackQuery) -> None:
             await callback.message.edit_text(
                 f"{header}\n\n{t('contacts_empty', lang)}",
                 reply_markup=detail_kb,
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         await callback.answer()
@@ -2432,14 +3130,20 @@ async def cb_group_contacts_detail(callback: CallbackQuery) -> None:
     if callback.message:
         if len(chunks) == 1:
             await callback.message.edit_text(
-                chunks[0], reply_markup=detail_kb, disable_web_page_preview=True
+                chunks[0],
+                reply_markup=detail_kb,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         else:
-            await callback.message.edit_text(chunks[0], disable_web_page_preview=True)
+            await callback.message.edit_text(
+                chunks[0], parse_mode="HTML", disable_web_page_preview=True
+            )
             for pos, chunk in enumerate(chunks[1:], start=1):
                 await callback.message.answer(
                     chunk,
                     reply_markup=(detail_kb if pos == len(chunks) - 1 else None),
+                    parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
     await callback.answer()
@@ -2447,7 +3151,6 @@ async def cb_group_contacts_detail(callback: CallbackQuery) -> None:
 
 # ----------------------------------------------------------------------
 # Admin: "👨‍🏫 Ustoz qo‘shish" (tch_add:start -> Group Picker -> Auto Invite Link)
-# NO manual teacher-name/phone input, NO premature Ustozlar row!
 # ----------------------------------------------------------------------
 
 
@@ -2491,17 +3194,16 @@ async def cb_add_teacher_start(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer()
         return
 
-    rows: list[list[InlineKeyboardButton]] = []
+    group_buttons: list[InlineKeyboardButton] = []
     for g in groups:
         g_name = g["Guruh_Nomi"].strip()
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📚 {g_name}",
-                    callback_data=f"tch_add_grp:{g_name}",
-                )
-            ]
+        group_buttons.append(
+            InlineKeyboardButton(
+                text=f"📚 {g_name}",
+                callback_data=f"tch_add_grp:{g_name}",
+            )
         )
+    rows = pair_buttons(group_buttons)
     rows.append(
         [
             InlineKeyboardButton(
@@ -2520,7 +3222,9 @@ async def cb_add_teacher_start(callback: CallbackQuery, state: FSMContext) -> No
     if callback.message:
         await callback.message.edit_text(
             _lt("add_teacher_select_group", lang),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            reply_markup=balance_inline_markup(
+                InlineKeyboardMarkup(inline_keyboard=rows)
+            ),
             parse_mode="HTML",
         )
     await callback.answer()
@@ -2587,6 +3291,7 @@ async def cb_add_group_start(callback: CallbackQuery, state: FSMContext) -> None
         await callback.message.edit_text(
             _lt("add_group_enter_name", lang),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:menu"),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2605,6 +3310,7 @@ async def cb_add_group_back_menu(callback: CallbackQuery, state: FSMContext) -> 
         await callback.message.edit_text(
             _lt("choose_groups_mode", lang),
             reply_markup=_mode_keyboard(lang, is_admin=True),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2614,7 +3320,9 @@ async def cb_add_group_cancel(callback: CallbackQuery, state: FSMContext) -> Non
     lang = await get_user_lang(callback.from_user.id)
     await state.clear()
     if callback.message:
-        await callback.message.edit_text(_lt("add_group_cancelled", lang))
+        await callback.message.edit_text(
+            _lt("add_group_cancelled", lang), parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -2626,7 +3334,7 @@ async def msg_add_group_cancel(message: Message, state: FSMContext) -> None:
     if message.from_user:
         lang = await get_user_lang(message.from_user.id)
         await state.clear()
-        await message.answer(_lt("add_group_cancelled", lang))
+        await message.answer(_lt("add_group_cancelled", lang), parse_mode="HTML")
 
 
 @router.callback_query(StateFilter(GroupAddStates), F.data.startswith("grp_add:back:"))
@@ -2645,6 +3353,7 @@ async def cb_add_group_step_back(callback: CallbackQuery, state: FSMContext) -> 
             await callback.message.edit_text(
                 _lt("add_group_enter_name", lang),
                 reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:menu"),
+                parse_mode="HTML",
             )
     elif target == "teacher":
         teachers = await get_active_teachers()
@@ -2659,6 +3368,7 @@ async def cb_add_group_step_back(callback: CallbackQuery, state: FSMContext) -> 
                 reply_markup=group_add_teacher_kb(
                     teachers, lang, back_cb="grp_add:back:name"
                 ),
+                parse_mode="HTML",
             )
     elif target == "count":
         await state.set_state(GroupAddStates.selecting_lesson_count)
@@ -2668,6 +3378,7 @@ async def cb_add_group_step_back(callback: CallbackQuery, state: FSMContext) -> 
                 reply_markup=group_add_lesson_count_kb(
                     lang, back_cb="grp_add:back:teacher"
                 ),
+                parse_mode="HTML",
             )
     elif target == "days":
         await state.set_state(GroupAddStates.selecting_days)
@@ -2679,6 +3390,7 @@ async def cb_add_group_step_back(callback: CallbackQuery, state: FSMContext) -> 
                     lang,
                     back_cb="grp_add:back:count",
                 ),
+                parse_mode="HTML",
             )
     elif target == "time":
         await state.set_state(GroupAddStates.entering_time)
@@ -2686,6 +3398,19 @@ async def cb_add_group_step_back(callback: CallbackQuery, state: FSMContext) -> 
             await callback.message.edit_text(
                 t("schedule_enter_time", lang),
                 reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:days"),
+                parse_mode="HTML",
+            )
+    elif target == "fee":
+        await state.set_state(GroupAddStates.entering_fee)
+        if callback.message:
+            await callback.message.edit_text(
+                _lt(
+                    "add_group_enter_fee",
+                    lang,
+                    group=html.escape(data.get("group_name", "")),
+                ),
+                reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:time"),
+                parse_mode="HTML",
             )
     await callback.answer()
 
@@ -2698,7 +3423,7 @@ async def msg_add_group_name(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     group_name = (message.text or "").strip()
     if (
@@ -2711,12 +3436,14 @@ async def msg_add_group_name(message: Message, state: FSMContext) -> None:
         await message.answer(
             _lt("add_group_invalid_name", lang),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:menu"),
+            parse_mode="HTML",
         )
         return
     if await get_sheets_manager().a_get_group(group_name):
         await message.answer(
             _lt("add_group_already_exists", lang, group=html.escape(group_name)),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:menu"),
+            parse_mode="HTML",
         )
         return
     teachers = await get_active_teachers()
@@ -2727,6 +3454,7 @@ async def msg_add_group_name(message: Message, state: FSMContext) -> None:
         reply_markup=group_add_teacher_kb(
             teachers, lang, back_cb="grp_add:back:name"
         ),
+        parse_mode="HTML",
     )
 
 
@@ -2754,6 +3482,7 @@ async def cb_add_group_self_teacher(
             reply_markup=group_add_lesson_count_kb(
                 lang, back_cb="grp_add:back:teacher"
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2792,6 +3521,7 @@ async def cb_add_group_invite_teacher(
             reply_markup=group_add_lesson_count_kb(
                 lang, back_cb="grp_add:back:teacher"
             ),
+            parse_mode="HTML",
             disable_web_page_preview=True,
         )
     await callback.answer()
@@ -2826,6 +3556,7 @@ async def cb_add_group_select_teacher(
             reply_markup=group_add_lesson_count_kb(
                 lang, back_cb="grp_add:back:teacher"
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2840,13 +3571,14 @@ async def msg_add_group_teacher_fallback(
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     await message.answer(
         _lt("add_group_select_teacher_btn_only", lang),
         reply_markup=group_add_teacher_kb(
             await get_active_teachers(), lang, back_cb="grp_add:back:name"
         ),
+        parse_mode="HTML",
     )
 
 
@@ -2874,6 +3606,7 @@ async def cb_add_group_lesson_count(
             reply_markup=group_add_weekdays_kb(
                 [], lang, back_cb="grp_add:back:count"
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2936,6 +3669,7 @@ async def cb_add_group_days_done(
         await callback.message.edit_text(
             t("schedule_enter_time", lang),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:days"),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -2948,40 +3682,93 @@ async def msg_add_group_time(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
     if not match:
         await message.answer(
             t("schedule_invalid_time", lang),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:days"),
+            parse_mode="HTML",
         )
         return
     lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
     data = await state.get_data()
-    selected_days = sorted(data["selected_days"])
-    lesson_count = int(data["lesson_count"])
-    lesson_dates = generate_cycle_dates(
-        datetime.now(TZ).date(), selected_days, lesson_count
-    )
     await state.update_data(lesson_time=lesson_time)
-    await state.set_state(GroupAddStates.confirming)
+    # Next step: monthly tuition fee ("Oylik to'lov summasi") right in creation
+    await state.set_state(GroupAddStates.entering_fee)
     await message.answer(
         _lt(
-            "add_group_confirm_summary",
+            "add_group_enter_fee",
             lang,
-            group=html.escape(data["group_name"]),
-            teacher_label=html.escape(
-                str(data.get("teacher_label") or data.get("teacher_chat_id") or "—")
-            ),
-            count=lesson_count,
-            days=_format_days_from_indices(selected_days, lang),
-            time=html.escape(lesson_time),
-            cycle_title=html.escape(format_cycle_title(lesson_dates, 1)),
-            start_date=format_uz_date(lesson_dates[0].strftime("%d.%m"), lang),
-            end_date=format_uz_date(lesson_dates[-1].strftime("%d.%m"), lang),
+            group=html.escape(str(data.get("group_name", ""))),
         ),
-        reply_markup=group_add_confirm_kb(lang, back_cb="grp_add:back:time"),
+        reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:time"),
+        parse_mode="HTML",
+    )
+
+
+def _parse_fee_input(raw: str) -> Optional[int]:
+    raw_text = (raw or "").strip().lower()
+    for suffix in ("so'm", "so‘m", "som", "sum", "сўм", "uzs"):
+        raw_text = raw_text.replace(suffix, "")
+    cleaned = re.sub(r"[\s,._]", "", raw_text)
+    if not cleaned.isdigit():
+        return None
+    amount = int(cleaned)
+    if amount <= 0 or amount > 100_000_000:
+        return None
+    if amount < 10000:
+        amount *= 1000
+    return amount
+
+
+@router.message(GroupAddStates.entering_fee)
+async def msg_add_group_fee(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
+        return
+    amount = _parse_fee_input(message.text or "")
+    if amount is None:
+        await message.answer(
+            _lt("edit_invalid_price", lang),
+            reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:time"),
+            parse_mode="HTML",
+        )
+        return
+    data = await state.get_data()
+    selected_days = sorted(data["selected_days"])
+    lesson_count = int(data["lesson_count"])
+    lesson_time = str(data.get("lesson_time") or "")
+    lesson_dates = generate_cycle_dates(
+        today_tashkent(), selected_days, lesson_count
+    )
+    await state.update_data(monthly_fee=amount)
+    await state.set_state(GroupAddStates.confirming)
+    summary = _lt(
+        "add_group_confirm_summary",
+        lang,
+        group=html.escape(data["group_name"]),
+        teacher_label=html.escape(
+            str(data.get("teacher_label") or data.get("teacher_chat_id") or "—")
+        ),
+        count=lesson_count,
+        days=_format_days_from_indices(selected_days, lang),
+        time=html.escape(lesson_time),
+        cycle_title=html.escape(format_cycle_title(lesson_dates, 1)),
+        start_date=format_uz_date(lesson_dates[0].strftime("%d.%m"), lang),
+        end_date=format_uz_date(lesson_dates[-1].strftime("%d.%m"), lang),
+    )
+    summary += "\n" + _lt("add_group_fee_line", lang, amount=_format_uzs(amount))
+    await message.answer(
+        summary,
+        reply_markup=group_add_confirm_kb(lang, back_cb="grp_add:back:fee"),
+        parse_mode="HTML",
     )
 
 
@@ -2999,7 +3786,9 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
     ):
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(t("error_generic", lang))
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
 
@@ -3010,6 +3799,7 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
     lesson_count = int(data["lesson_count"])
     selected_days = sorted(data["selected_days"])
     lesson_time = data["lesson_time"]
+    monthly_fee = int(data.get("monthly_fee") or 0)
 
     if pending_invite:
         inv = await get_teacher_by_invite_code(pending_invite)
@@ -3028,12 +3818,13 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
         await state.clear()
         if callback.message:
             await callback.message.edit_text(
-                _lt("add_group_already_exists", lang, group=html.escape(group_name))
+                _lt("add_group_already_exists", lang, group=html.escape(group_name)),
+                parse_mode="HTML",
             )
         await callback.answer()
         return
 
-    today = datetime.now(TZ).date()
+    today = today_tashkent()
     try:
         await asyncio.to_thread(
             sheets.add_group,
@@ -3043,6 +3834,8 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             lesson_count,
             _format_days_from_indices(selected_days, "latn"),
             lesson_time,
+            "",
+            str(monthly_fee) if monthly_fee > 0 else "",
         )
         cycle_info = await asyncio.to_thread(
             sheets.create_cycle_table, group_name, today, 1, today.year
@@ -3054,7 +3847,9 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
     except Exception:
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(t("error_generic", lang))
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
 
@@ -3068,9 +3863,14 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
                     t_lang,
                     group=html.escape(group_name),
                 ),
+                parse_mode="HTML",
             )
         except Exception:
             pass
+
+    await _notify_upfront_cycle_payment(
+        callback.bot, sheets, group_name, cycle_info
+    )
 
     bot_me = await callback.bot.get_me()
     join_link = f"https://t.me/{bot_me.username}?start=join_{_make_join_slug(group_name)}"
@@ -3089,7 +3889,13 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
                 start_date=html.escape(format_uz_date(cycle_info["start_date"], lang)),
                 end_date=html.escape(format_uz_date(cycle_info["end_date"], lang)),
                 join_link=html.escape(join_link),
+            )
+            + (
+                "\n\n" + _lt("add_group_fee_line", lang, amount=_format_uzs(monthly_fee))
+                if monthly_fee > 0
+                else ""
             ),
+            parse_mode="HTML",
             disable_web_page_preview=True,
         )
     await callback.answer()
@@ -3113,7 +3919,7 @@ async def _show_group_edit_panel(
     if not group:
         await state.clear()
         await (message.edit_text if edit else message.answer)(
-            _lt("group_not_found", lang)
+            _lt("group_not_found", lang), parse_mode="HTML"
         )
         return
     canonical = group["Guruh_Nomi"].strip()
@@ -3140,7 +3946,9 @@ async def _show_group_edit_panel(
 
     text = f"{notice}\n\n{body}" if notice else body
     kb = _group_edit_fields_kb(canonical, lang)
-    await (message.edit_text if edit else message.answer)(text, reply_markup=kb)
+    await (message.edit_text if edit else message.answer)(
+        text, reply_markup=kb, parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data == "grp_edit:start")
@@ -3162,6 +3970,7 @@ async def cb_edit_group_start(callback: CallbackQuery, state: FSMContext) -> Non
             reply_markup=groups_inline_kb(
                 groups, "grp_edit_sel", lang, include_back=True, include_cancel=True
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -3188,7 +3997,9 @@ async def cb_edit_group_cancel(callback: CallbackQuery, state: FSMContext) -> No
     lang = await get_user_lang(callback.from_user.id)
     await state.clear()
     if callback.message:
-        await callback.message.edit_text(_lt("edit_cancelled", lang))
+        await callback.message.edit_text(
+            _lt("edit_cancelled", lang), parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -3200,7 +4011,7 @@ async def msg_edit_group_cancel(message: Message, state: FSMContext) -> None:
     if message.from_user:
         lang = await get_user_lang(message.from_user.id)
         await state.clear()
-        await message.answer(_lt("edit_cancelled", lang))
+        await message.answer(_lt("edit_cancelled", lang), parse_mode="HTML")
 
 
 @router.callback_query(
@@ -3217,7 +4028,9 @@ async def cb_edit_group_selected(callback: CallbackQuery, state: FSMContext) -> 
     if val == "__cancel__":
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(_lt("edit_cancelled", lang))
+            await callback.message.edit_text(
+                _lt("edit_cancelled", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
     if val == "__back__":
@@ -3226,6 +4039,7 @@ async def cb_edit_group_selected(callback: CallbackQuery, state: FSMContext) -> 
             await callback.message.edit_text(
                 _lt("choose_groups_mode", lang),
                 reply_markup=_mode_keyboard(lang, is_admin=True),
+                parse_mode="HTML",
             )
         await callback.answer()
         return
@@ -3260,6 +4074,7 @@ async def cb_edit_group_back(callback: CallbackQuery, state: FSMContext) -> None
                     include_back=True,
                     include_cancel=True,
                 ),
+                parse_mode="HTML",
             )
     elif target == "fields":
         group_name = (
@@ -3299,6 +4114,7 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
                 back_cb=f"grp_edit:back:fields:{group_name}",
                 cancel_cb="grp_edit:cancel",
             ),
+            parse_mode="HTML",
         )
     elif field == "teacher":
         teachers = await get_active_teachers()
@@ -3306,12 +4122,14 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.message.edit_text(
             _lt("edit_select_teacher", lang, group=html.escape(group_name)),
             reply_markup=group_edit_teacher_kb(group_name, teachers, lang),
+            parse_mode="HTML",
         )
     elif field == "count":
         await state.set_state(GroupEditStates.selecting_lesson_count)
         await callback.message.edit_text(
             t("schedule_select_count", lang),
             reply_markup=group_edit_lesson_count_kb(group_name, lang),
+            parse_mode="HTML",
         )
     elif field == "days":
         group = await get_sheets_manager().a_get_group(group_name)
@@ -3321,6 +4139,7 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.message.edit_text(
             t("schedule_select_days", lang),
             reply_markup=group_edit_weekdays_kb(group_name, current_days, lang),
+            parse_mode="HTML",
         )
     elif field == "time":
         await state.set_state(GroupEditStates.entering_time)
@@ -3331,6 +4150,7 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
                 back_cb=f"grp_edit:back:fields:{group_name}",
                 cancel_cb="grp_edit:cancel",
             ),
+            parse_mode="HTML",
         )
     elif field == "price":
         await state.set_state(EDIT_PRICE_STATE)
@@ -3380,7 +4200,7 @@ async def msg_edit_group_new_name(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     old_name = (await state.get_data()).get("edit_group_name", "")
     new_name = (message.text or "").strip()
@@ -3398,6 +4218,7 @@ async def msg_edit_group_new_name(message: Message, state: FSMContext) -> None:
                 back_cb=f"grp_edit:back:fields:{old_name}",
                 cancel_cb="grp_edit:cancel",
             ),
+            parse_mode="HTML",
         )
         return
     sheets = get_sheets_manager()
@@ -3413,6 +4234,7 @@ async def msg_edit_group_new_name(message: Message, state: FSMContext) -> None:
                 back_cb=f"grp_edit:back:fields:{old_name}",
                 cancel_cb="grp_edit:cancel",
             ),
+            parse_mode="HTML",
         )
         return
 
@@ -3422,8 +4244,8 @@ async def msg_edit_group_new_name(message: Message, state: FSMContext) -> None:
         message.bot,
         sheets,
         new_name,
-        changes_latn=f"Guruh nomi o'zgardi: {old_name} -> {new_name}",
-        changes_cyrl=f"Гуруҳ номи ўзгарди: {old_name} -> {new_name}",
+        change_items=[("Guruh_Nomi", old_name, new_name)],
+        triggered_by_user_id=user_id,
     )
     await _show_group_edit_panel(
         message,
@@ -3449,6 +4271,10 @@ async def cb_edit_group_teacher(callback: CallbackQuery, state: FSMContext) -> N
     sheets = get_sheets_manager()
     group = await sheets.a_get_group(group_name)
     old_teacher_id = str(group.get("Ustoz_Chat_ID", "") if group else "").strip()
+    old_teacher_name = "—"
+    if old_teacher_id:
+        old_t_info = await _resolve_group_teacher_info(sheets, old_teacher_id, "latn")
+        old_teacher_name = old_t_info["name"] or old_teacher_id
 
     if target == "__invite__":
         invite_code = secrets.token_hex(4).upper()
@@ -3500,17 +4326,19 @@ async def cb_edit_group_teacher(callback: CallbackQuery, state: FSMContext) -> N
                     t_lang,
                     group=html.escape(group_name),
                 ),
+                parse_mode="HTML",
             )
         except Exception:
             pass
 
     t_info = await _resolve_group_teacher_info(sheets, new_teacher_id, "latn")
+    new_teacher_name = t_info["name"] or new_teacher_id
     await _broadcast_group_update(
         callback.bot,
         sheets,
         group_name,
-        changes_latn=f"Guruh ustozi yangilandi: {t_info['name'] or new_teacher_id}",
-        changes_cyrl=f"Гуруҳ устози янгиланди: {t_info['name'] or new_teacher_id}",
+        change_items=[("Ustoz", old_teacher_name, new_teacher_name)],
+        triggered_by_user_id=user_id,
     )
 
     if callback.message:
@@ -3647,7 +4475,7 @@ async def msg_edit_group_time(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     group_name = (await state.get_data()).get("edit_group_name", "")
     match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
@@ -3659,6 +4487,7 @@ async def msg_edit_group_time(message: Message, state: FSMContext) -> None:
                 back_cb=f"grp_edit:back:fields:{group_name}",
                 cancel_cb="grp_edit:cancel",
             ),
+            parse_mode="HTML",
         )
         return
     lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
@@ -3667,7 +4496,7 @@ async def msg_edit_group_time(message: Message, state: FSMContext) -> None:
     group = await sheets.a_get_group(group_name)
     if not group:
         await state.clear()
-        await message.answer(_lt("group_not_found", lang))
+        await message.answer(_lt("group_not_found", lang), parse_mode="HTML")
         return
 
     current_count = int(group.get("Oylik_Dars_Soni") or 12)
@@ -3710,11 +4539,28 @@ async def cb_edit_group_schedule_confirm(
     if not group_name or not days_indices:
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(t("error_generic", lang))
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
 
     sheets = get_sheets_manager()
+    old_group = await sheets.a_get_group(group_name)
+    old_count = str(old_group.get("Oylik_Dars_Soni") or "12") if old_group else "12"
+    old_days = str(old_group.get("Dars_Kunlari") or "") if old_group else ""
+    old_time = str(old_group.get("Dars_Vaqti") or "") if old_group else ""
+
+    change_items: list[tuple[str, str, str]] = []
+    if str(new_count) != old_count.strip():
+        change_items.append(("Oylik_Dars_Soni", old_count, str(new_count)))
+    if parse_weekdays(old_days) != sorted(days_indices):
+        change_items.append(("Dars_Kunlari", old_days, days_str))
+    if new_time.strip() != old_time.strip():
+        change_items.append(("Dars_Vaqti", old_time, new_time))
+    if not change_items:
+        change_items.append(("Dars_Vaqti", old_time, new_time))
+
     try:
         final_dates = await asyncio.to_thread(
             sheets.rebuild_active_cycle_sheet,
@@ -3726,7 +4572,9 @@ async def cb_edit_group_schedule_confirm(
     except Exception:
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(t("error_generic", lang))
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
 
@@ -3734,9 +4582,9 @@ async def cb_edit_group_schedule_confirm(
         callback.bot,
         sheets,
         group_name,
-        changes_latn="Dars jadvali (kunlar / vaqt / dars soni) yangilandi",
-        changes_cyrl="Дарс жадвали (кунлар / вақт / дарс сони) янгиланди",
+        change_items=change_items,
         dates_list=final_dates,
+        triggered_by_user_id=user_id,
     )
 
     notice = _lt(
@@ -3760,7 +4608,7 @@ async def msg_edit_group_price(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     group_name = (await state.get_data()).get("edit_group_name", "")
 
@@ -3798,13 +4646,16 @@ async def msg_edit_group_price(message: Message, state: FSMContext) -> None:
         amount *= 1000
 
     sheets = get_sheets_manager()
+    old_group = await sheets.a_get_group(group_name)
+    old_fee = str(old_group.get("Oylik_Tolov_Summa", "") if old_group else "").strip()
+
     await asyncio.to_thread(_sync_update_group_fee, sheets, group_name, amount)
     await _broadcast_group_update(
         message.bot,
         sheets,
         group_name,
-        changes_latn=f"Oylik to'lov summasi yangilandi: {_format_uzs(amount)} so'm",
-        changes_cyrl=f"Ойлик тўлов суммаси янгиланди: {_format_uzs(amount)} сўм",
+        change_items=[("Oylik_Tolov_Summa", old_fee, str(amount))],
+        triggered_by_user_id=user_id,
     )
     notice = _lt(
         "edit_price_saved",
@@ -3862,7 +4713,7 @@ async def _advance_full_group_step(
         await state.set_state(FullGroupEditStates.editing_fee)
         raw_fee = str(orig.get("Oylik_Tolov_Summa") or "").strip()
         fee_disp = (
-            f"{_format_uzs(int(raw_fee))} {'сўм' if lang == 'cyrl' else 'so‘m'}"
+            format_uzs(raw_fee, lang)
             if raw_fee.isdigit() and int(raw_fee) > 0
             else t("group_price_not_set", lang)
         )
@@ -3881,12 +4732,12 @@ async def _advance_full_group_step(
         old_fee = str(orig.get("Oylik_Tolov_Summa") or "").strip()
         new_fee = str(new_vals.get("Oylik_Tolov_Summa", old_fee)).strip()
         old_fee_disp = (
-            f"{_format_uzs(int(old_fee))} so'm"
+            format_uzs(old_fee, lang)
             if old_fee.isdigit() and int(old_fee) > 0
             else "—"
         )
         new_fee_disp = (
-            f"{_format_uzs(int(new_fee))} so'm"
+            format_uzs(new_fee, lang)
             if new_fee.isdigit() and int(new_fee) > 0
             else "—"
         )
@@ -3928,7 +4779,9 @@ async def cb_full_group_cancel(callback: CallbackQuery, state: FSMContext) -> No
     lang = await get_user_lang(callback.from_user.id)
     await state.clear()
     if callback.message:
-        await callback.message.edit_text(_lt("edit_cancelled", lang))
+        await callback.message.edit_text(
+            _lt("edit_cancelled", lang), parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -3940,7 +4793,7 @@ async def msg_full_group_cancel(message: Message, state: FSMContext) -> None:
     if message.from_user:
         lang = await get_user_lang(message.from_user.id)
         await state.clear()
-        await message.answer(_lt("edit_cancelled", lang))
+        await message.answer(_lt("edit_cancelled", lang), parse_mode="HTML")
 
 
 @router.callback_query(
@@ -3976,7 +4829,7 @@ async def msg_full_group_name(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     new_name = (message.text or "").strip()
     if (
@@ -3989,6 +4842,7 @@ async def msg_full_group_name(message: Message, state: FSMContext) -> None:
         await message.answer(
             _lt("add_group_invalid_name", lang),
             reply_markup=full_group_edit_step_kb(lang),
+            parse_mode="HTML",
         )
         return
     data = await state.get_data()
@@ -4001,6 +4855,7 @@ async def msg_full_group_name(message: Message, state: FSMContext) -> None:
         await message.answer(
             _lt("add_group_already_exists", lang, group=html.escape(new_name)),
             reply_markup=full_group_edit_step_kb(lang),
+            parse_mode="HTML",
         )
         return
     full_new = dict(data.get("full_new", {}))
@@ -4099,13 +4954,14 @@ async def msg_full_group_time(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
     if not match:
         await message.answer(
             t("schedule_invalid_time", lang),
             reply_markup=full_group_edit_step_kb(lang),
+            parse_mode="HTML",
         )
         return
     lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
@@ -4124,7 +4980,7 @@ async def msg_full_group_fee(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     raw_text = (message.text or "").strip().lower()
     for suffix in ("so'm", "so‘m", "som", "sum", "сўм", "uzs"):
@@ -4155,7 +5011,7 @@ async def msg_full_group_chat_id(message: Message, state: FSMContext) -> None:
     lang = await get_user_lang(user_id)
     if not await _is_admin(user_id):
         await state.clear()
-        await message.answer(_lt("no_permission", lang))
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     raw = (message.text or "").strip()
     if not re.fullmatch(r"-?\d{5,20}", raw):
@@ -4187,11 +5043,14 @@ async def cb_full_group_confirm_all(
 
     data = await state.get_data()
     old_group_name = str(data.get("full_old_group_name") or "").strip()
+    orig = dict(data.get("full_orig") or {})
     full_new = dict(data.get("full_new") or {})
     if not old_group_name:
         await state.clear()
         if callback.message:
-            await callback.message.edit_text(t("error_generic", lang))
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
         await callback.answer()
         return
 
@@ -4203,7 +5062,9 @@ async def cb_full_group_confirm_all(
         if not ok:
             await state.clear()
             if callback.message:
-                await callback.message.edit_text(t("error_generic", lang))
+                await callback.message.edit_text(
+                    t("error_generic", lang), parse_mode="HTML"
+                )
             await callback.answer()
             return
         if new_group_name.lower() != old_group_name.lower():
@@ -4211,13 +5072,25 @@ async def cb_full_group_confirm_all(
 
     sent_count = 0
     if full_new:
-        changed_keys_latn = ", ".join(full_new.keys())
+        change_items = [
+            (str(k), str(orig.get(k, "")), str(v))
+            for k, v in full_new.items()
+        ]
+        dates_list: Optional[list[str]] = None
+        if "Oylik_Dars_Soni" in full_new or "Dars_Kunlari" in full_new:
+            cycle_dates = await asyncio.to_thread(
+                sheets.get_cycle_dates_with_status, new_group_name
+            )
+            if cycle_dates:
+                dates_list = [d["date_str"] for d in cycle_dates]
+
         sent_count = await _broadcast_group_update(
             callback.bot,
             sheets,
             new_group_name,
-            changes_latn=changed_keys_latn,
-            changes_cyrl=changed_keys_latn,
+            change_items=change_items,
+            dates_list=dates_list,
+            triggered_by_user_id=user_id,
         )
 
     notice = _lt(

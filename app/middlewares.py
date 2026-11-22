@@ -7,7 +7,7 @@ from aiogram.types import CallbackQuery, Message, TelegramObject
 
 from app.database import get_user_lang
 from app.keyboards import global_cancel_fsm_kb
-from app.locales import TEXTS, t
+from app.locales import button_texts, t
 
 _MAIN_MENU_KEYS = (
     "menu_admin_groups",
@@ -30,18 +30,14 @@ _MAIN_MENU_KEYS = (
     "menu_parent_schedule",
     "menu_parent_payments",
     "btn_change_lang",
+    "menu_admin_courses",
+    "menu_guest_courses",
+    "menu_guest_enroll",
+    "menu_guest_contact",
 )
 
-MAIN_MENU_BUTTONS: set[str] = {
-    "🌐 Tilni o'zgartirish",
-    "🌐 Tilni o‘zgartirish",
-    "🌐 Тилни ўзгартириш",
-}
-for _lang in ("latn", "cyrl"):
-    for _key in _MAIN_MENU_KEYS:
-        _val = TEXTS.get(_lang, {}).get(_key)
-        if _val:
-            MAIN_MENU_BUTTONS.add(_val)
+# Current labels plus legacy ones (older reply keyboards may still be on screen).
+MAIN_MENU_BUTTONS: set[str] = button_texts(*_MAIN_MENU_KEYS)
 
 DEEP_LINK_START_RE = re.compile(r"^/start(?:@\w+)?\s+\S+")
 
