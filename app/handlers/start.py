@@ -23,6 +23,7 @@ from aiogram.types import (
 
 from app import database
 from app import states as app_states
+from app.scheduler import schedule_group_initial_notice
 from app.utils import now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
 from app.database import (
@@ -1814,6 +1815,7 @@ async def _apply_dual_role_invite_payload(
                     sid,
                     s_name,
                 )
+                schedule_group_initial_notice(None, group_name)
             return (sid or None), s_name
 
     db_user = await get_user(chat_id)
@@ -2688,6 +2690,13 @@ async def cb_approve_role_change(
         t_rec = await sheets_mgr.a_get_teacher_by_chat_id(target_user_id)
         if t_rec and t_rec.get("Ustoz_ID"):
             await sheets_mgr.a_delete_teacher_completely(t_rec["Ustoz_ID"])
+            await database.log_audit_event(
+                actor_id=adm_id,
+                action=database.AUDIT_TEACHER_DELETED,
+                target=f"{str(t_rec.get('F.I.O.') or '').strip()} ({t_rec['Ustoz_ID']})",
+                details="Rol almashtirish so'rovi tasdiqlandi (ustoz roli olib tashlandi)",
+                actor_name=callback.from_user.full_name or "",
+            )
     elif old_role in {"student", "parent"}:
         await asyncio.to_thread(
             _sync_clear_user_student_or_parent_chat_ids,
@@ -4086,6 +4095,7 @@ async def cb_join_approve(
             student_id,
             resolved_req["full_name"],
         )
+        schedule_group_initial_notice(callback.bot, resolved_req["group_name"])
     except Exception as exc:
         err_text = (
             _lt("rate_limit_busy", lang)
@@ -5018,3 +5028,5 @@ async def cmd_link_group(
         ),
         parse_mode="HTML",
     )
+    # Start the persistent 1-hour initial notice timer (if none yet / unsent).
+    schedule_group_initial_notice(message.bot, canonical_group)

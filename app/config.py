@@ -32,6 +32,19 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID: str = os.getenv("SPREADSHEET_ID", "").strip()
 ADMIN_IDS: list[int] = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
+
+def _parse_optional_int(raw: str) -> int | None:
+    try:
+        return int(raw.strip()) if raw and raw.strip() else None
+    except ValueError:
+        return None
+
+
+# Annual archive reports (Mishkat_Yillik_Hisobot_*.html) are delivered here;
+# falls back to ADMIN_IDS[0] when BACKUP_CHAT_ID is not set.
+BACKUP_CHAT_ID: int | None = _parse_optional_int(os.getenv("BACKUP_CHAT_ID", ""))
+BACKUP_THREAD_ID: int | None = _parse_optional_int(os.getenv("BACKUP_THREAD_ID", ""))
+
 CREDENTIALS_PATH: Path = _resolve_path("CREDENTIALS_PATH", "credentials.json")
 DB_PATH: Path = _resolve_path("DB_PATH", "data/bot.db")
 

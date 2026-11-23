@@ -19,8 +19,12 @@ from aiogram.types import (
 )
 
 from app import database
+from app.scheduler import schedule_group_initial_notice
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, SUPPORT_PHONE
 from app.database import (
+    AUDIT_STUDENT_DELETED,
+    AUDIT_STUDENT_RESTORED,
+    AUDIT_STUDENT_TO_RESERVE,
     add_legacy_debt,
     create_parent_batch_invite,
     delete_legacy_debt,
@@ -28,6 +32,7 @@ from app.database import (
     get_legacy_debts,
     get_user,
     get_user_lang,
+    log_audit_event,
     set_legacy_debt_paid,
 )
 from app.keyboards import (
@@ -1668,6 +1673,13 @@ async def cb_reserve_restore_group_selected(
     full_name = str(restored.get("F.I.O.") or "").strip() or sid
     new_group = str(restored.get("Guruh") or val).strip()
 
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_STUDENT_RESTORED,
+        target=f"{full_name} ({sid}) | {new_group}",
+        details=f"Talaba: {full_name}; Guruh: {new_group}",
+        actor_name=callback.from_user.full_name or "",
+    )
     await _notify_restore_from_reserve(callback.bot, restored, new_group, user_id)
 
     grp_obj = await sheets.a_get_group(new_group)
@@ -2241,6 +2253,7 @@ async def pb_add_more_or_finish(
                 await sheets.a_add_student_to_active_cycle(
                     child["group_name"], sid, child["full_name"], charge_upfront=True
                 )
+                schedule_group_initial_notice(callback.bot, child["group_name"])
                 created_lines.append(
                     f"{idx}. <b>{html.escape(child['full_name'])}</b> "
                     f"(<code>{html.escape(sid)}</code>) — 📚 <b>{html.escape(child['group_name'])}</b>"
@@ -2672,6 +2685,13 @@ async def stu_mng_action_clicked(callback: CallbackQuery, state: FSMContext) -> 
                 await callback.answer(t("error_generic", lang), show_alert=True)
                 return
             old_group = str(move_res.get("old_group") or "").strip() or "—"
+            await log_audit_event(
+                actor_id=user_id,
+                action=AUDIT_STUDENT_TO_RESERVE,
+                target=f"{old_fio or sid} ({sid}) | {old_group}",
+                details=f"Talaba: {old_fio or sid}; Eski guruh: {old_group}",
+                actor_name=callback.from_user.full_name or "",
+            )
             stu_sent, par_sent = await _notify_reserve_move(
                 callback.bot, move_res.get("student") or student, old_group, user_id
             )
@@ -2697,6 +2717,13 @@ async def stu_mng_action_clicked(callback: CallbackQuery, state: FSMContext) -> 
                     except Exception:
                         logger.exception("Failed restoring %s to %s", sid, sobiq)
                     else:
+                        await log_audit_event(
+                            actor_id=user_id,
+                            action=AUDIT_STUDENT_RESTORED,
+                            target=f"{old_fio or sid} ({sid}) | {sobiq}",
+                            details=f"Talaba: {old_fio or sid}; Guruh: {sobiq}",
+                            actor_name=callback.from_user.full_name or "",
+                        )
                         try:
                             await _notify_restore_from_reserve(
                                 callback.bot,
@@ -3039,6 +3066,7 @@ async def stu_transfer_keep_confirmed(
     new_student_id = result["new_student_id"]
     updated_student = result["student"]
     student_name = str(updated_student.get("F.I.O.") or "").strip()
+    schedule_group_initial_notice(callback.bot, new_group)
 
     await sheets.a_sync_student_across_all_sheets(
         new_student_id,
@@ -3372,6 +3400,18 @@ async def stu_delete_confirmed(callback: CallbackQuery, state: FSMContext) -> No
     payload = await sheets.a_purge_student_completely(sid)
     await state.clear()
     if payload.get("deleted"):
+        del_name = str(payload.get("student_name") or sid)
+        del_group = str((student_before or {}).get("Guruh") or "").strip() or "—"
+        await log_audit_event(
+            actor_id=user_id,
+            action=AUDIT_STUDENT_DELETED,
+            target=f"{del_name} ({payload.get('student_id') or sid}) | {del_group}",
+            details=(
+                f"Talaba: {del_name}; Guruh: {del_group}; "
+                f"O'chirilgan sikl qatorlari: {int(payload.get('removed_cycle_rows') or 0)}"
+            ),
+            actor_name=callback.from_user.full_name or "",
+        )
         stu_cid = payload.get("student_chat_id")
         # A student with another enrollment (same chat id) keeps the student role.
         purge_stu_cid = None if payload.get("student_has_other_enrollments") else stu_cid

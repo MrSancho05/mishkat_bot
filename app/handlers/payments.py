@@ -22,7 +22,10 @@ from app import config
 from app.utils import dual_role_header, now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
+    AUDIT_PAYMENT_CONFIRMED,
+    AUDIT_PAYMENT_REVERTED,
     get_legacy_debts,
+    log_audit_event,
     get_unpaid_legacy_debts_map,
     get_notification_details,
     get_pending_action,
@@ -1415,6 +1418,15 @@ async def cb_payment_confirm(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer(t("error_generic", lang), show_alert=True)
         return
 
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_PAYMENT_CONFIRMED,
+        target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
+        amount=int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee(),
+        details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
+        actor_name=callback.from_user.full_name or "",
+    )
+
     student = await sheets.a_get_student_by_id(student_id)
     if student:
         await _broadcast_payment_event(
@@ -1498,6 +1510,15 @@ async def cb_payment_revert(callback: CallbackQuery, state: FSMContext) -> None:
     if not ok:
         await callback.answer(t("error_generic", lang), show_alert=True)
         return
+
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_PAYMENT_REVERTED,
+        target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
+        amount=int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee(),
+        details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
+        actor_name=callback.from_user.full_name or "",
+    )
 
     student = await sheets.a_get_student_by_id(student_id)
     if student:

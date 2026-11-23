@@ -488,6 +488,405 @@ async def init_db() -> None:
             );
             """
         )
+        # Immutable (append-only) financial / administrative audit trail.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor_id INTEGER,
+                actor_name TEXT NOT NULL DEFAULT '',
+                actor_role TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                target TEXT NOT NULL DEFAULT '',
+                amount INTEGER,
+                details TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        await db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS audit_logs_no_update
+            BEFORE UPDATE ON audit_logs
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_logs is append-only');
+            END;
+            """
+        )
+        # Legacy per-group weekly reminder table (kept only to migrate its rows).
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_weekly_reminders (
+                group_name TEXT PRIMARY KEY,
+                iso_week TEXT NOT NULL
+            );
+            """
+        )
+        # Persistent two-stage group-chat payment reminder state (survives restarts):
+        #   stage 1 = initial notice 1 hour after the first student joined,
+        #   stage 2 = count-only weekly reminder every Monday 10:00.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS group_reminder_state (
+                group_name TEXT PRIMARY KEY,
+                initial_due_at TEXT,
+                initial_sent INTEGER DEFAULT 0,
+                last_weekly_iso_week TEXT
+            );
+            """
+        )
+        # Groups already reminded under the old single-stage logic have had their
+        # initial notice: carry them over so nothing is re-sent.
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO group_reminder_state
+                (group_name, initial_due_at, initial_sent, last_weekly_iso_week)
+            SELECT group_name, '', 1, iso_week FROM group_weekly_reminders;
+            """
+        )
+        await db.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS audit_logs_no_delete
+            BEFORE DELETE ON audit_logs
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_logs is append-only');
+            END;
+            """
+        )
+        await db.commit()
+
+
+# ----------------------------------------------------------------------
+# Immutable audit log (SQLite `audit_logs` + Google Sheets `Audit_Log`)
+# ----------------------------------------------------------------------
+
+AUDIT_PAYMENT_CONFIRMED = "✅ To'lov tasdiqlandi"
+AUDIT_PAYMENT_REVERTED = "↩️ To'lov qaytarildi"
+AUDIT_STUDENT_DELETED = "🗑 Talaba o'chirildi"
+AUDIT_STUDENT_TO_RESERVE = "⏸ Zaxiraga o'tkazildi"
+AUDIT_STUDENT_RESTORED = "▶️ Darsga tiklandi"
+AUDIT_GROUP_DELETED = "🗑 Guruh o'chirildi"
+AUDIT_GROUP_EDITED = "✏️ Guruh tahrirlandi"
+AUDIT_TEACHER_DELETED = "🗑 Ustoz o'chirildi"
+
+
+async def resolve_audit_actor(
+    telegram_id: Optional[int], fallback_name: str = ""
+) -> tuple[str, str]:
+    """Returns (actor_name, actor_role) for the audit trail; never raises."""
+    name = str(fallback_name or "").strip()
+    role = ""
+    try:
+        if telegram_id is not None:
+            if telegram_id in ADMIN_IDS or await is_dynamic_admin(telegram_id):
+                role = "Admin"
+            elif await get_teacher_by_telegram_id(telegram_id):
+                role = "Ustoz"
+            db_user = await get_user(telegram_id)
+            if db_user:
+                if not role:
+                    role = str(db_user.get("role") or "").strip().capitalize()
+                if not name:
+                    name = str(db_user.get("full_name") or "").strip()
+            if not name:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    async with db.execute(
+                        "SELECT full_name FROM user_profiles WHERE telegram_id = ?;",
+                        (telegram_id,),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                        if row and str(row[0] or "").strip():
+                            name = str(row[0]).strip()
+    except Exception:
+        pass
+    return (name or str(telegram_id or "—")), (role or "—")
+
+
+async def log_audit_event(
+    actor_id: Optional[int],
+    action: str,
+    target: str = "",
+    amount: Optional[int] = None,
+    details: str = "",
+    actor_name: str = "",
+    actor_role: str = "",
+) -> None:
+    """
+    Appends one row to SQLite `audit_logs` and to the `Audit_Log` worksheet.
+    Append-only: there is no update / delete API. Never raises, so an audit
+    failure can never break the business action that triggered it.
+    """
+    stamp = now_tashkent().strftime("%d.%m.%Y %H:%M:%S")
+    amount_val = int(amount) if amount is not None else None
+    try:
+        if not actor_name or not actor_role:
+            r_name, r_role = await resolve_audit_actor(actor_id, actor_name)
+            actor_name = actor_name or r_name
+            actor_role = actor_role or r_role
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO audit_logs
+                    (created_at, actor_id, actor_name, actor_role, action,
+                     target, amount, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    stamp,
+                    actor_id,
+                    actor_name,
+                    actor_role,
+                    action,
+                    target,
+                    amount_val,
+                    details,
+                ),
+            )
+            await db.commit()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("Failed writing audit_logs row")
+    try:
+        import asyncio
+
+        from app.sheets import get_sheets_manager
+
+        await asyncio.to_thread(
+            get_sheets_manager().append_audit_log,
+            stamp,
+            actor_name,
+            actor_id,
+            actor_role,
+            action,
+            target,
+            amount_val,
+            details,
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("Failed writing Audit_Log worksheet row")
+
+
+# ----------------------------------------------------------------------
+# Group payment reminder state (Asia/Tashkent): initial notice + weekly count
+# ----------------------------------------------------------------------
+
+GROUP_INITIAL_NOTICE_DELAY = timedelta(hours=1)
+
+
+def current_iso_week() -> str:
+    """Current Asia/Tashkent ISO week as 'YYYY-Www' (e.g. '2026-W48')."""
+    iso = now_tashkent().isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _group_reminder_key(group_name: str) -> str:
+    return str(group_name or "").strip().lower()
+
+
+def _parse_due_at(raw: Any) -> Optional[datetime]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=now_tashkent().tzinfo)
+    return parsed
+
+
+async def get_group_reminder_state(group_name: str) -> Optional[dict[str, Any]]:
+    """{'initial_due_at', 'initial_sent', 'last_weekly_iso_week'} or None."""
+    key = _group_reminder_key(group_name)
+    if not key:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT initial_due_at, initial_sent, last_weekly_iso_week "
+            "FROM group_reminder_state WHERE group_name = ?;",
+            (key,),
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "initial_due_at": str(row[0] or ""),
+        "initial_sent": int(row[1] or 0),
+        "last_weekly_iso_week": str(row[2] or "") or None,
+    }
+
+
+async def ensure_group_initial_due(group_name: str) -> bool:
+    """
+    Starts the 1-hour countdown of the initial group notice (now_tashkent + 1h)
+    unless it is already running or the notice was already sent.
+    Returns True only when a new timer was set.
+    """
+    key = _group_reminder_key(group_name)
+    if not key:
+        return False
+    due_iso = (now_tashkent() + GROUP_INITIAL_NOTICE_DELAY).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE;")
+        try:
+            async with db.execute(
+                "SELECT initial_due_at, initial_sent FROM group_reminder_state "
+                "WHERE group_name = ?;",
+                (key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                await db.execute(
+                    "INSERT INTO group_reminder_state "
+                    "(group_name, initial_due_at, initial_sent, last_weekly_iso_week) "
+                    "VALUES (?, ?, 0, NULL);",
+                    (key, due_iso),
+                )
+                changed = True
+            elif int(row[1] or 0) == 0 and not str(row[0] or "").strip():
+                await db.execute(
+                    "UPDATE group_reminder_state SET initial_due_at = ? "
+                    "WHERE group_name = ?;",
+                    (due_iso, key),
+                )
+                changed = True
+            else:
+                changed = False
+            await db.commit()
+            return changed
+        except Exception:
+            await db.execute("ROLLBACK;")
+            raise
+
+
+async def list_due_initial_group_notices() -> list[str]:
+    """Lower-cased group keys whose 1-hour timer elapsed and notice is unsent."""
+    now = now_tashkent()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT group_name, initial_due_at FROM group_reminder_state "
+            "WHERE COALESCE(initial_sent, 0) = 0 AND COALESCE(initial_due_at, '') != '';"
+        ) as cursor:
+            rows = await cursor.fetchall()
+    due: list[str] = []
+    for name, due_raw in rows:
+        due_at = _parse_due_at(due_raw)
+        if due_at is not None and now >= due_at:
+            due.append(str(name))
+    return due
+
+
+async def claim_group_initial_notice(group_name: str) -> bool:
+    """
+    Atomically flips initial_sent 0 -> 1 and records the current ISO week as the
+    last weekly week (so the same Monday never sends a second message).
+    False when it was already sent / has no running timer.
+    """
+    key = _group_reminder_key(group_name)
+    if not key:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE group_reminder_state SET initial_sent = 1, "
+            "last_weekly_iso_week = ? "
+            "WHERE group_name = ? AND COALESCE(initial_sent, 0) = 0;",
+            (current_iso_week(), key),
+        )
+        await db.commit()
+        return (cursor.rowcount or 0) > 0
+
+
+async def release_group_initial_notice(group_name: str) -> None:
+    """Rolls the initial-notice claim back after a failed Telegram delivery."""
+    key = _group_reminder_key(group_name)
+    if not key:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE group_reminder_state SET initial_sent = 0, "
+            "last_weekly_iso_week = NULL WHERE group_name = ?;",
+            (key,),
+        )
+        await db.commit()
+
+
+async def claim_group_weekly_reminder(
+    group_name: str, iso_week: str
+) -> tuple[bool, Optional[str]]:
+    """
+    Atomically records `iso_week` as the last weekly reminder week of a group
+    whose initial notice was already sent. Returns (claimed, previous_week);
+    claimed is False when the week was already recorded or stage 1 is pending.
+    """
+    key = _group_reminder_key(group_name)
+    if not key:
+        return False, None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE;")
+        try:
+            async with db.execute(
+                "SELECT initial_sent, last_weekly_iso_week FROM group_reminder_state "
+                "WHERE group_name = ?;",
+                (key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            previous = str(row[1]) if row and row[1] else None
+            if row is None or int(row[0] or 0) != 1 or previous == iso_week:
+                await db.execute("ROLLBACK;")
+                return False, previous
+            await db.execute(
+                "UPDATE group_reminder_state SET last_weekly_iso_week = ? "
+                "WHERE group_name = ?;",
+                (iso_week, key),
+            )
+            await db.commit()
+            return True, previous
+        except Exception:
+            await db.execute("ROLLBACK;")
+            raise
+
+
+async def release_group_weekly_reminder(
+    group_name: str, previous_week: Optional[str]
+) -> None:
+    """Rolls a weekly claim back when the Telegram delivery failed (retry later)."""
+    key = _group_reminder_key(group_name)
+    if not key:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE group_reminder_state SET last_weekly_iso_week = ? "
+            "WHERE group_name = ?;",
+            (previous_week, key),
+        )
+        await db.commit()
+
+
+async def rename_group_weekly_reminder(old_name: str, new_name: str) -> None:
+    """Keeps the group reminder state when a group is renamed."""
+    old_key, new_key = _group_reminder_key(old_name), _group_reminder_key(new_name)
+    if not old_key or not new_key or old_key == new_key:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE OR IGNORE group_reminder_state SET group_name = ? WHERE group_name = ?;",
+            (new_key, old_key),
+        )
+        await db.commit()
+
+
+async def delete_group_reminder_state(group_name: str) -> None:
+    """Forgets the reminder state of a deleted group (a re-created group restarts)."""
+    key = _group_reminder_key(group_name)
+    if not key:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM group_reminder_state WHERE group_name = ?;", (key,))
+        await db.execute("DELETE FROM group_weekly_reminders WHERE group_name = ?;", (key,))
         await db.commit()
 
 

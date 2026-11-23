@@ -1404,7 +1404,7 @@ async def cb_attendance_finish_instant(
                     qarz_summasi=format_uzs(total_debt),
                 )
                 if total_debt > 0
-                else ""
+                else "\n"
             )
             s_body = t(
                 s_key,
@@ -1469,7 +1469,7 @@ async def cb_attendance_finish_instant(
                     qarz_summasi=format_uzs(c_debt),
                 )
                 if c_debt > 0
-                else ""
+                else "\n"
             )
             p_body = t(
                 p_key,

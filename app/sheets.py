@@ -1,6 +1,8 @@
 import asyncio
 import copy
+import html as _html_mod
 import re
+import sqlite3
 import threading
 import time as _time
 from collections import Counter
@@ -16,6 +18,7 @@ import app.config as _app_config
 from app.utils import now_tashkent, to_tashkent, today_tashkent
 from app.config import (
     CREDENTIALS_PATH,
+    DB_PATH,
     GROUP_SHEET_NAME,
     SPREADSHEET_ID,
     STUDENT_SHEET_NAME,
@@ -52,15 +55,125 @@ STUDENT_HEADERS = [
     "Onasi_Chat_ID",
     "Status",
     "Qarzdor_Oylar",
-    "Sobiq_Guruh",
-    "Izoh",
 ]
 
 # Columns that may legitimately stay empty (never auto-filled with the yellow
 # "Ma'lumot kiritilmagan" placeholder).
-STUDENT_OPTIONAL_COLS = {"Qarzdor_Oylar", "Sobiq_Guruh", "Izoh"}
+STUDENT_OPTIONAL_COLS = {"Qarzdor_Oylar"}
+
+# 'Sobiq_Guruh' / 'Izoh' are no longer columns of Baza_Talabalar. The reserve
+# ("Zahira guruhi") restore flow still needs them, so they live in the SQLite
+# table `student_reserve_meta` and are exposed as virtual fields on every
+# student record (reads and update_student() writes behave exactly as before).
+STUDENT_META_FIELDS = ("Sobiq_Guruh", "Izoh")
+
+
+def _meta_connect() -> sqlite3.Connection:
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    conn = sqlite3.connect(str(DB_PATH), timeout=15)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS student_reserve_meta ("
+        "student_id TEXT PRIMARY KEY, "
+        "sobiq_guruh TEXT NOT NULL DEFAULT '', "
+        "izoh TEXT NOT NULL DEFAULT '')"
+    )
+    return conn
+
+
+def _load_student_meta() -> dict[str, dict[str, str]]:
+    """{Talaba_ID: {"Sobiq_Guruh": ..., "Izoh": ...}}; never raises."""
+    try:
+        conn = _meta_connect()
+        try:
+            rows = conn.execute(
+                "SELECT student_id, sobiq_guruh, izoh FROM student_reserve_meta"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            str(sid): {"Sobiq_Guruh": str(sob or ""), "Izoh": str(izo or "")}
+            for sid, sob, izo in rows
+        }
+    except Exception:
+        _sheets_logger.exception("Failed loading student_reserve_meta")
+        return {}
+
+
+def _save_student_meta(student_id: str, fields: dict[str, str]) -> None:
+    sid = str(student_id or "").strip()
+    if not sid or not fields:
+        return
+    conn = _meta_connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO student_reserve_meta (student_id) VALUES (?)",
+            (sid,),
+        )
+        if "Sobiq_Guruh" in fields:
+            conn.execute(
+                "UPDATE student_reserve_meta SET sobiq_guruh = ? WHERE student_id = ?",
+                (str(fields["Sobiq_Guruh"] or ""), sid),
+            )
+        if "Izoh" in fields:
+            conn.execute(
+                "UPDATE student_reserve_meta SET izoh = ? WHERE student_id = ?",
+                (str(fields["Izoh"] or ""), sid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_student_meta(student_id: str) -> None:
+    sid = str(student_id or "").strip()
+    if not sid:
+        return
+    try:
+        conn = _meta_connect()
+        try:
+            conn.execute(
+                "DELETE FROM student_reserve_meta WHERE student_id = ?", (sid,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        _sheets_logger.exception("Failed deleting student_reserve_meta for %s", sid)
+
+
+def _import_student_meta(rows: list[tuple[str, str, str]]) -> bool:
+    """Copies legacy sheet values into the side table (existing DB rows win)."""
+    try:
+        conn = _meta_connect()
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO student_reserve_meta "
+                "(student_id, sobiq_guruh, izoh) VALUES (?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except Exception:
+        _sheets_logger.exception("Failed importing legacy Sobiq_Guruh/Izoh values")
+        return False
 
 RESERVE_GROUP_NAME = "Zahira guruhi"
+AUDIT_SHEET_NAME = "Audit_Log"
+AUDIT_HEADERS = [
+    "Sana_Vaqt",
+    "Kim_FIO",
+    "Kim_ID",
+    "Rol",
+    "Harakat",
+    "Obyekt",
+    "Summa",
+    "Batafsil",
+]
 LEAD_SHEET_NAME = "Qiziquvchilar_Lidlar"
 LEAD_HEADERS = [
     "Lead_ID",
@@ -137,6 +250,10 @@ STUDENT_CHAT_ID_COLS = (
     "Onasi_Chat_ID",
     "OtaOna_Chat_ID",
 )
+
+
+def _html_escape(value: Any) -> str:
+    return _html_mod.escape(str(value or ""))
 
 
 def _is_present_mark(mark: Any) -> bool:
@@ -446,6 +563,9 @@ class SheetsManager:
         self._groups_cache: Optional[tuple[float, list[dict[str, Any]]]] = None
         self._cache_ttl: float = 20.0
         self._cycle_snapshot_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._created_titles: set[str] = set()
+        self._archive_sender: Optional[Any] = None
+        self._pending_archives: list[tuple[str, bytes, str]] = []
 
     def _invalidate_students_cache(self) -> None:
         self._students_cache = None
@@ -593,6 +713,7 @@ class SheetsManager:
                 ws = self._execute_with_retry(
                     ss.add_worksheet, title=title, rows=rows, cols=cols
                 )
+                self._created_titles.add(title)
                 cached_headers: list[str] = []
                 if headers:
                     self._execute_with_retry(
@@ -813,11 +934,66 @@ class SheetsManager:
 
             return normalized_row
 
+    def _migrate_student_schema(self, ws: gspread.Worksheet) -> None:
+        """
+        One-time cleanup of Baza_Talabalar: removes the obsolete 'Sobiq_Guruh' and
+        'Izoh' columns. Values that still exist in them (reserve students) are
+        first copied into the `student_reserve_meta` table, so nothing is lost
+        and the Zahira-guruhi restore flow keeps working. Columns are located by
+        header name and deleted right-to-left, so no other column ever shifts.
+        """
+        try:
+            values = self._execute_with_retry(ws.get_all_values)
+            if not values:
+                return
+            raw_headers = list(values[0])
+            headers = [str(h or "").strip() for h in raw_headers]
+            legacy_idx = {
+                name: headers.index(name)
+                for name in STUDENT_META_FIELDS
+                if name in headers
+            }
+            if not legacy_idx:
+                return
+
+            def _cell(row: list[str], idx: Optional[int]) -> str:
+                if idx is None or idx >= len(row):
+                    return ""
+                val = _normalize_read_value(row[idx])
+                return "" if val == MISSING_TEXT else val
+
+            id_idx = headers.index("Talaba_ID") if "Talaba_ID" in headers else None
+            import_rows: list[tuple[str, str, str]] = []
+            for raw in values[1:]:
+                sid = _cell(raw, id_idx)
+                sobiq = _cell(raw, legacy_idx.get("Sobiq_Guruh"))
+                izoh = _cell(raw, legacy_idx.get("Izoh"))
+                if sid and (sobiq or izoh):
+                    import_rows.append((sid, sobiq, izoh))
+            if import_rows and not _import_student_meta(import_rows):
+                return  # keep the columns; nothing may be lost
+
+            for idx in sorted(legacy_idx.values(), reverse=True):
+                self._execute_with_retry(ws.delete_columns, idx + 1)
+                raw_headers.pop(idx)
+            self._ws_cache[ws.title] = (ws, list(raw_headers))
+            self._invalidate_students_cache()
+            _sheets_logger.info(
+                "Removed obsolete columns %s from %s",
+                ", ".join(legacy_idx),
+                STUDENT_SHEET_NAME,
+            )
+        except Exception:
+            _sheets_logger.exception(
+                "Could not clean up obsolete %s columns", STUDENT_SHEET_NAME
+            )
+
     def ensure_master_sheets(self) -> None:
         with self._lock:
             ws_students = self._get_or_create_worksheet(
                 STUDENT_SHEET_NAME, headers=STUDENT_HEADERS, rows=500, cols=16
             )
+            self._migrate_student_schema(ws_students)
             self._ensure_missing_headers(ws_students, STUDENT_HEADERS)
 
             ws_groups = self._get_or_create_worksheet(
@@ -838,6 +1014,14 @@ class SheetsManager:
             )
             self._ensure_missing_headers(ws_leads, LEAD_HEADERS)
 
+            ws_audit = self._get_or_create_worksheet(
+                AUDIT_SHEET_NAME,
+                headers=AUDIT_HEADERS,
+                rows=1000,
+                cols=len(AUDIT_HEADERS),
+            )
+            self._ensure_missing_headers(ws_audit, AUDIT_HEADERS)
+
     # ------------------------------------------------------------------
     # CRUD: Baza_Talabalar & Global Propagation
     # ------------------------------------------------------------------
@@ -856,6 +1040,7 @@ class SheetsManager:
             return (rows[0] if rows else list(STUDENT_HEADERS)), []
         headers = rows[0]
         students: list[dict[str, Any]] = []
+        meta_map = _load_student_meta()
         for idx, raw_row in enumerate(rows[1:], start=2):
             padded = raw_row + [""] * (len(headers) - len(raw_row))
             record: dict[str, Any] = {
@@ -863,6 +1048,9 @@ class SheetsManager:
             }
             for h in STUDENT_HEADERS:
                 record.setdefault(h, "")
+            stu_meta = meta_map.get(str(record.get("Talaba_ID") or "").strip(), {})
+            for meta_key in STUDENT_META_FIELDS:
+                record[meta_key] = stu_meta.get(meta_key) or record.get(meta_key, "")
             self._normalize_student_record(record)
             record["_row_number"] = idx
             if not record.get("Talaba_ID"):
@@ -1354,6 +1542,22 @@ class SheetsManager:
             student = self.get_student_by_id(student_id)
             if not student:
                 return False
+
+            meta_updates = {
+                k: ("" if v is None else str(v))
+                for k, v in updates.items()
+                if k in STUDENT_META_FIELDS
+            }
+            if meta_updates:
+                _save_student_meta(
+                    str(student.get("Talaba_ID") or student_id).strip(), meta_updates
+                )
+                updates = {
+                    k: v for k, v in updates.items() if k not in STUDENT_META_FIELDS
+                }
+                if not updates:
+                    self._invalidate_students_cache()
+                    return True
 
             old_fio = str(student.get("F.I.O.", "")).strip()
             row_num = student["_row_number"]
@@ -2318,6 +2522,7 @@ class SheetsManager:
             )
             self._execute_with_retry(ws.delete_rows, int(student["_row_number"]))
             self._invalidate_students_cache()
+            _delete_student_meta(real_sid)
             payload["deleted"] = True
 
             # --- 4. Which parents are orphaned? ---------------------------------
@@ -3899,9 +4104,184 @@ class SheetsManager:
         self, group_name: str, year: int
     ) -> gspread.Worksheet:
         sheet_title = f"{group_name.strip()}_{year}"
-        return self._get_or_create_worksheet(
+        ws = self._get_or_create_worksheet(
             sheet_title, headers=None, rows=300, cols=22
         )
+        if sheet_title in self._created_titles:
+            self._created_titles.discard(sheet_title)
+            self._schedule_annual_archive(group_name.strip(), year)
+        return ws
+
+    # ------------------------------------------------------------------
+    # Annual group archive (HTML report of {Group}_{year-1})
+    # ------------------------------------------------------------------
+
+    def set_archive_sender(self, sender: Any) -> None:
+        """
+        Registers `sender(filename, content_bytes, caption)` (blocking, thread-safe)
+        and flushes archives that were produced before the bot was ready.
+        """
+        self._archive_sender = sender
+        pending, self._pending_archives = self._pending_archives, []
+        for item in pending:
+            self._deliver_archive(*item)
+
+    def _deliver_archive(self, filename: str, content: bytes, caption: str) -> None:
+        sender = self._archive_sender
+        if sender is None:
+            self._pending_archives.append((filename, content, caption))
+            return
+        try:
+            sender(filename, content, caption)
+        except Exception:
+            _sheets_logger.exception("Failed delivering annual archive %s", filename)
+
+    def _schedule_annual_archive(self, group_name: str, new_year: int) -> None:
+        """Builds + sends the previous year's report in a background thread."""
+
+        def _worker() -> None:
+            try:
+                self.generate_annual_group_archive(group_name, new_year - 1)
+            except Exception:
+                _sheets_logger.exception(
+                    "Annual archive for %s_%s failed", group_name, new_year - 1
+                )
+
+        threading.Thread(target=_worker, name="annual-archive", daemon=True).start()
+
+    def build_annual_report_data(
+        self, group_name: str, year: int
+    ) -> Optional[dict[str, Any]]:
+        """Reads {group}_{year} and returns the report payload (None if no sheet)."""
+        with self._lock:
+            ss = self._get_spreadsheet()
+            title = f"{group_name.strip()}_{year}"
+            try:
+                ws = self._execute_with_retry(ss.worksheet, title)
+            except gspread.WorksheetNotFound:
+                return None
+            cycles_raw = self.parse_cycles_from_sheet(ws)
+
+            group = self.get_group(group_name) or {}
+            teacher_name = "—"
+            teacher_id = str(group.get("Ustoz_ID") or "").strip()
+            if teacher_id:
+                teacher = self.get_teacher_by_id(teacher_id)
+                if teacher:
+                    teacher_name = str(teacher.get("F.I.O.") or "").strip() or "—"
+            fee_raw = re.sub(r"[^\d]", "", str(group.get("Oylik_Tolov_Summa") or ""))
+            fee = int(fee_raw) if fee_raw else 0
+            if not fee:
+                import os as _os
+
+                env_fee = re.sub(r"[^\d]", "", _os.getenv("DEFAULT_MONTHLY_FEE", ""))
+                fee = int(env_fee) if env_fee else 0
+
+            cycles: list[dict[str, Any]] = []
+            for cyc in cycles_raw:
+                dcols = cyc.get("date_columns", [])
+                students: list[dict[str, Any]] = []
+                for row in cyc.get("student_rows", []):
+                    marks: list[str] = []
+                    present = absent = 0
+                    for dc in dcols:
+                        mk = str(row["marks"].get(dc["col_idx"], "") or "").strip()
+                        if _is_present_mark(mk):
+                            present += 1
+                            marks.append("✅")
+                        elif _is_absent_mark(mk):
+                            absent += 1
+                            marks.append("❌")
+                        else:
+                            marks.append("")
+                    students.append(
+                        {
+                            "id": row.get("student_id", ""),
+                            "name": row.get("full_name", ""),
+                            "present": present,
+                            "absent": absent,
+                            "paid": _is_paid_status(row.get("payment_status", "")),
+                            "marks": marks,
+                        }
+                    )
+                cycles.append(
+                    {
+                        "title": cyc.get("title", ""),
+                        "dates": [str(dc.get("date_str", "")) for dc in dcols],
+                        "students": students,
+                    }
+                )
+            return {
+                "group": group_name.strip(),
+                "year": year,
+                "teacher": teacher_name,
+                "fee": fee,
+                "cycles": cycles,
+            }
+
+    def generate_annual_group_archive(
+        self, group_name: str, prev_year: int
+    ) -> Optional[str]:
+        """
+        Creates Mishkat_Yillik_Hisobot_{group}_{prev_year}.html from the previous
+        year's worksheet and hands it to the registered Telegram sender.
+        Returns the filename, or None when there is no previous-year sheet.
+        """
+        from app.utils import annual_report_filename, build_annual_report_html
+
+        data = self.build_annual_report_data(group_name, prev_year)
+        if not data or not data["cycles"]:
+            return None
+        content = build_annual_report_html(data).encode("utf-8")
+        filename = annual_report_filename(group_name, prev_year)
+        caption = (
+            f"📦 <b>Yillik arxiv hisoboti</b>\n\n"
+            f"📚 Guruh: <b>{_html_escape(group_name)}</b>\n"
+            f"🗓 Yil: <b>{prev_year}</b>\n\n"
+            "Faylni telefoningizda bir bosishda ochishingiz mumkin."
+        )
+        self._deliver_archive(filename, content, caption)
+        return filename
+
+    # ------------------------------------------------------------------
+    # Immutable audit trail worksheet (append-only)
+    # ------------------------------------------------------------------
+
+    def append_audit_log(
+        self,
+        stamp: str,
+        actor_name: str,
+        actor_id: Any,
+        actor_role: str,
+        action: str,
+        target: str,
+        amount: Any,
+        details: str,
+    ) -> None:
+        """Appends one row to 'Audit_Log'. There is deliberately no edit/delete API."""
+
+        def _safe(value: Any) -> Any:
+            text = "" if value is None else str(value)
+            return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+        with self._lock:
+            ws = self._get_or_create_worksheet(
+                AUDIT_SHEET_NAME, headers=AUDIT_HEADERS, rows=1000, cols=len(AUDIT_HEADERS)
+            )
+            self._ensure_missing_headers(ws, AUDIT_HEADERS)
+            row = [
+                _safe(stamp),
+                _safe(actor_name),
+                "" if actor_id is None else str(actor_id),
+                _safe(actor_role),
+                _safe(action),
+                _safe(target),
+                "" if amount is None else int(amount),
+                _safe(details),
+            ]
+            self._execute_with_retry(
+                ws.append_row, row, value_input_option="USER_ENTERED"
+            )
 
     def parse_cycles_from_sheet(self, ws: gspread.Worksheet) -> list[dict[str, Any]]:
         with self._lock:

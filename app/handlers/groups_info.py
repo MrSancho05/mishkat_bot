@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import html
 import inspect
 import re
@@ -21,9 +22,13 @@ from aiogram.types import (
 
 import app.config as _app_config
 from app import database
+from app.scheduler import schedule_group_initial_notice
 from app.utils import now_tashkent, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
 from app.database import (
+    AUDIT_GROUP_DELETED,
+    AUDIT_GROUP_EDITED,
+    AUDIT_TEACHER_DELETED,
     create_teacher_invite,
     get_active_teachers,
     get_notification_details,
@@ -31,6 +36,7 @@ from app.database import (
     get_teacher_by_telegram_id,
     get_user,
     get_user_lang,
+    log_audit_event,
     reset_user_role,
     save_notification_details,
 )
@@ -2268,7 +2274,23 @@ async def cb_delete_group_confirm(
         await callback.answer()
         return
 
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_GROUP_DELETED,
+        target=canonical,
+        details=(
+            f"Guruh: {canonical}; talabalar Zahira guruhiga o'tkazildi; "
+            f"Ustoz chat ID: {old_teacher_chat_id or '—'}"
+        ),
+        actor_name=callback.from_user.full_name or "",
+    )
     await _cleanup_deleted_group_in_sqlite(canonical)
+    try:
+        await database.delete_group_reminder_state(canonical)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed clearing group reminder state for %s", canonical
+        )
     if old_teacher_chat_id:
         await asyncio.to_thread(
             _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
@@ -2527,6 +2549,14 @@ async def cb_teacher_manage_assign_execute(
         teacher.get("Chat_ID") or teacher.get("Ustoz_Chat_ID") or ""
     ).strip()
 
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_GROUP_EDITED,
+        target=canonical_group,
+        details=f"Ustoz: {old_teacher_name} → {teacher_name}",
+        actor_name=callback.from_user.full_name or "",
+    )
+
     if old_teacher_chat_id and old_teacher_chat_id != teacher_chat_id:
         await asyncio.to_thread(
             _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
@@ -2656,6 +2686,13 @@ async def cb_teacher_manage_delete_confirm(
     )
 
     payload = await sheets.a_purge_teacher_completely(teacher_id)
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_TEACHER_DELETED,
+        target=f"{teacher_name} ({payload.get('teacher_id') or teacher_id})",
+        details=f"Ustoz: {teacher_name}; Ustoz ID: {payload.get('teacher_id') or teacher_id}",
+        actor_name=callback.from_user.full_name or "",
+    )
     t_cid_int = payload.get("teacher_chat_id")
     teacher_lang_before = await get_user_lang(int(t_cid_int)) if t_cid_int else "latn"
     chat_id = str(t_cid_int) if t_cid_int else ""
@@ -5067,8 +5104,26 @@ async def cb_full_group_confirm_all(
                 )
             await callback.answer()
             return
+        await log_audit_event(
+            actor_id=user_id,
+            action=AUDIT_GROUP_EDITED,
+            target=(
+                old_group_name
+                if new_group_name.lower() == old_group_name.lower()
+                else f"{old_group_name} → {new_group_name}"
+            ),
+            details="; ".join(
+                f"{k}: {orig.get(k, '')} → {v}" for k, v in full_new.items()
+            ),
+            actor_name=callback.from_user.full_name or "",
+        )
         if new_group_name.lower() != old_group_name.lower():
             await _rename_group_in_sqlite(old_group_name, new_group_name)
+            await database.rename_group_weekly_reminder(old_group_name, new_group_name)
+        if str(full_new.get("Guruh_TG_Chat_ID") or "").strip():
+            # A group chat was linked/changed: make sure the 1-hour initial
+            # notice timer is running (never restarted if already set/sent).
+            schedule_group_initial_notice(callback.bot, new_group_name)
 
     sent_count = 0
     if full_new:

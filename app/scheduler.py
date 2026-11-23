@@ -22,7 +22,15 @@ from app import config
 from app.utils import dual_role_header, now_tashkent, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
+    claim_group_initial_notice,
+    claim_group_weekly_reminder,
+    current_iso_week,
+    ensure_group_initial_due,
     get_group_counter,
+    get_group_reminder_state,
+    list_due_initial_group_notices,
+    release_group_initial_notice,
+    release_group_weekly_reminder,
     get_unpaid_legacy_debts_map,
     get_lesson_topic,
     get_teacher_by_telegram_id,
@@ -35,6 +43,7 @@ from app.database import (
 from app.debt_view import (
     build_debt_notice,
     compute_children_debts,
+    format_cycle_title,
     send_expandable_notice,
 )
 from app.locales import format_uz_date, t
@@ -1418,6 +1427,60 @@ def _format_weekly_debt_parent_message(
     )
 
 
+def _weekly_debt_period_text(
+    child_debt: Optional[dict[str, Any]], raw_debts: str, lang: str
+) -> str:
+    """HTML-safe list of unpaid periods (current cycles + legacy labels)."""
+    parts: list[str] = []
+    if child_debt:
+        for cyc in child_debt.get("cycles") or []:
+            title = str(cyc.get("title") or "").strip()
+            if title:
+                parts.append(format_cycle_title(title, lang))
+        for title in child_debt.get("extra_titles") or []:
+            parts.append(format_cycle_title(title, lang))
+        for leg in child_debt.get("legacy") or []:
+            label = str(leg.get("label") or "").strip()
+            if label and label != "—":
+                parts.append(html.escape(label))
+    if not parts:
+        cleaned = str(raw_debts or "").strip()
+        if cleaned and not cleaned.isdigit():
+            parts = [
+                format_cycle_title(x.strip(), lang)
+                for x in cleaned.split(";")
+                if x.strip() and x.strip() != "0"
+            ]
+    seen: list[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.append(part)
+    return ", ".join(seen) if seen else "—"
+
+
+async def _resolve_weekly_parent_name(
+    par_chat_id: int,
+    items: list[dict[str, Any]],
+    students_by_id: dict[str, dict[str, Any]],
+    lang: str,
+) -> str:
+    for it in items:
+        stu = students_by_id.get(str(it.get("student_id") or "").strip()) or {}
+        for cid_col, name_col in (
+            ("Otasi_Chat_ID", "Otasi_FIO"),
+            ("Onasi_Chat_ID", "Onasi_FIO"),
+            ("OtaOna_Chat_ID", "Otasi_FIO"),
+        ):
+            if _parse_int_chat_id(stu.get(cid_col)) == par_chat_id:
+                name = str(stu.get(name_col) or "").strip()
+                if name:
+                    return name
+    db_user = await get_user(par_chat_id)
+    if db_user and str(db_user.get("full_name") or "").strip():
+        return str(db_user["full_name"]).strip()
+    return "ota-ona" if lang != "cyrl" else "ота-она"
+
+
 async def weekly_debt_reminder(bot: Bot) -> None:
     sheets = get_sheets_manager()
     try:
@@ -1465,7 +1528,6 @@ async def weekly_debt_reminder(bot: Bot) -> None:
         child_debts = []
     child_by_sid = {c["student_id"]: c for c in child_debts}
 
-    debtors_by_group: dict[str, list[dict[str, Any]]] = {}
     student_payloads: dict[int, list[dict[str, Any]]] = {}
     parent_payloads: dict[int, list[dict[str, Any]]] = {}
 
@@ -1483,9 +1545,6 @@ async def weekly_debt_reminder(bot: Bot) -> None:
         student_name = student.get("F.I.O.", "").strip() or stu_id
         fee = group_fees.get(group_raw.lower(), default_fee)
         total = child_debt["total_sum"] if child_debt else months * fee
-
-        if group_raw and _count_debt_months(debts) > 0:
-            debtors_by_group.setdefault(group_raw.lower(), []).append(student)
 
         item = {
             "student_id": stu_id,
@@ -1518,7 +1577,7 @@ async def weekly_debt_reminder(bot: Bot) -> None:
             ):
                 p_bucket.append(item)
 
-    # 1) Student DMs (1 combined message per student)
+    # 1) Student DMs (one reminder per unpaid group, upfront Lesson-1 wording)
     for stu_cid, s_items in student_payloads.items():
         s_lang = await get_user_lang(stu_cid)
         s_prefix = (
@@ -1526,109 +1585,315 @@ async def weekly_debt_reminder(bot: Bot) -> None:
             if await has_dual_student_parent_role(stu_cid)
             else ""
         )
-        s_children = [
-            child_by_sid[it["student_id"]]
-            for it in s_items
-            if it["student_id"] in child_by_sid
-        ]
-        if s_children:
-            s_short, s_detailed = build_debt_notice(
-                s_children,
+        for it in s_items:
+            s_msg = t(
+                "weekly_debt_student_dm",
                 s_lang,
-                audience="student",
-                card_number=card_number,
-                card_owner=card_owner,
-                recipient_name=s_items[0]["student_name"],
-                prefix=s_prefix,
+                student_name=html.escape(it["student_name"]),
+                group_name=html.escape(it["group_name"]),
+                debts=_weekly_debt_period_text(
+                    child_by_sid.get(it["student_id"]), it["debts"], s_lang
+                ),
+                amount=_format_uzs(int(it["total"])),
+                card_number=card_esc,
+                card_owner=owner_esc,
             )
-            await send_expandable_notice(bot, stu_cid, s_short, s_detailed, s_lang)
-        else:
-            s_blocks = [
-                t(
-                    "reminder_weekly_debt_student",
-                    s_lang,
-                    student_name=html.escape(it["student_name"]),
-                    group=html.escape(it["group_name"]),
-                    debts=html.escape(it["debts"]),
-                    card_number=card_esc,
-                    card_owner=owner_esc,
-                )
-                for it in s_items
-            ]
-            await _safe_send_message(
-                bot,
-                stu_cid,
-                f"{s_prefix}" + "\n\n━━━━━━━━━━━━━━\n\n".join(s_blocks),
-            )
-        await asyncio.sleep(0.05)
+            await _safe_send_message(bot, stu_cid, f"{s_prefix}{s_msg}")
+            await asyncio.sleep(0.05)
 
-    # 2) Parent DMs (Strictly 1 combined message per parent)
+    # 2) Parent DMs (strictly 1 message per parent chat: single or combined)
     for par_chat_id, p_items in parent_payloads.items():
         p_lang = await get_user_lang(par_chat_id)
         is_dual = await has_dual_student_parent_role(par_chat_id)
-        p_children = [
-            child_by_sid[it["student_id"]]
-            for it in p_items
-            if it["student_id"] in child_by_sid
-        ]
-        if p_children:
-            p_prefix = (
-                dual_role_header(
-                    "parent",
-                    p_lang,
-                    [str(c.get("F.I.O.") or "") for c in p_children],
-                )
-                if is_dual
-                else ""
+        p_name = await _resolve_weekly_parent_name(
+            par_chat_id, p_items, students_by_id, p_lang
+        )
+        p_prefix = (
+            dual_role_header(
+                "parent", p_lang, [str(it.get("student_name") or "") for it in p_items]
             )
-            p_short, p_detailed = build_debt_notice(
-                p_children,
+            if is_dual
+            else ""
+        )
+        if len(p_items) == 1:
+            it = p_items[0]
+            p_msg = t(
+                "weekly_debt_parent_single_dm",
                 p_lang,
-                audience="parent",
-                card_number=card_number,
-                card_owner=card_owner,
-                prefix=p_prefix,
+                parent_name=html.escape(p_name),
+                student_name=html.escape(it["student_name"]),
+                group_name=html.escape(it["group_name"]),
+                debts=_weekly_debt_period_text(
+                    child_by_sid.get(it["student_id"]), it["debts"], p_lang
+                ),
+                amount=_format_uzs(int(it["total"])),
+                card_number=card_esc,
+                card_owner=owner_esc,
             )
-            await send_expandable_notice(bot, par_chat_id, p_short, p_detailed, p_lang)
         else:
-            combined = _format_weekly_debt_parent_message(
-                items=p_items,
-                lang=p_lang,
-                card_number=card_number,
-                card_owner=card_owner,
-                has_dual_role=is_dual,
+            child_blocks = [
+                t(
+                    "weekly_debt_child_block",
+                    p_lang,
+                    student_name=html.escape(it["student_name"]),
+                    group_name=html.escape(it["group_name"]),
+                    debts=_weekly_debt_period_text(
+                        child_by_sid.get(it["student_id"]), it["debts"], p_lang
+                    ),
+                    amount=_format_uzs(int(it["total"])),
+                )
+                for it in p_items
+            ]
+            p_msg = t(
+                "weekly_debt_parent_multi_dm",
+                p_lang,
+                parent_name=html.escape(p_name),
+                children_blocks="\n\n──────────────────\n\n".join(child_blocks),
+                grand_total=_format_uzs(sum(int(it["total"]) for it in p_items)),
+                card_number=card_esc,
+                card_owner=owner_esc,
             )
-            await _safe_send_message(bot, par_chat_id, combined)
+        await _safe_send_message(bot, par_chat_id, f"{p_prefix}{p_msg}")
         await asyncio.sleep(0.05)
 
-    # 3) Group Telegram Chat reminder (Latin script, tap-to-copy card)
-    for grp_key, grp_debtors in debtors_by_group.items():
-        grp = groups_by_lower.get(grp_key)
-        if not grp:
+    # 3) Stage 2 - Group Telegram Chat reminder: COUNT ONLY (no names / personal
+    #    data). Only groups whose initial notice was already sent and that were
+    #    not yet reminded this ISO week; nothing is sent once everyone has paid.
+    for grp in groups:
+        grp_name = str(grp.get("Guruh_Nomi", "")).strip()
+        if not grp_name or not _parse_int_chat_id(grp.get("Guruh_TG_Chat_ID")):
             continue
-        group_tg_id = _parse_int_chat_id(grp.get("Guruh_TG_Chat_ID"))
-        if not group_tg_id:
-            continue
+        if await maybe_send_group_weekly_reminder(bot, grp_name, group=grp):
+            await asyncio.sleep(0.5)
 
-        canonical_group = html.escape(grp.get("Guruh_Nomi", "").strip())
-        debtor_lines = "\n".join(
-            f"• <b>{html.escape(d.get('F.I.O.', '').strip())}</b> — "
-            f"<i>{html.escape(d.get('Qarzdor_Oylar', '').strip())}</i>"
-            for d in grp_debtors
+
+async def _count_unpaid_active_students(sheets: SheetsManager, group_name: str) -> int:
+    """Number of active ("O'qiyapti") students of the group with an unpaid cycle."""
+    students = await asyncio.to_thread(sheets.get_all_students, group_name, True)
+    return sum(
+        1
+        for stu in students
+        if _count_debt_months(str(stu.get("Qarzdor_Oylar", "") or "")) > 0
+    )
+
+
+async def maybe_send_group_weekly_reminder(
+    bot: Bot,
+    group_name: str,
+    *,
+    group: Optional[dict[str, Any]] = None,
+    unpaid_count: Optional[int] = None,
+) -> bool:
+    """
+    Stage 2: anonymized, count-only "Haftalik to‘lov eslatmasi" for the group's
+    Telegram chat (`Guruh_TG_Chat_ID`) - never any student names.
+
+    Sends only when the chat is linked, the initial notice was already sent
+    (group_reminder_state.initial_sent == 1), the current Asia/Tashkent ISO week
+    is not yet recorded in last_weekly_iso_week and at least one active student
+    is still unpaid. With 0 unpaid students nothing is sent (auto-stop).
+    Never raises. Returns True only when a message was actually delivered.
+    """
+    try:
+        clean_name = str(group_name or "").strip()
+        if not clean_name:
+            return False
+        sheets = get_sheets_manager()
+        if group is None:
+            group = await asyncio.to_thread(sheets.get_group, clean_name)
+        if not group:
+            return False
+        group_tg_id = _parse_int_chat_id(group.get("Guruh_TG_Chat_ID"))
+        if not group_tg_id:
+            return False
+
+        canonical_group = str(group.get("Guruh_Nomi", "")).strip() or clean_name
+        iso_week = current_iso_week()
+        state = await get_group_reminder_state(canonical_group)
+        if (
+            not state
+            or int(state.get("initial_sent") or 0) != 1
+            or state.get("last_weekly_iso_week") == iso_week
+        ):
+            return False
+
+        if unpaid_count is None:
+            unpaid_count = await _count_unpaid_active_students(sheets, canonical_group)
+        if unpaid_count <= 0:
+            return False
+
+        claimed, previous_week = await claim_group_weekly_reminder(
+            canonical_group, iso_week
         )
-        group_msg = (
-            "⚠️ <b>Haftalik to‘lov eslatmasi</b>\n\n"
-            f"📚 Guruh: <b>{canonical_group}</b>\n\n"
-            f"To‘lov muddati kelgan talabalar:\n{debtor_lines}\n\n"
-            "Iltimos, oylik to‘lovni o‘z vaqtida amalga oshiring.\n\n"
-            f"💳 To‘lov uchun karta: <code>{card_esc}</code>\n"
-            f"👤 Karta egasi: <b>{owner_esc}</b>"
+        if not claimed:
+            return False
+
+        card_number, card_owner = _get_payment_card_info()
+        group_msg = t(
+            "group_weekly_reminder",
+            "latn",
+            canonical_group=html.escape(canonical_group),
+            unpaid_count=unpaid_count,
+            card_esc=html.escape(card_number),
+            owner_esc=html.escape(card_owner),
         )
-        await _safe_send_message(bot, group_tg_id, group_msg)
-        await asyncio.sleep(0.5)
+        delivered = await _safe_send_message(bot, group_tg_id, group_msg)
+        if not delivered:
+            await release_group_weekly_reminder(canonical_group, previous_week)
+        return delivered
+    except Exception:
+        logger.exception("Group weekly reminder failed for %s", group_name)
+        return False
+
+
+async def send_group_initial_notice(
+    bot: Bot,
+    group_name: str,
+    *,
+    group: Optional[dict[str, Any]] = None,
+) -> bool:
+    """
+    Stage 1: "Oylik to‘lov eslatmasi" (no unpaid count, no names), sent once
+    when the 1-hour timer of group_reminder_state has elapsed, the group chat is
+    linked and at least one active student is unpaid. On success it sets
+    initial_sent = 1 and last_weekly_iso_week = current ISO week. Never raises.
+    """
+    try:
+        clean_name = str(group_name or "").strip()
+        if not clean_name:
+            return False
+        sheets = get_sheets_manager()
+        if group is None:
+            group = await asyncio.to_thread(sheets.get_group, clean_name)
+        if not group:
+            return False
+        group_tg_id = _parse_int_chat_id(group.get("Guruh_TG_Chat_ID"))
+        if not group_tg_id:
+            return False
+        canonical_group = str(group.get("Guruh_Nomi", "")).strip() or clean_name
+
+        if await _count_unpaid_active_students(sheets, canonical_group) <= 0:
+            return False
+        if not await claim_group_initial_notice(canonical_group):
+            return False
+
+        card_number, card_owner = _get_payment_card_info()
+        msg = t(
+            "group_initial_notice",
+            "latn",
+            canonical_group=html.escape(canonical_group),
+            card_esc=html.escape(card_number),
+            owner_esc=html.escape(card_owner),
+        )
+        delivered = await _safe_send_message(bot, group_tg_id, msg)
+        if not delivered:
+            await release_group_initial_notice(canonical_group)
+        return delivered
+    except Exception:
+        logger.exception("Group initial notice failed for %s", group_name)
+        return False
+
+
+# group key -> earliest time the (still unmet) initial notice is re-checked, so a
+# due-but-not-sendable group (chat unlinked / everyone paid) does not hit Google
+# Sheets every minute. The persistent timer in SQLite is never touched by this.
+_initial_retry_after: dict[str, Any] = {}
+_INITIAL_RETRY_DELAY = timedelta(minutes=10)
+
+
+async def process_initial_group_notices(bot: Bot) -> None:
+    """
+    Runs every minute (and right after startup, so a restart never loses a
+    pending 1-hour timer): sends every initial group notice whose
+    initial_due_at has passed and whose initial_sent is still 0.
+    """
+    try:
+        due_keys = await list_due_initial_group_notices()
+    except Exception:
+        logger.exception("Failed listing due initial group notices")
+        return
+    now = now_tashkent()
+    pending = [
+        k for k in due_keys if _initial_retry_after.get(k, now) <= now
+    ]
+    if not pending:
+        return
+    sheets = get_sheets_manager()
+    try:
+        groups = await asyncio.to_thread(sheets.get_all_groups)
+    except Exception:
+        logger.exception("Failed loading groups for initial group notices")
+        return
+    by_key = {
+        str(g.get("Guruh_Nomi", "")).strip().lower(): g
+        for g in groups
+        if str(g.get("Guruh_Nomi", "")).strip()
+    }
+    for key in pending:
+        grp = by_key.get(key)
+        if grp is None:
+            _initial_retry_after[key] = now + _INITIAL_RETRY_DELAY
+            continue
+        if await send_group_initial_notice(
+            bot, str(grp.get("Guruh_Nomi", "")), group=grp
+        ):
+            _initial_retry_after.pop(key, None)
+            await asyncio.sleep(0.5)
+        else:
+            _initial_retry_after[key] = now_tashkent() + _INITIAL_RETRY_DELAY
+
+
+async def register_group_initial_notice(
+    group_name: str, *, require_students: bool = True
+) -> bool:
+    """
+    Starts the persistent 1-hour countdown (now_tashkent + 1h) of the initial
+    group notice, unless one is already running or was already sent. Called when
+    a student is added to a group and when /link_group links a group chat.
+    Never raises. Returns True when a new timer was set.
+    """
+    try:
+        clean_name = str(group_name or "").strip()
+        if not clean_name:
+            return False
+        if require_students:
+            students = await asyncio.to_thread(
+                get_sheets_manager().get_all_students, clean_name, True
+            )
+            if not students:
+                return False
+        _initial_retry_after.pop(clean_name.lower(), None)
+        return await ensure_group_initial_due(clean_name)
+    except Exception:
+        logger.exception("Could not start initial group notice timer for %s", group_name)
+        return False
+
+
+_group_reminder_tasks: set["asyncio.Task[Any]"] = set()
+_registered_bot: Optional[Bot] = None
+
+
+def schedule_group_initial_notice(bot: Optional[Bot], group_name: str) -> None:
+    """
+    Fire-and-forget wrapper so handlers never wait on Google Sheets reads.
+    (`bot` is accepted for call-site symmetry; the timer itself is persistent
+    and delivered by the scheduler.)
+    """
+    if not str(group_name or "").strip():
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(
+            register_group_initial_notice(group_name)
+        )
+    except RuntimeError:
+        return
+    _group_reminder_tasks.add(task)
+    task.add_done_callback(_group_reminder_tasks.discard)
 
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
+    global _registered_bot
+    _registered_bot = bot
     scheduler = AsyncIOScheduler(timezone=TZ)
     now_tz = now_tashkent()
 
@@ -1638,6 +1903,16 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         next_run_time=now_tz + timedelta(seconds=15),
         args=[bot],
         id="process_lesson_reminders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        process_initial_group_notices,
+        trigger=IntervalTrigger(minutes=1, timezone=TZ),
+        next_run_time=now_tz + timedelta(seconds=20),
+        args=[bot],
+        id="process_initial_group_notices",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

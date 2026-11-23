@@ -18,7 +18,7 @@ from app.handlers.students import router as students_router
 from app.middlewares import StateGuardMiddleware
 from app.scheduler import setup_scheduler
 from app.sheets import get_sheets_manager
-from app.utils import to_tashkent
+from app.utils import send_annual_archive_document, to_tashkent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +64,15 @@ async def main() -> None:
     dp.include_router(attendance_router)
     dp.include_router(payments_router)
     dp.include_router(groups_info_router)
+
+    loop = asyncio.get_running_loop()
+
+    def _archive_sender(filename: str, content: bytes, caption: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            send_annual_archive_document(bot, filename, content, caption), loop
+        ).result(timeout=120)
+
+    get_sheets_manager().set_archive_sender(_archive_sender)
 
     scheduler = setup_scheduler(bot)
     scheduler.start()
