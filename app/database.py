@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -538,6 +539,84 @@ async def init_db() -> None:
             """
         )
         await db.commit()
+    await _migrate_prorated_overrides_to_100()
+
+
+async def _migrate_prorated_overrides_to_100() -> None:
+    """
+    One-time (idempotent) migration: active-cycle prorated overrides that were
+    stored with the old nearest-1 000 rounding (-3) are recalculated with the
+    nearest-100 rounding (-2). A row is touched only when its amount still equals
+    the old -3 result for the group's current fee / lesson count; rows whose fee
+    or lesson count cannot be determined (or that were set by hand) stay intact.
+    Never raises, so a Sheets outage can never block the bot's startup.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT student_id, group_name, cycle_title, remaining_lessons, "
+                "custom_amount FROM student_cycle_overrides;"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        if not rows:
+            return
+
+        from app.debt_view import _group_fee_from_row, default_monthly_fee
+        from app.sheets import get_sheets_manager
+
+        sheets = get_sheets_manager()
+        default_fee = default_monthly_fee()
+        all_groups = await asyncio.to_thread(sheets.get_all_groups)
+        fees = {
+            str(g.get("Guruh_Nomi", "")).strip().lower(): _group_fee_from_row(
+                g, default_fee
+            )
+            for g in all_groups
+        }
+        active_info: dict[str, dict[str, Any]] = {}
+        updates: list[tuple[int, str, str, str]] = []
+        for sid, grp, title, remaining, amount in rows:
+            grp_key = str(grp or "").strip().lower()
+            fee = fees.get(grp_key)
+            if not fee:
+                continue
+            if grp_key not in active_info:
+                try:
+                    active_info[grp_key] = (
+                        await asyncio.to_thread(
+                            sheets.get_active_cycle_elapsed_info, grp_key
+                        )
+                        or {}
+                    )
+                except Exception:
+                    active_info[grp_key] = {}
+            info = active_info[grp_key]
+            if str(info.get("cycle_title") or "") != str(title):
+                continue
+            total = int(info.get("total_lessons") or 0)
+            if total <= 0:
+                continue
+            rem = max(0, min(int(remaining or 0), total))
+            raw = (int(fee) / total) * rem
+            old_amount = max(0, int(round(raw, -3)))
+            new_amount = max(0, int(round(raw, -2)))
+            if int(amount or 0) == old_amount and new_amount != old_amount:
+                updates.append((new_amount, str(sid), str(grp), str(title)))
+        if not updates:
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.executemany(
+                "UPDATE student_cycle_overrides SET custom_amount = ? "
+                "WHERE student_id = ? AND group_name = ? AND cycle_title = ?;",
+                updates,
+            )
+            await db.commit()
+        log.info("Prorated overrides migrated to 100-UZS rounding: %d", len(updates))
+    except Exception:
+        log.exception("Prorated override rounding migration skipped")
 
 
 # ----------------------------------------------------------------------
@@ -883,14 +962,14 @@ def compute_prorated_amount(
     monthly_fee: int, total_lessons: int, remaining_lessons: int
 ) -> int:
     """
-    prorated = round((monthly_fee / total_lessons) * remaining_lessons, -3):
+    prorated = round((monthly_fee / total_lessons) * remaining_lessons, -2):
     the share of the monthly fee for the remaining lessons, rounded to the
-    nearest 1 000 UZS (never negative).
+    nearest 100 UZS (never negative), so e.g. 212 500 stays 212 500.
     """
     total = max(1, int(total_lessons or 0))
     remaining = max(0, min(int(remaining_lessons or 0), total))
     raw = (int(monthly_fee or 0) / total) * remaining
-    return max(0, int(round(raw, -3)))
+    return max(0, int(round(raw, -2)))
 
 
 def _override_group_key(group_name: str) -> str:
