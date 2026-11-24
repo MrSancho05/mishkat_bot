@@ -21,6 +21,38 @@ DEFAULT_COURSES: list[tuple[str, str, str, str]] = [
         "6–12 oy",
         "Haftasiga 3 marta",
     ),
+    (
+        "Qur'on o‘qish va Tajvid",
+        "Qur'oni Karimni to‘g‘ri va chiroyli o‘qish, tajvid qoidalari, yod olish (hifz) "
+        "bo‘yicha amaliy mashg‘ulotlar.",
+        "6–12 oy",
+        "Haftasiga 3 marta",
+    ),
+    (
+        "Ingliz tili",
+        "Beginner darajasidan IELTS / CEFR tayyorgarligigacha: grammatika, lug‘at, "
+        "speaking, listening, reading va writing.",
+        "3–9 oy",
+        "Haftasiga 3 marta",
+    ),
+    (
+        "Rus tili",
+        "Kundalik muloqot, grammatika va so‘z boyligini oshirishga yo‘naltirilgan amaliy kurs.",
+        "3–6 oy",
+        "Haftasiga 3 marta",
+    ),
+    (
+        "Matematika",
+        "Maktab dasturi, olimpiada va oliy ta'limga kirish imtihonlariga tayyorgarlik.",
+        "6–9 oy",
+        "Haftasiga 3 marta",
+    ),
+    (
+        "Kompyuter savodxonligi",
+        "Kompyuter bilan ishlash asoslari, MS Office (Word, Excel, PowerPoint) va internet xavfsizligi.",
+        "2–3 oy",
+        "Haftasiga 3 marta",
+    ),
 ]
 
 

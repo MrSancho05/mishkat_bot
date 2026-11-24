@@ -19,7 +19,12 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from app import config
-from app.utils import dual_role_header, now_tashkent, today_tashkent
+from app.utils import (
+    dual_role_header,
+    get_lesson_time_for_weekday,
+    now_tashkent,
+    today_tashkent,
+)
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
     claim_group_initial_notice,
@@ -747,11 +752,26 @@ async def process_lesson_reminders(bot: Bot) -> None:
             continue
 
         lesson_days = parse_weekdays(group.get("Dars_Kunlari", ""))
-        lesson_time = _parse_lesson_time(group.get("Dars_Vaqti", ""))
-        if not lesson_days or lesson_time is None:
+        if not lesson_days:
             continue
 
-        time_str = lesson_time.strftime("%H:%M")
+        # Per-day schedules ("Du 14:00, Chor 15:30"): every trigger below uses the
+        # exact time of the weekday it refers to (today's for same-day / 1h-before
+        # reminders, tomorrow's for the evening-before reminder).
+        dars_vaqti = str(group.get("Dars_Vaqti", "") or "")
+        today_time = (
+            _parse_lesson_time(get_lesson_time_for_weekday(dars_vaqti, today) or "")
+            if today.weekday() in lesson_days
+            else None
+        )
+        tomorrow_time = (
+            _parse_lesson_time(get_lesson_time_for_weekday(dars_vaqti, tomorrow) or "")
+            if tomorrow.weekday() in lesson_days
+            else None
+        )
+        if today_time is None and tomorrow_time is None:
+            continue
+
         counter = await get_group_counter(group_name)
         last_reminded = counter.get("last_reminded_date") if counter else None
         last_1h_reminded = counter.get("last_1h_reminded_date") if counter else None
@@ -762,23 +782,26 @@ async def process_lesson_reminders(bot: Bot) -> None:
         # --- Tier 1: Advance reminder ---
         target_advance_date: Optional[date] = None
         reminder_key: Optional[str] = None
+        time_str = ""
 
-        if lesson_time < time(10, 0):
-            if (
-                tomorrow.weekday() in lesson_days
-                and time(20, 0) <= now.time() < time(20, 15)
-                and last_reminded != tomorrow.isoformat()
-            ):
-                target_advance_date = tomorrow
-                reminder_key = "reminder_evening_before"
-        else:
-            if (
-                today.weekday() in lesson_days
-                and time(8, 0) <= now.time() < time(8, 15)
-                and last_reminded != today.isoformat()
-            ):
-                target_advance_date = today
-                reminder_key = "reminder_morning_today"
+        if (
+            tomorrow_time is not None
+            and tomorrow_time < time(10, 0)
+            and time(20, 0) <= now.time() < time(20, 15)
+            and last_reminded != tomorrow.isoformat()
+        ):
+            target_advance_date = tomorrow
+            reminder_key = "reminder_evening_before"
+            time_str = tomorrow_time.strftime("%H:%M")
+        elif (
+            today_time is not None
+            and today_time >= time(10, 0)
+            and time(8, 0) <= now.time() < time(8, 15)
+            and last_reminded != today.isoformat()
+        ):
+            target_advance_date = today
+            reminder_key = "reminder_morning_today"
+            time_str = today_time.strftime("%H:%M")
 
         if target_advance_date and reminder_key:
             if group_tg_id:
@@ -841,8 +864,9 @@ async def process_lesson_reminders(bot: Bot) -> None:
             )
 
         # --- Tier 2: 1 hour before lesson start ---
-        if today.weekday() in lesson_days and last_1h_reminded != today.isoformat():
-            lesson_dt = datetime.combine(today, lesson_time, tzinfo=TZ)
+        if today_time is not None and last_1h_reminded != today.isoformat():
+            time_str = today_time.strftime("%H:%M")
+            lesson_dt = datetime.combine(today, today_time, tzinfo=TZ)
             seconds_until_lesson = (lesson_dt - now).total_seconds()
             if 3300 <= seconds_until_lesson <= 3660:
                 for student in active_in_group:

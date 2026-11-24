@@ -768,7 +768,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_full_edit_time": (
             "4/6 ⏰ <b>Dars vaqti</b>\n"
             "Hozirgi qiymat: <b>{current}</b>\n"
-            "Yangi dars vaqtini kiriting (<code>HH:MM</code>) yoki eski holatida qoldiring:"
+            "Dars vaqtini qanday belgilashni tanlang yoki eski holatida qoldiring:"
         ),
         "group_full_edit_price": (
             "5/6 💰 <b>Oylik to'lov summasi</b>\n"
@@ -966,6 +966,11 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "schedule_enter_time": "Dars boshlanish vaqtini kiriting (format: <code>HH:MM</code>, masalan: <code>14:00</code>):",
         "schedule_invalid_time": "❌ Noto‘g‘ri vaqt formati. Iltimos <code>HH:MM</code> ko‘rinishida yozing (masalan: <code>09:00</code>).",
+        "lesson_time_mode_prompt": "🕒 <b>Dars vaqtini qanday belgilaymiz?</b>\n\nTanlangan kunlar: <b>{days}</b>",
+        "btn_lesson_time_uniform": "🕒 Hamma kunlarga bir xil vaqt",
+        "btn_lesson_time_per_day": "⚙️ Har bir kun uchun alohida vaqt",
+        "lesson_time_day_prompt": "{n}/{total} — <b>{day}</b> kuni dars soati nechada? (Masalan: <code>14:00</code>)",
+        "lesson_time_missing_days_alert": "⚠️ Yangi kunlar uchun dars vaqti belgilanmagan. Iltimos, vaqtni qayta belgilang.",
         "schedule_confirm_summary": (
             "📅 <b>Dars jadvali tasdiqlansinmi?</b>\n\n"
             "📚 Guruh: <b>{group}</b>\n"
@@ -2055,7 +2060,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "group_full_edit_time": (
             "4/6 ⏰ <b>Дарс вақти</b>\n"
             "Ҳозирги қиймат: <b>{current}</b>\n"
-            "Янги дарс вақтини киритинг (<code>HH:MM</code>) ёки эски ҳолатида қолдиринг:"
+            "Дарс вақтини қандай белгилашни танланг ёки эски ҳолатида қолдиринг:"
         ),
         "group_full_edit_price": (
             "5/6 💰 <b>Ойлик тўлов суммаси</b>\n"
@@ -2253,6 +2258,11 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         "schedule_enter_time": "Дарс бошланиш вақтини киритинг (формат: <code>HH:MM</code>, масалан: <code>14:00</code>):",
         "schedule_invalid_time": "❌ Нотўғри вақт формати. Илтимос <code>HH:MM</code> кўринишида ёзинг (масалан: <code>09:00</code>).",
+        "lesson_time_mode_prompt": "🕒 <b>Дарс вақтини қандай белгилаймиз?</b>\n\nТанланган кунлар: <b>{days}</b>",
+        "btn_lesson_time_uniform": "🕒 Ҳамма кунларга бир хил вақт",
+        "btn_lesson_time_per_day": "⚙️ Ҳар бир кун учун алоҳида вақт",
+        "lesson_time_day_prompt": "{n}/{total} — <b>{day}</b> куни дарс соати нечада? (Масалан: <code>14:00</code>)",
+        "lesson_time_missing_days_alert": "⚠️ Янги кунлар учун дарс вақти белгиланмаган. Илтимос, вақтни қайта белгиланг.",
         "schedule_confirm_summary": (
             "📅 <b>Дарс жадвали тасдиқлансинми?</b>\n\n"
             "📚 Гуруҳ: <b>{group}</b>\n"

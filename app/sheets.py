@@ -15,7 +15,12 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 import app.config as _app_config
-from app.utils import now_tashkent, to_tashkent, today_tashkent
+from app.utils import (
+    get_lesson_time_for_weekday,
+    now_tashkent,
+    to_tashkent,
+    today_tashkent,
+)
 from app.config import (
     CREDENTIALS_PATH,
     DB_PATH,
@@ -373,7 +378,10 @@ def _get_anchor_date_for_schedule(
     now_dt: datetime, lesson_time_str: str = ""
 ) -> date:
     today = now_dt.date()
-    match = re.match(r"^(\d{1,2})[:.](\d{2})$", (lesson_time_str or "").strip())
+    # Per-day schedules ("Du 14:00, Chor 15:30") use TODAY's own lesson time;
+    # a plain "HH:MM" applies to every day (legacy behaviour).
+    todays_time = get_lesson_time_for_weekday(lesson_time_str or "", today)
+    match = re.match(r"^(\d{1,2})[:.](\d{2})$", (todays_time or "").strip())
     if match:
         hour, minute = int(match.group(1)), int(match.group(2))
         if 0 <= hour <= 23 and 0 <= minute <= 59:

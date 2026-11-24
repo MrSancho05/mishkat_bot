@@ -20,7 +20,12 @@ from aiogram.types import (
 )
 
 from app import database
-from app.utils import dual_role_header, now_tashkent, today_tashkent
+from app.utils import (
+    dual_role_header,
+    get_lesson_time_for_weekday,
+    now_tashkent,
+    today_tashkent,
+)
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
     get_all_dynamic_admins,
@@ -1696,7 +1701,11 @@ async def cb_attendance_finish_instant(
         for d in group_debtors
     ]
 
-    lesson_time = (str(group.get("Dars_Vaqti") or "").strip() if group else "") or "—"
+    # Per-day schedules: the report shows the time of THAT lesson's weekday.
+    raw_lesson_time = str(group.get("Dars_Vaqti") or "").strip() if group else ""
+    lesson_time = (
+        get_lesson_time_for_weekday(raw_lesson_time, lesson_date) or raw_lesson_time
+    ) or "—"
 
     report_payload = {
         "group_name": group_name,

@@ -751,6 +751,35 @@ def confirm_cancel_kb(
     return builder.as_markup()
 
 
+def lesson_time_mode_kb(
+    prefix: str,
+    lang: str = "latn",
+    back_cb: Optional[str] = None,
+    cancel_cb: Optional[str] = None,
+    keep_cb: Optional[str] = None,
+) -> InlineKeyboardMarkup:
+    """
+    The two lesson-time options shown after the days are chosen:
+    '🕒 Hamma kunlarga bir xil vaqt' / '⚙️ Har bir kun uchun alohida vaqt'.
+    Callback data: '<prefix>:time_mode:uniform' / '<prefix>:time_mode:perday'.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _btn(t("btn_lesson_time_uniform", lang), f"{prefix}:time_mode:uniform")
+    )
+    builder.row(
+        _btn(t("btn_lesson_time_per_day", lang), f"{prefix}:time_mode:perday")
+    )
+    if keep_cb:
+        builder.row(
+            _btn(t("btn_keep_current", lang), keep_cb),
+            _btn(t("btn_cancel", lang), cancel_cb or "full_grp:cancel"),
+        )
+    else:
+        _nav_row(builder, lang=lang, back_cb=back_cb, cancel_cb=cancel_cb)
+    return builder.as_markup()
+
+
 def step_nav_inline_kb(
     lang: str = "latn",
     back_cb: Optional[str] = None,

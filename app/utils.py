@@ -73,6 +73,178 @@ def format_tashkent(value: object, fmt: str = DISPLAY_DT_FMT) -> str:
 
 
 # ----------------------------------------------------------------------
+# Per-day lesson times (stored in the existing ``Dars_Vaqti`` column)
+#
+#   uniform : "14:00"
+#   per-day : "Du 14:00, Chor 15:30, Ju 17:00"
+# ----------------------------------------------------------------------
+
+import re as _re
+
+# Canonical Uzbek day abbreviations used when WRITING per-day schedules.
+LESSON_DAY_ABBR: dict[int, str] = {
+    0: "Du",
+    1: "Se",
+    2: "Chor",
+    3: "Pay",
+    4: "Ju",
+    5: "Shan",
+    6: "Yak",
+}
+
+# Every spelling accepted when READING (canonical, long Latin and Cyrillic).
+_LESSON_DAY_TOKENS: dict[str, int] = {
+    "du": 0, "dush": 0, "dushanba": 0, "mon": 0, "душ": 0, "ду": 0, "душанба": 0,
+    "se": 1, "sesh": 1, "seshanba": 1, "tue": 1, "сеш": 1, "се": 1, "сешанба": 1,
+    "chor": 2, "ch": 2, "chorshanba": 2, "wed": 2, "чор": 2, "ч": 2, "чоршанба": 2,
+    "pay": 3, "pa": 3, "payshanba": 3, "thu": 3, "пай": 3, "па": 3, "пайшанба": 3,
+    "ju": 4, "jum": 4, "juma": 4, "fri": 4, "жум": 4, "жу": 4, "жума": 4,
+    "shan": 5, "sh": 5, "shanba": 5, "sat": 5, "шан": 5, "ш": 5, "шанба": 5,
+    "yak": 6, "ya": 6, "yakshanba": 6, "sun": 6, "як": 6, "якшанба": 6,
+}
+
+_SIMPLE_TIME_RE = _re.compile(r"^\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*$")
+_PER_DAY_ENTRY_RE = _re.compile(
+    r"^\s*([^\W\d_]+)\.?\s*[-:=]?\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*$",
+    _re.UNICODE,
+)
+
+
+def normalize_hhmm(raw: object) -> Optional[str]:
+    """'9:5' is invalid, '9:05' / '09.05' -> '09:05'; None if not a valid 00:00-23:59."""
+    match = _SIMPLE_TIME_RE.match(str(raw or ""))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return f"{hour:02d}:{minute:02d}"
+    return None
+
+
+def parse_lesson_times(dars_vaqti: object) -> tuple[Optional[str], dict[int, str]]:
+    """
+    Parses a ``Dars_Vaqti`` value into ``(uniform_time, per_day_times)``.
+
+    * "14:00"                         -> ("14:00", {})
+    * "Du 14:00, Chor 15:30, Ju 17:00" -> (None, {0: "14:00", 2: "15:30", 4: "17:00"})
+    * empty / unparsable               -> (None, {})
+    """
+    raw = str(dars_vaqti or "").strip()
+    if not raw:
+        return None, {}
+    simple = normalize_hhmm(raw)
+    if simple:
+        return simple, {}
+    per_day: dict[int, str] = {}
+    for chunk in _re.split(r"[,;\n]+", raw):
+        entry = _PER_DAY_ENTRY_RE.match(chunk)
+        if not entry:
+            continue
+        idx = _LESSON_DAY_TOKENS.get(entry.group(1).lower())
+        hhmm = normalize_hhmm(f"{entry.group(2)}:{entry.group(3)}")
+        if idx is not None and hhmm:
+            per_day[idx] = hhmm
+    return None, per_day
+
+
+def _weekday_of(target: Union[date, datetime, int, str, None]) -> Optional[int]:
+    if target is None:
+        return None
+    if isinstance(target, datetime):
+        dt = target if target.tzinfo else target.replace(tzinfo=TASHKENT_TZ)
+        return dt.astimezone(TASHKENT_TZ).weekday()
+    if isinstance(target, date):
+        return target.weekday()
+    if isinstance(target, int):
+        return target if 0 <= target <= 6 else None
+    return _LESSON_DAY_TOKENS.get(str(target).strip().lower().rstrip("."))
+
+
+def get_lesson_time_for_weekday(
+    dars_vaqti: str, target_date_or_weekday: Union[date, datetime, int, str, None]
+) -> Optional[str]:
+    """
+    'HH:MM' lesson time for the given date / weekday index (0=Mon) / weekday name.
+
+    A simple "HH:MM" value applies to every day. A per-day value returns the exact
+    time of that weekday, or None when the group has no lesson on that weekday.
+    Aware datetimes are converted to Asia/Tashkent first.
+    """
+    uniform, per_day = parse_lesson_times(dars_vaqti)
+    if uniform:
+        return uniform
+    weekday = _weekday_of(target_date_or_weekday)
+    if weekday is None:
+        return None
+    return per_day.get(weekday)
+
+
+def is_per_day_lesson_time(dars_vaqti: object) -> bool:
+    return bool(parse_lesson_times(dars_vaqti)[1])
+
+
+def build_per_day_lesson_time(times_by_weekday: dict[int, str]) -> str:
+    """{0: '14:00', 2: '15:30'} -> 'Du 14:00, Chor 15:30' (weekday order)."""
+    parts: list[str] = []
+    for idx in sorted(times_by_weekday):
+        hhmm = normalize_hhmm(times_by_weekday[idx])
+        if hhmm and idx in LESSON_DAY_ABBR:
+            parts.append(f"{LESSON_DAY_ABBR[idx]} {hhmm}")
+    return ", ".join(parts)
+
+
+def format_lesson_time_display(dars_vaqti: object, lang: str = "latn") -> str:
+    """
+    Value for a card's single "time" slot: '14:00' for uniform schedules,
+    'Dush 14:00, Chor 15:30, Jum 17:00' for per-day ones (plain text, not HTML-escaped).
+    Unparsable legacy text is returned unchanged; empty -> ''.
+    """
+    from app.locales import WEEKDAYS_SHORT
+
+    raw = str(dars_vaqti or "").strip()
+    uniform, per_day = parse_lesson_times(raw)
+    if uniform:
+        return uniform
+    if not per_day:
+        return raw
+    names = WEEKDAYS_SHORT.get(lang) or WEEKDAYS_SHORT["latn"]
+    return ", ".join(f"{names[idx]} {per_day[idx]}" for idx in sorted(per_day))
+
+
+def format_group_schedule(
+    dars_kunlari: str, dars_vaqti: str, lang: str = "latn"
+) -> str:
+    """
+    Single-string schedule for group cards.
+
+    * uniform : 'Dush, Chor, Jum — 14:00'
+    * per-day : 'Dush 14:00, Chor 15:30, Jum 17:00'
+    Days listed in ``dars_kunlari`` that have no entry in a per-day schedule are
+    shown without a time; legacy free-text values pass through unchanged.
+    """
+    from app.locales import WEEKDAYS_SHORT
+
+    names = WEEKDAYS_SHORT.get(lang) or WEEKDAYS_SHORT["latn"]
+    uniform, per_day = parse_lesson_times(dars_vaqti)
+    day_idx: list[int] = []
+    for tok in _re.split(r"[,;/\s]+", str(dars_kunlari or "").strip()):
+        idx = _LESSON_DAY_TOKENS.get(tok.lower().strip(".-"))
+        if idx is not None and idx not in day_idx:
+            day_idx.append(idx)
+    day_idx.sort()
+    if per_day:
+        ordered = day_idx or sorted(per_day)
+        return ", ".join(
+            f"{names[i]} {per_day[i]}" if i in per_day else names[i] for i in ordered
+        )
+    days_txt = ", ".join(names[i] for i in day_idx) or str(dars_kunlari or "").strip()
+    time_txt = uniform or str(dars_vaqti or "").strip()
+    if days_txt and time_txt:
+        return f"{days_txt} — {time_txt}"
+    return days_txt or time_txt or "—"
+
+
+# ----------------------------------------------------------------------
 # Inline calendar helpers (cycle start date picker)
 # ----------------------------------------------------------------------
 

@@ -16,7 +16,7 @@ from aiogram.types import (
     Message,
 )
 
-from app.utils import today_tashkent
+from app.utils import format_lesson_time_display, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
     get_group_topics_history,
@@ -711,7 +711,7 @@ async def _send_teacher_schedule(
 
         day_indices = parse_weekdays(group["Dars_Kunlari"])
         days_formatted = _format_days_list(day_indices, lang)
-        lesson_time = str(group.get("Dars_Vaqti", "")).strip() or "—"
+        lesson_time = format_lesson_time_display(group.get("Dars_Vaqti", ""), lang) or "—"
         total_count = int(group.get("Oylik_Dars_Soni") or 12)
         completed = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
         remaining = max(0, total_count - completed)
@@ -814,7 +814,9 @@ async def _build_parent_schedule_text(
                 if raw_days
                 else _lt("not_set", lang)
             )
-            lesson_time = str(group.get("Dars_Vaqti", "")).strip() or _lt("not_set", lang)
+            lesson_time = format_lesson_time_display(
+                group.get("Dars_Vaqti", ""), lang
+            ) or _lt("not_set", lang)
             if group_key not in teacher_cache:
                 teacher_cache[group_key] = await _resolve_teacher_name(
                     user_id=None,
@@ -1018,7 +1020,7 @@ async def _send_student_or_parent_schedule(message: Message, lang: str) -> None:
 
         day_indices = parse_weekdays(group["Dars_Kunlari"])
         days_formatted = _format_days_list(day_indices, lang)
-        lesson_time = str(group.get("Dars_Vaqti", "")).strip() or "—"
+        lesson_time = format_lesson_time_display(group.get("Dars_Vaqti", ""), lang) or "—"
         total_count = int(group.get("Oylik_Dars_Soni") or 12)
         completed = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
         remaining = max(0, total_count - completed)
