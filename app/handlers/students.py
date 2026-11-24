@@ -38,6 +38,7 @@ from app.database import (
 from app.keyboards import (
     balance_inline_markup,
     confirm_delete_student_kb,
+    enroll_choice_kb,
     get_main_menu_kb,
     groups_inline_kb,
     parent_batch_more_kb,
@@ -50,6 +51,7 @@ from app.keyboards import (
     student_transfer_keep_kb,
     students_list_kb,
 )
+from app.debt_view import format_uzs, get_group_monthly_fee
 from app.locales import button_texts, format_full_weekdays, t
 from app.sheets import (
     COLOR_HEADER_GRAY,
@@ -154,8 +156,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "istasangiz, xohlagan vaqtingizda mashg'ulotlarga qayta qo'shilishingiz mumkin.\n"
             "📞 Darslarga qaytish yoki savollaringiz bo'yicha ma'muriyatimizga murojaat qiling: "
             "{aloqa_raqami}\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "reserve_notify_parent": (
             "⏸ Assalomu alaykum, hurmatli <b>{ota_ona_ismi}</b>!\n\n"
@@ -166,8 +167,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "ettirish istagi bo'lsa, istalgan vaqtda guruhga qayta tiklanishi mumkin.\n"
             "📞 Qo'shimcha ma'lumot olish yoki darslarga qaytish uchun ma'muriyatimiz bilan "
             "bog'laning: {aloqa_raqami}\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "btn_legacy_add": "➕ Qarz qo‘shish",
         "btn_legacy_list": "📜 Avvalgi qarzlar",
@@ -266,8 +266,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "🗓 Dars kunlari: <b>{dars_kunlari}</b>\n"
             "👨‍🏫 Guruh ustozi: <b>{oqituvchi_ismi}</b>\n\n"
             "O'qishlaringizda ulkan muvaffaqiyatlar tilaymiz!\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "restore_notify_parent": (
             "▶️ Assalomu alaykum, hurmatli <b>{ota_ona_ismi}</b>!\n\n"
@@ -276,8 +275,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "🗓 Dars kunlari: <b>{dars_kunlari}</b>\n"
             "👨‍🏫 Guruh ustozi: <b>{oqituvchi_ismi}</b>\n\n"
             "Farzandingizga o'qishlarida ulkan muvaffaqiyatlar tilaymiz!\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "restore_notify_teacher": (
             "♻️ <b>Guruhingizga talaba tiklandi</b>\n\n"
@@ -408,8 +406,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "истасангиз, хоҳлаган вақтингизда машғулотларга қайта қўшилишингиз мумкин.\n"
             "📞 Дарсларга қайтиш ёки саволларингиз бўйича маъмуриятимизга мурожаат қилинг: "
             "{aloqa_raqami}\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "reserve_notify_parent": (
             "⏸ Ассалому алайкум, ҳурматли <b>{ota_ona_ismi}</b>!\n\n"
@@ -420,8 +417,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "эттириш истаги бўлса, исталган вақтда гуруҳга қайта тикланиши мумкин.\n"
             "📞 Қўшимча маълумот олиш ёки дарсларга қайтиш учун маъмуриятимизга мурожаат "
             "қилинг: {aloqa_raqami}\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "btn_legacy_add": "➕ Қарз қўшиш",
         "btn_legacy_list": "📜 Аввалги қарзлар",
@@ -520,8 +516,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "🗓 Дарс кунлари: <b>{dars_kunlari}</b>\n"
             "👨‍🏫 Гуруҳ устози: <b>{oqituvchi_ismi}</b>\n\n"
             "Ўқишларингизда улкан муваффақиятлар тилаймиз!\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "restore_notify_parent": (
             "▶️ Ассалому алайкум, ҳурматли <b>{ota_ona_ismi}</b>!\n\n"
@@ -530,8 +525,7 @@ _LOCAL_STU_TEXTS: dict[str, dict[str, str]] = {
             "🗓 Дарс кунлари: <b>{dars_kunlari}</b>\n"
             "👨‍🏫 Гуруҳ устози: <b>{oqituvchi_ismi}</b>\n\n"
             "Фарзандингизга ўқишларида улкан муваффақиятлар тилаймиз!\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "restore_notify_teacher": (
             "♻️ <b>Гуруҳингизга талаба тикланди</b>\n\n"
@@ -2221,88 +2215,211 @@ async def pb_add_more_or_finish(
             await callback.message.edit_text(t("error_generic", lang))
             await callback.answer()
             return
+        await state.update_data(batch_enroll_modes={})
+        if await _pb_ask_next_enroll_choice(callback, state, lang):
+            await callback.answer()
+            return
+        await _pb_finish_creation(callback, state, lang)
+        await callback.answer()
 
-        parent_name = str(data.get("batch_parent_name") or "").strip()
-        parent_phone = str(data.get("batch_parent_phone") or "").strip()
-        parent_type = _pb_parent_type(data)
-        is_mother = parent_type == "mother"
-        sheets = get_sheets_manager()
 
-        try:
-            await asyncio.to_thread(_ensure_extended_student_headers_sync)
-            created_ids: list[str] = []
-            created_lines: list[str] = []
-            for idx, child in enumerate(children, start=1):
-                new_stu = await sheets.a_add_student(
-                    full_name=child["full_name"],
-                    group_name=child["group_name"],
-                    student_phone="Yo'q",
-                    student_tg="",
-                    parent_phone=parent_phone,
-                    status="O'qiyapti",
-                    # Strict column routing: a mother is NEVER stored as Otasi_*.
-                    father_name="" if is_mother else parent_name,
-                    father_phone="" if is_mother else parent_phone,
-                    mother_name=parent_name if is_mother else "",
-                    mother_phone=parent_phone if is_mother else "",
+async def _pb_children_needing_choice(
+    children: list[dict[str, Any]], modes: dict[str, str]
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """[(index, child, elapsed_info)] of children whose group already has elapsed lessons."""
+    sheets = get_sheets_manager()
+    cache: dict[str, dict[str, Any]] = {}
+    pending: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for idx, child in enumerate(children):
+        if str(idx) in modes:
+            continue
+        group_name = str(child.get("group_name") or "").strip()
+        if group_name not in cache:
+            try:
+                cache[group_name] = await sheets.a_get_active_cycle_elapsed_info(
+                    group_name
                 )
-                sid = str(new_stu.get("Talaba_ID") or "").strip()
-                if not sid:
-                    continue
-                created_ids.append(sid)
-                await sheets.a_add_student_to_active_cycle(
-                    child["group_name"], sid, child["full_name"], charge_upfront=True
-                )
-                schedule_group_initial_notice(callback.bot, child["group_name"])
-                created_lines.append(
-                    f"{idx}. <b>{html.escape(child['full_name'])}</b> "
-                    f"(<code>{html.escape(sid)}</code>) — 📚 <b>{html.escape(child['group_name'])}</b>"
-                )
+            except Exception:
+                logger.exception("Elapsed-lesson lookup failed for %s", group_name)
+                cache[group_name] = {"past_dates_count": 0}
+        if int(cache[group_name].get("past_dates_count") or 0) > 0:
+            pending.append((idx, child, cache[group_name]))
+    return pending
 
-            if not created_ids:
-                await state.clear()
-                await callback.message.edit_text(t("error_generic", lang))
-                await callback.answer()
-                return
 
-            invite_code = secrets.token_hex(5).upper()
-            await create_parent_batch_invite(
-                invite_code=invite_code,
-                parent_name=parent_name,
+async def _pb_ask_next_enroll_choice(
+    callback: CallbackQuery, state: FSMContext, lang: str
+) -> bool:
+    """Shows the 📚 / 🆕 choice for the next child that needs one; False when none left."""
+    data = await state.get_data()
+    children = list(data.get("batch_children", []))
+    modes = dict(data.get("batch_enroll_modes") or {})
+    pending = await _pb_children_needing_choice(children, modes)
+    if not pending:
+        return False
+    idx, child, info = pending[0]
+    await state.update_data(batch_enroll_idx=idx)
+    await state.set_state(StudentAddStates.parent_batch_enroll_choice)
+    await callback.message.edit_text(
+        t(
+            "enroll_choice_prompt",
+            lang,
+            group=html.escape(str(child.get("group_name") or "")),
+            cycle_title=html.escape(str(info.get("cycle_title") or "—")),
+            past_count=int(info.get("past_dates_count") or 0),
+            student_name=html.escape(str(child.get("full_name") or "")),
+        ),
+        reply_markup=enroll_choice_kb(
+            "pb_enroll:full", "pb_enroll:new", lang
+        ),
+        parse_mode="HTML",
+    )
+    return True
+
+
+@router.callback_query(
+    StateFilter(StudentAddStates.parent_batch_enroll_choice),
+    F.data.startswith("pb_enroll:"),
+)
+async def pb_enroll_choice_selected(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_st("no_permission", lang), show_alert=True)
+        return
+    mode = (callback.data or "").split(":", 1)[1].strip()
+    if mode not in {"full", "new"}:
+        await callback.answer()
+        return
+    data = await state.get_data()
+    modes = dict(data.get("batch_enroll_modes") or {})
+    idx = data.get("batch_enroll_idx")
+    if idx is None:
+        await state.clear()
+        await callback.message.edit_text(t("error_generic", lang))
+        await callback.answer()
+        return
+    modes[str(idx)] = mode
+    await state.update_data(batch_enroll_modes=modes, batch_enroll_idx=None)
+    if await _pb_ask_next_enroll_choice(callback, state, lang):
+        await callback.answer()
+        return
+    await _pb_finish_creation(callback, state, lang)
+    await callback.answer()
+
+
+async def _pb_finish_creation(
+    callback: CallbackQuery, state: FSMContext, lang: str
+) -> None:
+    data = await state.get_data()
+    children = list(data.get("batch_children", []))
+    modes: dict[str, str] = dict(data.get("batch_enroll_modes") or {})
+    parent_name = str(data.get("batch_parent_name") or "").strip()
+    parent_phone = str(data.get("batch_parent_phone") or "").strip()
+    parent_type = _pb_parent_type(data)
+    is_mother = parent_type == "mother"
+    sheets = get_sheets_manager()
+
+    try:
+        await asyncio.to_thread(_ensure_extended_student_headers_sync)
+        created_ids: list[str] = []
+        created_lines: list[str] = []
+        for idx, child in enumerate(children, start=1):
+            new_stu = await sheets.a_add_student(
+                full_name=child["full_name"],
+                group_name=child["group_name"],
+                student_phone="Yo'q",
+                student_tg="",
                 parent_phone=parent_phone,
-                student_ids=created_ids,
-                parent_type=parent_type,
+                status="O'qiyapti",
+                # Strict column routing: a mother is NEVER stored as Otasi_*.
+                father_name="" if is_mother else parent_name,
+                father_phone="" if is_mother else parent_phone,
+                mother_name=parent_name if is_mother else "",
+                mother_phone=parent_phone if is_mother else "",
             )
-
-            bot_info = await callback.bot.get_me()
-            await state.clear()
-            text = _st(
-                "pb_finished",
-                lang,
-                parent_label=_pb_parent_label(data, lang),
-                parent_name=html.escape(parent_name),
-                parent_phone=_format_clickable_phone(parent_phone, "—"),
-                children_lines="\n".join(created_lines),
-                bot_username=bot_info.username,
-                invite_code=invite_code,
+            sid = str(new_stu.get("Talaba_ID") or "").strip()
+            if not sid:
+                continue
+            created_ids.append(sid)
+            enroll = await sheets.a_enroll_student_in_active_cycle(
+                child["group_name"],
+                sid,
+                child["full_name"],
+                modes.get(str(idx - 1)),
             )
-            if len(created_ids) == 1:
-                text += _st(
-                    "pb_single_direct_link",
+            schedule_group_initial_notice(callback.bot, child["group_name"])
+            line = (
+                f"{idx}. <b>{html.escape(child['full_name'])}</b> "
+                f"(<code>{html.escape(sid)}</code>) — 📚 <b>{html.escape(child['group_name'])}</b>"
+            )
+            if enroll.get("mode") == "full" and enroll.get("past_dates_count"):
+                line += "\n   " + t(
+                    "enroll_result_full",
                     lang,
-                    bot_username=bot_info.username,
-                    student_id=created_ids[0],
-                )
-            await callback.message.edit_text(
-                text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            logger.exception("Error finishing parent_batch student creation")
+                    marked=int(enroll.get("marked") or 0),
+                    amount=format_uzs(
+                            await get_group_monthly_fee(sheets, child["group_name"])
+                        ),
+                ).replace("\n", "\n   ")
+            elif enroll.get("mode") == "new" and enroll.get("past_dates_count"):
+                line += "\n   " + t(
+                    "enroll_result_new",
+                    lang,
+                    remaining=int(enroll.get("remaining_lessons") or 0),
+                    amount=format_uzs(int(enroll.get("custom_amount") or 0)),
+                ).replace("\n", "\n   ")
+            created_lines.append(line)
+
+        if not created_ids:
             await state.clear()
             await callback.message.edit_text(t("error_generic", lang))
-        await callback.answer()
+            return
+
+        invite_code = secrets.token_hex(5).upper()
+        await create_parent_batch_invite(
+            invite_code=invite_code,
+            parent_name=parent_name,
+            parent_phone=parent_phone,
+            student_ids=created_ids,
+            parent_type=parent_type,
+        )
+
+        bot_info = await callback.bot.get_me()
+        await state.clear()
+        text = _st(
+            "pb_finished",
+            lang,
+            parent_label=_pb_parent_label(data, lang),
+            parent_name=html.escape(parent_name),
+            parent_phone=_format_clickable_phone(parent_phone, "—"),
+            children_lines="\n".join(created_lines),
+            bot_username=bot_info.username,
+            invite_code=invite_code,
+        )
+        if len(created_ids) == 1:
+            text += _st(
+                "pb_single_direct_link",
+                lang,
+                bot_username=bot_info.username,
+                student_id=created_ids[0],
+            )
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Error finishing parent_batch student creation")
+        await state.clear()
+        await callback.message.edit_text(t("error_generic", lang))
+
+
 
 
 # ======================================================================
@@ -3402,6 +3519,10 @@ async def stu_delete_confirmed(callback: CallbackQuery, state: FSMContext) -> No
     if payload.get("deleted"):
         del_name = str(payload.get("student_name") or sid)
         del_group = str((student_before or {}).get("Guruh") or "").strip() or "—"
+        try:
+            await database.delete_cycle_overrides(student_id=sid)
+        except Exception:
+            logger.exception("Could not drop prorated overrides of %s", sid)
         await log_audit_event(
             actor_id=user_id,
             action=AUDIT_STUDENT_DELETED,

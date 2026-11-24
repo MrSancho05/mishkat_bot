@@ -73,6 +73,36 @@ def format_tashkent(value: object, fmt: str = DISPLAY_DT_FMT) -> str:
 
 
 # ----------------------------------------------------------------------
+# Inline calendar helpers (cycle start date picker)
+# ----------------------------------------------------------------------
+
+
+def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    """(year, month) moved by `delta` months (negative = back), 1 <= month <= 12."""
+    index = year * 12 + (month - 1) + int(delta)
+    return index // 12, index % 12 + 1
+
+
+def month_weeks(year: int, month: int) -> list[list[int]]:
+    """Monday-first weeks of the month; 0 marks an empty cell."""
+    import calendar as _calendar
+
+    return [list(week) for week in _calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)]
+
+
+def parse_calendar_month(raw: str) -> Optional[tuple[int, int]]:
+    """'2026-11' -> (2026, 11); None when malformed / out of range."""
+    try:
+        year_s, month_s = str(raw or "").strip().split("-", 1)
+        year, month = int(year_s), int(month_s)
+    except ValueError:
+        return None
+    if not (2000 <= year <= 2100 and 1 <= month <= 12):
+        return None
+    return year, month
+
+
+# ----------------------------------------------------------------------
 # Dual-role (Student + Parent) notification context headers
 # ----------------------------------------------------------------------
 

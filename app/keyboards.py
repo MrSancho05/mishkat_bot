@@ -901,12 +901,81 @@ def group_add_weekdays_kb(
 def group_add_confirm_kb(
     lang: str = "latn", back_cb: str = "grp_add:back:time"
 ) -> InlineKeyboardMarkup:
-    return confirm_cancel_kb(
-        confirm_cb="grp_add:confirm",
-        cancel_cb="grp_add:cancel",
-        lang=lang,
-        back_cb=back_cb,
+    """
+    [📅 Boshlanish sanasini o‘zgartirish] sits on its own full-width row directly
+    ABOVE the [✅ Tasdiqlash | ❌ Bekor qilish] row; Back goes below.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(_btn(t("btn_change_start_date", lang), "grp_add:pick_start"))
+    _confirm_nav(builder, lang, "grp_add:confirm", "grp_add:cancel", back_cb)
+    return builder.as_markup()
+
+
+def enroll_choice_kb(
+    full_cb: str,
+    new_cb: str,
+    lang: str = "latn",
+    extra_row: Optional[tuple[str, str]] = None,
+) -> InlineKeyboardMarkup:
+    """
+    Mid-cycle enrollment choice for a NEW student: the labels are long, so every
+    choice gets its own full-width row; an optional extra (e.g. reject) row follows.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.row(_btn(t("btn_enroll_full", lang), full_cb))
+    builder.row(_btn(t("btn_enroll_new", lang), new_cb))
+    if extra_row:
+        builder.row(_btn(extra_row[0], extra_row[1]))
+    return builder.as_markup()
+
+
+def group_start_calendar_kb(
+    year: int,
+    month: int,
+    selected: Optional[Any] = None,
+    lang: str = "latn",
+    back_cb: str = "grp_cal:back",
+) -> InlineKeyboardMarkup:
+    """
+    Interactive monthly calendar: [◀️ | Month YYYY | ▶️], weekday header row and
+    one clickable button per day (callback grp_cal:day:YYYY-MM-DD).
+    `selected` (a date) is highlighted.
+    """
+    from app.locales import MONTHS_UZ
+    from app.utils import month_weeks, shift_month
+
+    safe_lang = lang if lang in MONTHS_UZ else "latn"
+    prev_y, prev_m = shift_month(year, month, -1)
+    next_y, next_m = shift_month(year, month, 1)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _btn("◀️", f"grp_cal:nav:{prev_y:04d}-{prev_m:02d}"),
+        _btn(f"{MONTHS_UZ[safe_lang][month]} {year}", "grp_cal:noop"),
+        _btn("▶️", f"grp_cal:nav:{next_y:04d}-{next_m:02d}"),
     )
+    wk = WEEKDAYS_SHORT.get(safe_lang) or WEEKDAYS_SHORT["latn"]
+    builder.row(*[_btn(str(wk[i])[:2], "grp_cal:noop") for i in range(7)])
+    for week in month_weeks(year, month):
+        row: list[InlineKeyboardButton] = []
+        for day in week:
+            if day == 0:
+                row.append(_btn(" ", "grp_cal:noop"))
+                continue
+            is_selected = (
+                selected is not None
+                and selected.year == year
+                and selected.month == month
+                and selected.day == day
+            )
+            row.append(
+                _btn(
+                    f"✅{day}" if is_selected else str(day),
+                    f"grp_cal:day:{year:04d}-{month:02d}-{day:02d}",
+                )
+            )
+        builder.row(*row)
+    builder.row(_btn(t("btn_back", lang), back_cb))
+    return builder.as_markup()
 
 
 def group_edit_fields_kb(

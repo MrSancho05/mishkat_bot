@@ -947,6 +947,7 @@ TEXTS: dict[str, dict[str, str]] = {
 
         # Human-friendly cycle & lesson labels
         "human_cycle_label": "{num}-o‘quv oyi ({count} ta dars)",
+        "human_cycle_label_prorated": "{num}-o‘quv oyi (qolgan {remaining} ta dars)",
         "lesson_status_present": "✅ Qatnashdi",
         "lesson_status_absent": "❌ Kelmadi",
         "lesson_status_pending": "⏳ Kutilmoqda",
@@ -1033,16 +1034,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "Siz <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>ga qatnashdingiz.\n"
             "{mavzu_qatori}Biz sizning bilim olishdagi qat'iyatingiz va ishtiyoqingizni yuqori baholaymiz."
             "{talaba_qarz_eslatmasi}\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_student_absent": (
             "🔴 Hurmatli <b>{talaba_ismi}</b>,\n\n"
             "Siz <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>da qatnashmadingiz.\n"
             "{mavzu_qatori}Yangi mavzularni o'tkazib yubormaslik uchun dars materiallari va uyga vazifalarni ko'rib chiqishingizni tavsiya qilamiz. Keyingi darsda sizni albatta kutamiz!"
             "{talaba_qarz_eslatmasi}\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_student_debt_note": (
             "\n\n💳 Eslatma: Joriy o'quv oyi uchun <b>{qarz_summasi} so'm</b> to'lov hali amalga oshirilmagan. To'lovni 1-darsdan kechiktirmay amalga oshirishingizni so'raymiz.\n"
@@ -1052,19 +1051,61 @@ TEXTS: dict[str, dict[str, str]] = {
             "Farzandingiz <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>ga qatnashdi.\n"
             "{mavzu_qatori}Biz farzandingizning bilim olishdagi qat'iyati va intilishini yuqori baholaymiz!"
             "{ota_ona_qarz_eslatmasi}\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_parent_absent": (
             "🔴 Assalomu alaykum, hurmatli {ota_ona_ismi}!\n\n"
             "Farzandingiz <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> guruhida <b>{sana_uz} ({hafta_kuni})</b> kungi o'tkazilgan <b>{dars_raqami}-dars</b>da qatnashmadi.\n"
             "{mavzu_qatori}Yangi mavzularni o'tkazib yubormaslik uchun dars materiallari va uyga vazifalarni ko'rib chiqishini tavsiya qilamiz. Keyingi darsda albatta kutib qolamiz!"
             "{ota_ona_qarz_eslatmasi}\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "attendance_parent_debt_note": (
             "\n\n💳 Eslatma: Farzandingizning joriy o'quv oyi uchun <b>{qarz_summasi} so'm</b> to'lovi hali amalga oshirilmagan. To'lovni 1-darsdan kechiktirmay amalga oshirishingizni hurmat bilan so'raymiz.\n"
+        ),
+        "attendance_student_debt_note_prorated": (
+            "\n\n💳 Eslatma: Joriy o‘quv oyining qolgan {remaining_lessons} ta darsi uchun <b>{qarz_summasi} so‘m</b> to‘lov hali amalga oshirilmagan. To‘lovni 1-darsdan kechiktirmay amalga oshirishingizni so‘raymiz.\n"
+        ),
+        "attendance_parent_debt_note_prorated": (
+            "\n\n💳 Eslatma: Farzandingizning joriy o‘quv oyining qolgan {remaining_lessons} ta darsi uchun <b>{qarz_summasi} so‘m</b> to‘lovi hali amalga oshirilmagan. To‘lovni 1-darsdan kechiktirmay amalga oshirishingizni hurmat bilan so‘raymiz.\n"
+        ),
+        "group_lesson_progress": (
+            "📋 <b>Dars yakunlandi</b>\n\n"
+            "📚 Guruh: <b>{group_name}</b>\n"
+            "🗓 O‘quv oyi: <b>{cycle_title}</b>\n"
+            "✅ O‘tilgan dars: <b>{lesson_num}-dars</b> (jami <b>{total_lessons} ta</b> darsdan) — <b>{date_str}</b>\n"
+            "{optional_topic_line}\n"
+            "Hurmat bilan,\n"
+            "Guruh ustozi: <b>{teacher_name}</b>"
+        ),
+        "group_lesson_progress_topic_line": "📖 Mavzu: <b>{topic}</b>\n",
+        "btn_change_start_date": "📅 Boshlanish sanasini o‘zgartirish",
+        "add_group_start_date_lines": (
+            "📅 Boshlanish sanasi: <b>{start_date}</b>\n"
+            "🏁 Sikl tugash sanasi: <b>{end_date}</b>"
+        ),
+        "add_group_calendar_title": (
+            "📅 <b>Sikl boshlanish sanasini tanlang</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "Hozirgi tanlov: <b>{selected}</b>\n\n"
+            "<i>O‘tgan yoki kelgusi sanani bosing.</i>"
+        ),
+        "btn_enroll_full": "📚 Oy boshidan beri o‘qiydi",
+        "btn_enroll_new": "🆕 Bugundan qo‘shildi (Yangi talaba)",
+        "enroll_choice_prompt": (
+            "🗓 <b>{group}</b> guruhining joriy o‘quv oyida (<b>{cycle_title}</b>) "
+            "<b>{past_count} ta</b> dars allaqachon o‘tib bo‘lgan.\n\n"
+            "👤 Talaba: <b>{student_name}</b>\n\n"
+            "Talaba qaysi holatda qo‘shiladi?"
+        ),
+        "enroll_result_full": (
+            "📚 O‘tgan <b>{marked} ta</b> dars jimgina ✅ deb belgilandi (xabarnomasiz).\n"
+            "💰 To‘liq oylik to‘lov: <b>{amount} so‘m</b>"
+        ),
+        "enroll_result_new": (
+            "🆕 Joriy o‘quv oyining qolgan <b>{remaining} ta</b> darsi uchun to‘lov: "
+            "<b>{amount} so‘m</b>.\n"
+            "Keyingi o‘quv oyidan boshlab to‘liq oylik to‘lov qo‘llanadi."
         ),
         "attendance_multi_header": (
             "📋 Assalomu alaykum, hurmatli {ota_ona_ismi}!\n\n"
@@ -1388,8 +1429,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Iltimos, oylik to‘lovni 1-darsdan kechiktirmay o‘z vaqtida amalga oshiring.\n\n"
             "💳 To‘lov uchun karta: <code>{card_number}</code>\n"
             "👤 Karta egasi: <b>{card_owner}</b>\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "weekly_debt_parent_single_dm": (
             "⚠️ <b>Haftalik to‘lov eslatmasi</b>\n\n"
@@ -1400,8 +1440,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Iltimos, oylik to‘lovni 1-darsdan kechiktirmay o‘z vaqtida amalga oshirishingizni hurmat bilan so‘raymiz.\n\n"
             "💳 To‘lov uchun karta: <code>{card_number}</code>\n"
             "👤 Karta egasi: <b>{card_owner}</b>\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "weekly_debt_parent_multi_dm": (
             "⚠️ <b>Haftalik to‘lov eslatmasi</b>\n\n"
@@ -1412,8 +1451,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Iltimos, oylik to‘lovlarni 1-darsdan kechiktirmay o‘z vaqtida amalga oshirishingizni hurmat bilan so‘raymiz.\n\n"
             "💳 To‘lov uchun karta: <code>{card_number}</code>\n"
             "👤 Karta egasi: <b>{card_owner}</b>\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "group_initial_notice": (
             "💳 <b>Oylik to‘lov eslatmasi</b>\n\n"
@@ -1421,8 +1459,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Yangi o‘quv oyi boshlanishi munosabati bilan oylik to‘lovni 1-darsdan kechiktirmay o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
             "💳 To‘lov uchun karta: <code>{card_esc}</code>\n"
             "👤 Karta egasi: <b>{owner_esc}</b>\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "group_weekly_reminder": (
             "⚠️ <b>Haftalik to‘lov eslatmasi</b>\n\n"
@@ -1431,8 +1468,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Iltimos, oylik to‘lovni 1-darsdan kechiktirmay o‘z vaqtida amalga oshirishingizni so‘raymiz.\n\n"
             "💳 To‘lov uchun karta: <code>{card_esc}</code>\n"
             "👤 Karta egasi: <b>{owner_esc}</b>\n\n"
-            "Hurmat bilan,\n"
-            "Mishkat Nodavlat Ta'lim Muassasasi!"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
         ),
         "weekly_debt_child_block": (
             "👶 <b>{student_name}</b>\n"
@@ -2198,6 +2234,7 @@ TEXTS: dict[str, dict[str, str]] = {
 
         # Human-friendly cycle & lesson labels
         "human_cycle_label": "{num}-ўқув ойи ({count} та дарс)",
+        "human_cycle_label_prorated": "{num}-ўқув ойи (қолган {remaining} та дарс)",
         "lesson_status_present": "✅ Қатнашди",
         "lesson_status_absent": "❌ Келмади",
         "lesson_status_pending": "⏳ Кутилмоқда",
@@ -2284,16 +2321,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "Сиз <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>га қатнашдингиз.\n"
             "{mavzu_qatori}Биз сизнинг билим олишдаги қатъиятингиз ва иштиёқингизни юқори баҳолаймиз."
             "{talaba_qarz_eslatmasi}\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_student_absent": (
             "🔴 Ҳурматли <b>{talaba_ismi}</b>,\n\n"
             "Сиз <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>да қатнашмадингиз.\n"
             "{mavzu_qatori}Янги мавзуларни ўтказиб юбормаслик учун дарс материаллари ва уйга вазифаларни кўриб чиқишингизни тавсия қиламиз. Кейинги дарсда сизни албатта кутамиз!"
             "{talaba_qarz_eslatmasi}\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_student_debt_note": (
             "\n\n💳 Эслатма: Жорий ўқув ойи учун <b>{qarz_summasi} сўм</b> тўлов ҳали амалга оширилмаган. Тўловни 1-дарсдан кечиктирмай амалга оширишингизни сўраймиз.\n"
@@ -2303,19 +2338,61 @@ TEXTS: dict[str, dict[str, str]] = {
             "Фарзандингиз <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>га қатнашди.\n"
             "{mavzu_qatori}Биз фарзандингизнинг билим олишдаги қатъияти ва интилишини юқори баҳолаймиз!"
             "{ota_ona_qarz_eslatmasi}\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_parent_absent": (
             "🔴 Ассалому алайкум, ҳурматли {ota_ona_ismi}!\n\n"
             "Фарзандингиз <b>{talaba_ismi}</b> <b>{guruh_nomi}</b> гуруҳида <b>{sana_uz} ({hafta_kuni})</b> кунги ўтказилган <b>{dars_raqami}-дарс</b>да қатнашмади.\n"
             "{mavzu_qatori}Янги мавзуларни ўтказиб юбормаслик учун дарс материаллари ва уйга вазифаларни кўриб чиқишини тавсия қиламиз. Кейинги дарсда албатта кутиб қоламиз!"
             "{ota_ona_qarz_eslatmasi}\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "attendance_parent_debt_note": (
             "\n\n💳 Эслатма: Фарзандингизнинг жорий ўқув ойи учун <b>{qarz_summasi} сўм</b> тўлови ҳали амалга оширилмаган. Тўловни 1-дарсдан кечиктирмай амалга оширишингизни ҳурмат билан сўраймиз.\n"
+        ),
+        "attendance_student_debt_note_prorated": (
+            "\n\n💳 Эслатма: Жорий ўқув ойининг қолган {remaining_lessons} та дарси учун <b>{qarz_summasi} сўм</b> тўлов ҳали амалга оширилмаган. Тўловни 1-дарсдан кечиктирмай амалга оширишингизни сўраймиз.\n"
+        ),
+        "attendance_parent_debt_note_prorated": (
+            "\n\n💳 Эслатма: Фарзандингизнинг жорий ўқув ойининг қолган {remaining_lessons} та дарси учун <b>{qarz_summasi} сўм</b> тўлови ҳали амалга оширилмаган. Тўловни 1-дарсдан кечиктирмай амалга оширишингизни ҳурмат билан сўраймиз.\n"
+        ),
+        "group_lesson_progress": (
+            "📋 <b>Дарс якунланди</b>\n\n"
+            "📚 Гуруҳ: <b>{group_name}</b>\n"
+            "🗓 Ўқув ойи: <b>{cycle_title}</b>\n"
+            "✅ Ўтилган дарс: <b>{lesson_num}-дарс</b> (жами <b>{total_lessons} та</b> дарсдан) — <b>{date_str}</b>\n"
+            "{optional_topic_line}\n"
+            "Ҳурмат билан,\n"
+            "Гуруҳ устози: <b>{teacher_name}</b>"
+        ),
+        "group_lesson_progress_topic_line": "📖 Мавзу: <b>{topic}</b>\n",
+        "btn_change_start_date": "📅 Бошланиш санасини ўзгартириш",
+        "add_group_start_date_lines": (
+            "📅 Бошланиш санаси: <b>{start_date}</b>\n"
+            "🏁 Сикл тугаш санаси: <b>{end_date}</b>"
+        ),
+        "add_group_calendar_title": (
+            "📅 <b>Сикл бошланиш санасини танланг</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "Ҳозирги танлов: <b>{selected}</b>\n\n"
+            "<i>Ўтган ёки келгуси санани босинг.</i>"
+        ),
+        "btn_enroll_full": "📚 Ой бошидан бери ўқийди",
+        "btn_enroll_new": "🆕 Бугундан қўшилди (Янги талаба)",
+        "enroll_choice_prompt": (
+            "🗓 <b>{group}</b> гуруҳининг жорий ўқув ойида (<b>{cycle_title}</b>) "
+            "<b>{past_count} та</b> дарс аллақачон ўтиб бўлган.\n\n"
+            "👤 Талаба: <b>{student_name}</b>\n\n"
+            "Талаба қайси ҳолатда қўшилади?"
+        ),
+        "enroll_result_full": (
+            "📚 Ўтган <b>{marked} та</b> дарс жимгина ✅ деб белгиланди (хабарномасиз).\n"
+            "💰 Тўлиқ ойлик тўлов: <b>{amount} сўм</b>"
+        ),
+        "enroll_result_new": (
+            "🆕 Жорий ўқув ойининг қолган <b>{remaining} та</b> дарси учун тўлов: "
+            "<b>{amount} сўм</b>.\n"
+            "Кейинги ўқув ойидан бошлаб тўлиқ ойлик тўлов қўлланади."
         ),
         "attendance_multi_header": (
             "📋 Ассалому алайкум, ҳурматли {ota_ona_ismi}!\n\n"
@@ -2639,8 +2716,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Илтимос, ойлик тўловни 1-дарсдан кечиктирмай ўз вақтида амалга оширинг.\n\n"
             "💳 Тўлов учун карта: <code>{card_number}</code>\n"
             "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "weekly_debt_parent_single_dm": (
             "⚠️ <b>Ҳафталик тўлов эслатмаси</b>\n\n"
@@ -2651,8 +2727,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Илтимос, ойлик тўловни 1-дарсдан кечиктирмай ўз вақтида амалга оширишингизни ҳурмат билан сўраймиз.\n\n"
             "💳 Тўлов учун карта: <code>{card_number}</code>\n"
             "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "weekly_debt_parent_multi_dm": (
             "⚠️ <b>Ҳафталик тўлов эслатмаси</b>\n\n"
@@ -2663,8 +2738,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Илтимос, ойлик тўловларни 1-дарсдан кечиктирмай ўз вақтида амалга оширишингизни ҳурмат билан сўраймиз.\n\n"
             "💳 Тўлов учун карта: <code>{card_number}</code>\n"
             "👤 Карта эгаси: <b>{card_owner}</b>\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "group_initial_notice": (
             "💳 <b>Ойлик тўлов эслатмаси</b>\n\n"
@@ -2672,8 +2746,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Янги ўқув ойи бошланиши муносабати билан ойлик тўловни 1-дарсдан кечиктирмай ўз вақтида амалга оширишингизни сўраймиз.\n\n"
             "💳 Тўлов учун карта: <code>{card_esc}</code>\n"
             "👤 Карта эгаси: <b>{owner_esc}</b>\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "group_weekly_reminder": (
             "⚠️ <b>Ҳафталик тўлов эслатмаси</b>\n\n"
@@ -2682,8 +2755,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "Илтимос, ойлик тўловни 1-дарсдан кечиктирмай ўз вақтида амалга оширишингизни сўраймиз.\n\n"
             "💳 Тўлов учун карта: <code>{card_esc}</code>\n"
             "👤 Карта эгаси: <b>{owner_esc}</b>\n\n"
-            "Ҳурмат билан,\n"
-            "Мишкат Нодавлат Таълим Муассасаси!"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
         ),
         "weekly_debt_child_block": (
             "👶 <b>{student_name}</b>\n"

@@ -17,6 +17,7 @@ class GroupAddStates(StatesGroup):
     entering_time = State()
     entering_fee = State()
     confirming = State()
+    picking_start_date = State()
 
 
 class GroupEditStates(StatesGroup):
@@ -106,6 +107,7 @@ class StudentAddStates(StatesGroup):
     parent_batch_child_name = State()
     parent_batch_child_group = State()
     parent_batch_add_more = State()
+    parent_batch_enroll_choice = State()
 
 
 class StudentManageStates(StatesGroup):

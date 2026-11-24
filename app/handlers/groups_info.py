@@ -23,7 +23,7 @@ from aiogram.types import (
 import app.config as _app_config
 from app import database
 from app.scheduler import schedule_group_initial_notice
-from app.utils import now_tashkent, today_tashkent
+from app.utils import now_tashkent, parse_calendar_month, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
 from app.database import (
     AUDIT_GROUP_DELETED,
@@ -39,6 +39,7 @@ from app.database import (
     log_audit_event,
     reset_user_role,
     save_notification_details,
+    upsert_group_counter,
 )
 from app.keyboards import (
     balance_inline_markup,
@@ -54,6 +55,7 @@ from app.keyboards import (
     group_add_teacher_kb,
     group_add_weekdays_kb,
     group_delete_confirm_kb,
+    group_start_calendar_kb,
     group_edit_lesson_count_kb,
     group_edit_teacher_kb,
     group_edit_weekdays_kb,
@@ -71,6 +73,7 @@ from app.locales import (
     format_field_label,
     format_uz_date,
     format_uz_date_list,
+    format_uz_date_long,
     format_uzs,
     t,
 )
@@ -80,6 +83,9 @@ from app.sheets import (
     SheetsManager,
     _cell_bg_request,
     _col_letter,
+    _get_anchor_date_for_schedule,
+    count_elapsed_lessons,
+    first_lesson_date_on_or_after,
     format_cycle_title,
     generate_cycle_dates,
     get_sheets_manager,
@@ -1007,6 +1013,15 @@ async def _rename_group_in_sqlite(old_name: str, new_name: str) -> None:
             await db.execute(
                 "UPDATE lesson_topics SET group_name = ? WHERE LOWER(group_name) = LOWER(?);",
                 (new_name.strip(), old_name.strip()),
+            )
+        except Exception:
+            pass
+        try:
+            # group_name of the prorated overrides is stored lower-cased
+            await db.execute(
+                "UPDATE OR IGNORE student_cycle_overrides SET group_name = ? "
+                "WHERE group_name = ?;",
+                (new_name.strip().lower(), old_name.strip().lower()),
             )
         except Exception:
             pass
@@ -2285,6 +2300,12 @@ async def cb_delete_group_confirm(
         actor_name=callback.from_user.full_name or "",
     )
     await _cleanup_deleted_group_in_sqlite(canonical)
+    try:
+        await database.delete_cycle_overrides(group_name=canonical)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Could not drop prorated overrides of deleted group %s", canonical
+        )
     try:
         await database.delete_group_reminder_state(canonical)
     except Exception:
@@ -3779,14 +3800,44 @@ async def msg_add_group_fee(message: Message, state: FSMContext) -> None:
         )
         return
     data = await state.get_data()
+    default_start = _group_add_default_start(data)
+    await state.update_data(monthly_fee=amount, start_date=default_start.isoformat())
+    data = await state.get_data()
+    await state.set_state(GroupAddStates.confirming)
+    summary, kb = _build_group_add_confirmation(data, lang)
+    await message.answer(summary, reply_markup=kb, parse_mode="HTML")
+
+
+def _group_add_default_start(data: dict[str, Any]) -> date:
+    """Nearest upcoming scheduled lesson date (Dars_Kunlari) in Asia/Tashkent."""
+    days = sorted(data["selected_days"])
+    anchor = _get_anchor_date_for_schedule(
+        now_tashkent(), str(data.get("lesson_time") or "")
+    )
+    return first_lesson_date_on_or_after(anchor, days)
+
+
+def _group_add_start_date(data: dict[str, Any]) -> date:
+    raw = str(data.get("start_date") or "").strip()
+    if raw:
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            pass
+    return _group_add_default_start(data)
+
+
+def _build_group_add_confirmation(
+    data: dict[str, Any], lang: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Confirmation preview (with the selected start / calculated end date)."""
     selected_days = sorted(data["selected_days"])
     lesson_count = int(data["lesson_count"])
     lesson_time = str(data.get("lesson_time") or "")
+    monthly_fee = int(data.get("monthly_fee") or 0)
     lesson_dates = generate_cycle_dates(
-        today_tashkent(), selected_days, lesson_count
+        _group_add_start_date(data), selected_days, lesson_count
     )
-    await state.update_data(monthly_fee=amount)
-    await state.set_state(GroupAddStates.confirming)
     summary = _lt(
         "add_group_confirm_summary",
         lang,
@@ -3801,12 +3852,161 @@ async def msg_add_group_fee(message: Message, state: FSMContext) -> None:
         start_date=format_uz_date(lesson_dates[0].strftime("%d.%m"), lang),
         end_date=format_uz_date(lesson_dates[-1].strftime("%d.%m"), lang),
     )
-    summary += "\n" + _lt("add_group_fee_line", lang, amount=_format_uzs(amount))
-    await message.answer(
-        summary,
-        reply_markup=group_add_confirm_kb(lang, back_cb="grp_add:back:fee"),
-        parse_mode="HTML",
+    if monthly_fee > 0:
+        summary += "\n" + _lt("add_group_fee_line", lang, amount=_format_uzs(monthly_fee))
+    summary += "\n" + t(
+        "add_group_start_date_lines",
+        lang,
+        start_date=format_uz_date_long(lesson_dates[0], lang),
+        end_date=format_uz_date_long(lesson_dates[-1], lang),
     )
+    return summary, group_add_confirm_kb(lang, back_cb="grp_add:back:fee")
+
+
+@router.callback_query(GroupAddStates.confirming, F.data == "grp_add:pick_start")
+async def cb_add_group_pick_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    data = await state.get_data()
+    if not {"group_name", "lesson_count", "selected_days", "lesson_time"}.issubset(
+        data.keys()
+    ):
+        await state.clear()
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+    start = _group_add_start_date(data)
+    await state.set_state(GroupAddStates.picking_start_date)
+    if callback.message:
+        await callback.message.edit_text(
+            t(
+                "add_group_calendar_title",
+                lang,
+                group=html.escape(data["group_name"]),
+                selected=format_uz_date_long(start, lang),
+            ),
+            reply_markup=group_start_calendar_kb(
+                start.year, start.month, selected=start, lang=lang
+            ),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.callback_query(GroupAddStates.picking_start_date, F.data == "grp_cal:noop")
+async def cb_group_calendar_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.callback_query(
+    GroupAddStates.picking_start_date, F.data.startswith("grp_cal:nav:")
+)
+async def cb_group_calendar_nav(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    parsed = parse_calendar_month((callback.data or "").split(":", 2)[-1])
+    if parsed is None:
+        await callback.answer()
+        return
+    data = await state.get_data()
+    start = _group_add_start_date(data)
+    if callback.message:
+        await callback.message.edit_text(
+            t(
+                "add_group_calendar_title",
+                lang,
+                group=html.escape(str(data.get("group_name") or "")),
+                selected=format_uz_date_long(start, lang),
+            ),
+            reply_markup=group_start_calendar_kb(
+                parsed[0], parsed[1], selected=start, lang=lang
+            ),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    GroupAddStates.picking_start_date, F.data.startswith("grp_cal:day:")
+)
+async def cb_group_calendar_day(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    try:
+        picked = date.fromisoformat((callback.data or "").split(":", 2)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    data = await state.get_data()
+    if not {"group_name", "lesson_count", "selected_days", "lesson_time"}.issubset(
+        data.keys()
+    ):
+        await state.clear()
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+    selected_days = sorted(data["selected_days"])
+    effective = first_lesson_date_on_or_after(picked, selected_days)
+    lesson_dates = generate_cycle_dates(
+        effective, selected_days, int(data["lesson_count"])
+    )
+    if lesson_dates[-1] < today_tashkent():
+        await callback.answer(
+            "⚠️ Bu sanadan boshlangan siklning barcha darslari allaqachon o‘tib ketgan. "
+            "Iltimos, yaqinroq sanani tanlang."
+            if lang != "cyrl"
+            else "⚠️ Бу санадан бошланган сикл барча дарслари аллақачон ўтиб кетган. "
+            "Илтимос, яқинроқ санани танланг.",
+            show_alert=True,
+        )
+        return
+    await state.update_data(start_date=effective.isoformat())
+    data = await state.get_data()
+    await state.set_state(GroupAddStates.confirming)
+    summary, kb = _build_group_add_confirmation(data, lang)
+    if callback.message:
+        await callback.message.edit_text(summary, reply_markup=kb, parse_mode="HTML")
+    if effective != picked:
+        await callback.answer(
+            f"📅 {effective.strftime('%d.%m.%Y')}"
+            + (" — eng yaqin dars kuni" if lang != "cyrl" else " — энг яқин дарс куни")
+        )
+    else:
+        await callback.answer()
+
+
+@router.callback_query(
+    GroupAddStates.picking_start_date, F.data == "grp_cal:back"
+)
+async def cb_group_calendar_back(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    data = await state.get_data()
+    if not {"group_name", "lesson_count", "selected_days", "lesson_time"}.issubset(
+        data.keys()
+    ):
+        await state.clear()
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+    await state.set_state(GroupAddStates.confirming)
+    summary, kb = _build_group_add_confirmation(data, lang)
+    if callback.message:
+        await callback.message.edit_text(summary, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
 
 @router.callback_query(GroupAddStates.confirming, F.data == "grp_add:confirm")
@@ -3862,6 +4062,11 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
         return
 
     today = today_tashkent()
+    start_date = _group_add_start_date(data)
+    initial_dates = generate_cycle_dates(start_date, selected_days, lesson_count)
+    # Lessons strictly BEFORE today are already elapsed (today's lesson is not):
+    # the counter continues seamlessly, e.g. 3 elapsed -> next lesson is 4-dars.
+    elapsed_count = count_elapsed_lessons(initial_dates, today)
     try:
         await asyncio.to_thread(
             sheets.add_group,
@@ -3875,8 +4080,19 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             str(monthly_fee) if monthly_fee > 0 else "",
         )
         cycle_info = await asyncio.to_thread(
-            sheets.create_cycle_table, group_name, today, 1, today.year
+            sheets.create_cycle_table,
+            group_name,
+            start_date,
+            1,
+            initial_dates[0].year,
         )
+        if elapsed_count > 0:
+            await asyncio.to_thread(
+                sheets.update_group,
+                group_name,
+                {"Otilgan_Dars_Hisoblagich": str(elapsed_count)},
+            )
+            await upsert_group_counter(group_name, lesson_count=elapsed_count)
         if teacher_chat_id:
             await asyncio.to_thread(
                 _sync_refresh_teacher_groups_column, sheets, teacher_chat_id

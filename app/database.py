@@ -544,6 +544,22 @@ async def init_db() -> None:
             SELECT group_name, '', 1, iso_week FROM group_weekly_reminders;
             """
         )
+        # Prorated billing for students who joined in the middle of a cycle
+        # ("🆕 Bugundan qo‘shildi"): one row per (student, group, cycle). The
+        # override only ever applies to that exact cycle; the next cycle is billed
+        # at 100% of Oylik_Tolov again.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS student_cycle_overrides (
+                student_id TEXT NOT NULL,
+                group_name TEXT NOT NULL,
+                cycle_title TEXT NOT NULL,
+                remaining_lessons INTEGER NOT NULL,
+                custom_amount INTEGER NOT NULL,
+                PRIMARY KEY (student_id, group_name, cycle_title)
+            );
+            """
+        )
         await db.execute(
             """
             CREATE TRIGGER IF NOT EXISTS audit_logs_no_delete
@@ -887,6 +903,177 @@ async def delete_group_reminder_state(group_name: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM group_reminder_state WHERE group_name = ?;", (key,))
         await db.execute("DELETE FROM group_weekly_reminders WHERE group_name = ?;", (key,))
+        await db.commit()
+
+
+# ----------------------------------------------------------------------
+# Prorated cycle billing overrides (student_cycle_overrides)
+# ----------------------------------------------------------------------
+
+
+def compute_prorated_amount(
+    monthly_fee: int, total_lessons: int, remaining_lessons: int
+) -> int:
+    """
+    prorated = round((monthly_fee / total_lessons) * remaining_lessons, -3):
+    the share of the monthly fee for the remaining lessons, rounded to the
+    nearest 1 000 UZS (never negative).
+    """
+    total = max(1, int(total_lessons or 0))
+    remaining = max(0, min(int(remaining_lessons or 0), total))
+    raw = (int(monthly_fee or 0) / total) * remaining
+    return max(0, int(round(raw, -3)))
+
+
+def _override_group_key(group_name: str) -> str:
+    return str(group_name or "").strip().lower()
+
+
+async def set_cycle_override(
+    student_id: str,
+    group_name: str,
+    cycle_title: str,
+    remaining_lessons: int,
+    custom_amount: int,
+) -> None:
+    """Stores / replaces the prorated amount of ONE student for ONE cycle."""
+    sid = str(student_id or "").strip()
+    grp = _override_group_key(group_name)
+    title = str(cycle_title or "").strip()
+    if not sid or not grp or not title:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO student_cycle_overrides
+                (student_id, group_name, cycle_title, remaining_lessons, custom_amount)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(student_id, group_name, cycle_title) DO UPDATE SET
+                remaining_lessons = excluded.remaining_lessons,
+                custom_amount = excluded.custom_amount;
+            """,
+            (sid, grp, title, int(remaining_lessons), int(custom_amount)),
+        )
+        await db.commit()
+
+
+async def get_cycle_overrides_for_students(
+    student_ids: Optional[list[str]] = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    {student_id: [{'group_name', 'cycle_title', 'remaining_lessons',
+    'custom_amount'}, ...]}; every student when `student_ids` is None.
+    Never raises (an unreadable table simply means 'no overrides').
+    """
+    try:
+        query = (
+            "SELECT student_id, group_name, cycle_title, remaining_lessons, "
+            "custom_amount FROM student_cycle_overrides"
+        )
+        params: list[Any] = []
+        if student_ids is not None:
+            ids = [str(x or "").strip() for x in student_ids if str(x or "").strip()]
+            if not ids:
+                return {}
+            query += " WHERE student_id IN (%s)" % ",".join("?" for _ in ids)
+            params = ids
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(query + ";", params) as cursor:
+                rows = await cursor.fetchall()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).exception("Failed loading student_cycle_overrides")
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for sid, grp, title, remaining, amount in rows:
+        result.setdefault(str(sid), []).append(
+            {
+                "group_name": str(grp),
+                "cycle_title": str(title),
+                "remaining_lessons": int(remaining or 0),
+                "custom_amount": int(amount or 0),
+            }
+        )
+    return result
+
+
+def get_cycle_overrides_sync(student_id: str) -> list[dict[str, Any]]:
+    """Blocking variant (for worker threads) of one student's prorated overrides."""
+    import sqlite3
+
+    sid = str(student_id or "").strip()
+    if not sid:
+        return []
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=15)
+        try:
+            rows = conn.execute(
+                "SELECT group_name, cycle_title, remaining_lessons, custom_amount "
+                "FROM student_cycle_overrides WHERE student_id = ?;",
+                (sid,),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return [
+        {
+            "group_name": str(g),
+            "cycle_title": str(c),
+            "remaining_lessons": int(r or 0),
+            "custom_amount": int(a or 0),
+        }
+        for g, c, r, a in rows
+    ]
+
+
+async def get_cycle_override(
+    student_id: str, group_name: str, cycle_title: str
+) -> Optional[dict[str, Any]]:
+    sid = str(student_id or "").strip()
+    if not sid:
+        return None
+    for item in (await get_cycle_overrides_for_students([sid])).get(sid, []):
+        if item["group_name"] == _override_group_key(group_name) and (
+            item["cycle_title"] == str(cycle_title or "").strip()
+        ):
+            return item
+    return None
+
+
+async def delete_cycle_overrides(
+    student_id: Optional[str] = None, group_name: Optional[str] = None
+) -> None:
+    """Drops overrides of a deleted student (and/or of a deleted group)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if student_id:
+        clauses.append("student_id = ?")
+        params.append(str(student_id).strip())
+    if group_name:
+        clauses.append("group_name = ?")
+        params.append(_override_group_key(group_name))
+    if not clauses:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM student_cycle_overrides WHERE " + " AND ".join(clauses) + ";",
+            params,
+        )
+        await db.commit()
+
+
+async def rename_cycle_overrides_group(old_name: str, new_name: str) -> None:
+    old_key, new_key = _override_group_key(old_name), _override_group_key(new_name)
+    if not old_key or not new_key or old_key == new_key:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE OR IGNORE student_cycle_overrides SET group_name = ? "
+            "WHERE group_name = ?;",
+            (new_key, old_key),
+        )
         await db.commit()
 
 

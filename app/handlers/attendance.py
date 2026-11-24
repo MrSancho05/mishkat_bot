@@ -38,7 +38,7 @@ from app.keyboards import (
     build_attendance_mode_kb,
     groups_inline_kb,
 )
-from app.debt_view import compute_total_debt_map, format_uzs
+from app.debt_view import compute_debt_details_map, format_uzs
 from app.locales import (
     button_texts,
     format_uz_date,
@@ -709,6 +709,45 @@ def _format_admin_report_text(
     )
 
 
+async def _broadcast_group_lesson_progress(
+    bot: Any,
+    group: Optional[dict[str, Any]],
+    group_name: str,
+    cycle_title: str,
+    lesson_num: int,
+    total_lessons: int,
+    lesson_date: date,
+    topic: str,
+    teacher_name: str,
+) -> bool:
+    """
+    Posts the clean "📋 Dars yakunlandi" progress summary to the linked group
+    Telegram chat (Guruh_TG_Chat_ID). It never contains student names, absences
+    or debts. Returns True only when the message was delivered; never raises.
+    """
+    group_tg_id = _parse_int(group.get("Guruh_TG_Chat_ID") if group else None)
+    if not group_tg_id:
+        return False
+    clean_topic = " ".join(str(topic or "").split())
+    topic_line = (
+        t("group_lesson_progress_topic_line", "latn", topic=html.escape(clean_topic))
+        if clean_topic
+        else ""
+    )
+    text = t(
+        "group_lesson_progress",
+        "latn",
+        group_name=html.escape(group_name),
+        cycle_title=html.escape(cycle_title or "—"),
+        lesson_num=int(lesson_num),
+        total_lessons=int(total_lessons),
+        date_str=lesson_date.strftime("%d.%m.%Y"),
+        optional_topic_line=topic_line,
+        teacher_name=html.escape(teacher_name or "—"),
+    )
+    return await _safe_send(bot, group_tg_id, text)
+
+
 async def _trigger_cycle_completion(
     bot: Any,
     sheets: SheetsManager,
@@ -1355,7 +1394,17 @@ async def cb_attendance_finish_instant(
     marked_students = [
         students_by_id[sid] for sid in marks_map if sid in students_by_id
     ]
-    debt_map = await compute_total_debt_map(sheets, marked_students)
+    debt_details = await compute_debt_details_map(sheets, marked_students)
+    debt_map = {
+        sid: int(child.get("total_sum") or 0) for sid, child in debt_details.items()
+    }
+    # Prorated ("🆕 Bugundan qo‘shildi") students: remaining lessons of the
+    # CURRENT cycle, when that cycle is still part of their unpaid debt.
+    prorated_remaining: dict[str, int] = {}
+    for _sid, _child in debt_details.items():
+        _ov = (_child.get("overrides") or {}).get(str(cycle_title or "").strip())
+        if _ov and int(_ov.get("remaining_lessons") or 0) > 0:
+            prorated_remaining[_sid] = int(_ov["remaining_lessons"])
     weekday_cache: dict[str, str] = {}
     sana_cache: dict[str, str] = {}
 
@@ -1397,15 +1446,21 @@ async def cb_attendance_finish_instant(
                 if mark == "✅"
                 else "attendance_student_absent"
             )
-            s_debt_note = (
-                t(
+            if total_debt > 0 and sid in prorated_remaining:
+                s_debt_note = t(
+                    "attendance_student_debt_note_prorated",
+                    s_lang,
+                    qarz_summasi=format_uzs(total_debt),
+                    remaining_lessons=prorated_remaining[sid],
+                )
+            elif total_debt > 0:
+                s_debt_note = t(
                     "attendance_student_debt_note",
                     s_lang,
                     qarz_summasi=format_uzs(total_debt),
                 )
-                if total_debt > 0
-                else "\n"
-            )
+            else:
+                s_debt_note = "\n"
             s_body = t(
                 s_key,
                 s_lang,
@@ -1462,15 +1517,21 @@ async def cb_attendance_finish_instant(
                 if c_mark == "✅"
                 else "attendance_parent_absent"
             )
-            p_debt_note = (
-                t(
+            if c_debt > 0 and _sid in prorated_remaining:
+                p_debt_note = t(
+                    "attendance_parent_debt_note_prorated",
+                    p_lang,
+                    qarz_summasi=format_uzs(c_debt),
+                    remaining_lessons=prorated_remaining[_sid],
+                )
+            elif c_debt > 0:
+                p_debt_note = t(
                     "attendance_parent_debt_note",
                     p_lang,
                     qarz_summasi=format_uzs(c_debt),
                 )
-                if c_debt > 0
-                else "\n"
-            )
+            else:
+                p_debt_note = "\n"
             p_body = t(
                 p_key,
                 p_lang,
@@ -1589,6 +1650,21 @@ async def cb_attendance_finish_instant(
         ),
         parse_mode="HTML",
     )
+
+    # Group chat progress summary (no student names / absences / debts). Sent once
+    # per lesson - an edited re-submission does not spam the group again.
+    if not is_resubmit:
+        await _broadcast_group_lesson_progress(
+            bot=callback.bot,
+            group=group,
+            group_name=group_name,
+            cycle_title=cycle_title,
+            lesson_num=dars_raqami,
+            total_lessons=limit,
+            lesson_date=lesson_date,
+            topic=mavzu,
+            teacher_name=teacher_name,
+        )
 
     if (not is_resubmit) and group and new_count >= limit:
         await _trigger_cycle_completion(

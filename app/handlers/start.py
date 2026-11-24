@@ -56,9 +56,11 @@ from app.database import (
     upsert_user,
     upsert_user_profile,
 )
+from app.debt_view import format_uzs, get_group_monthly_fee
 from app.keyboards import (
     build_dual_role_approval_kb,
     cancel_reply_kb,
+    enroll_choice_kb,
     get_main_menu_kb,
     guest_menu_kb,
     join_approval_kb,
@@ -4049,11 +4051,13 @@ async def cb_join_approve(
         return
     user_id = callback.from_user.id
     lang = await get_user_lang(user_id)
+    parts = callback.data.split(":")
     try:
-        request_id = int(callback.data.split(":", 1)[1])
-    except ValueError:
+        request_id = int(parts[1])
+    except (ValueError, IndexError):
         await callback.answer()
         return
+    enroll_mode = parts[2] if len(parts) > 2 and parts[2] in {"full", "new"} else None
 
     req = await get_join_request(request_id)
     if not req:
@@ -4063,6 +4067,38 @@ async def cb_join_approve(
     if not await _can_process_join_request(user_id, req["group_name"], sheets_mgr):
         await callback.answer(t("join_no_permission", lang), show_alert=True)
         return
+
+    # Mid-cycle enrollment: when lessons of the active cycle already passed, the
+    # Admin / Teacher first chooses how the new student joins (nothing is saved yet).
+    if enroll_mode is None and str(req.get("status") or "") == "pending":
+        try:
+            elapsed = await sheets_mgr.a_get_active_cycle_elapsed_info(req["group_name"])
+        except Exception:
+            logger.exception("Elapsed-lesson lookup failed for %s", req["group_name"])
+            elapsed = {}
+        if int(elapsed.get("past_dates_count") or 0) > 0:
+            try:
+                await callback.message.edit_text(
+                    t(
+                        "enroll_choice_prompt",
+                        lang,
+                        group=html.escape(req["group_name"]),
+                        cycle_title=html.escape(str(elapsed.get("cycle_title") or "—")),
+                        past_count=int(elapsed.get("past_dates_count") or 0),
+                        student_name=html.escape(req["full_name"]),
+                    ),
+                    reply_markup=enroll_choice_kb(
+                        f"join_approve:{request_id}:full",
+                        f"join_approve:{request_id}:new",
+                        lang,
+                        extra_row=(t("join_btn_reject", lang), f"join_reject:{request_id}"),
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.exception("Could not show enrollment choice for request %s", request_id)
+            await callback.answer()
+            return
     resolved_req = await resolve_join_request(request_id, "approved")
     if not resolved_req:
         await callback.answer(t("join_already_processed", lang), show_alert=True)
@@ -4088,12 +4124,11 @@ async def cb_join_approve(
         await sheets_mgr.a_link_student_chat_id(
             student_id, resolved_req["student_telegram_id"], False, tg_username
         )
-        await asyncio.to_thread(
-            _append_student_to_active_cycle,
-            sheets_mgr,
+        enroll_info = await sheets_mgr.a_enroll_student_in_active_cycle(
             resolved_req["group_name"],
             student_id,
             resolved_req["full_name"],
+            enroll_mode,
         )
         schedule_group_initial_notice(callback.bot, resolved_req["group_name"])
     except Exception as exc:
@@ -4135,8 +4170,25 @@ async def cb_join_approve(
             if lang == "latn"
             else f"\n\n👨‍👩‍👧 Ота-она таклиф ҳаволаси:\n<code>{html.escape(parent_link)}</code>"
         )
+        enroll_note = ""
+        if enroll_info.get("past_dates_count") and enroll_info.get("mode") == "full":
+            enroll_note = "\n\n" + t(
+                "enroll_result_full",
+                lang,
+                marked=int(enroll_info.get("marked") or 0),
+                amount=format_uzs(
+                    await get_group_monthly_fee(sheets_mgr, resolved_req["group_name"])
+                ),
+            )
+        elif enroll_info.get("past_dates_count") and enroll_info.get("mode") == "new":
+            enroll_note = "\n\n" + t(
+                "enroll_result_new",
+                lang,
+                remaining=int(enroll_info.get("remaining_lessons") or 0),
+                amount=format_uzs(int(enroll_info.get("custom_amount") or 0)),
+            )
         await callback.message.edit_text(
-            f"{approved_card}{parent_note}", parse_mode="HTML"
+            f"{approved_card}{enroll_note}{parent_note}", parse_mode="HTML"
         )
     except Exception:
         pass

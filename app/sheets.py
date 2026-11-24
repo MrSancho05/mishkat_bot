@@ -410,6 +410,21 @@ def get_next_lesson_date_after(after_date: date, lesson_days: list[int]) -> date
     return cursor
 
 
+def count_elapsed_lessons(dates: list[date], today: date) -> int:
+    """Lessons strictly BEFORE today (today's own lesson has not elapsed yet)."""
+    return sum(1 for d in dates if d < today)
+
+
+def first_lesson_date_on_or_after(start: date, lesson_days: list[int]) -> date:
+    """Nearest scheduled lesson date (start itself when it is a lesson day)."""
+    if not lesson_days:
+        raise ValueError("lesson_days cannot be empty")
+    cursor = start
+    while cursor.weekday() not in lesson_days:
+        cursor += timedelta(days=1)
+    return cursor
+
+
 def format_cycle_title(dates: list[date], cycle_number: int) -> str:
     if not dates:
         today = today_tashkent()
@@ -5877,6 +5892,154 @@ class SheetsManager:
                 group_name, fallback_date_str, attendance_map, year=year
             )
 
+    # ------------------------------------------------------------------
+    # Mid-cycle enrollment helpers (elapsed lessons, silent ✅ marking)
+    # ------------------------------------------------------------------
+
+    def _locate_active_cycle_with_dates(
+        self, group_name: str
+    ) -> Optional[tuple[gspread.Worksheet, dict[str, Any], list[tuple[dict[str, Any], date]]]]:
+        """(worksheet, active cycle, [(date_column, full date)]) of the latest cycle."""
+        clean_group = (group_name or "").strip()
+        if not clean_group or clean_group.lower() == RESERVE_GROUP_NAME.lower():
+            return None
+        ss = self._get_spreadsheet()
+        now_year = now_tashkent().year
+        for y in (now_year, now_year + 1, now_year - 1):
+            try:
+                ws = self._execute_with_retry(ss.worksheet, f"{clean_group}_{y}")
+            except gspread.WorksheetNotFound:
+                continue
+            parsed = self.parse_cycles_from_sheet(ws)
+            if not parsed:
+                continue
+            cycle = parsed[-1]
+            dated: list[tuple[dict[str, Any], date]] = []
+            running_year = y
+            prev_date: Optional[date] = None
+            for dc in cycle["date_columns"]:
+                try:
+                    parts = str(dc["date_str"]).split(".")
+                    if len(parts) == 3:
+                        d_val, m_val, y_val = map(int, parts)
+                        running_year = y_val
+                    else:
+                        d_val, m_val = map(int, parts[:2])
+                        if prev_date and m_val < prev_date.month:
+                            running_year += 1
+                    parsed_date = date(running_year, m_val, d_val)
+                except (ValueError, TypeError):
+                    continue
+                prev_date = parsed_date
+                dated.append((dc, parsed_date))
+            return ws, cycle, dated
+        return None
+
+    def get_active_cycle_elapsed_info(
+        self, group_name: str, today: Optional[date] = None
+    ) -> dict[str, Any]:
+        """
+        Elapsed-lesson info of the group's ACTIVE cycle.
+        past_dates_count counts lesson dates strictly before `today` (Asia/Tashkent)
+        and skips cancelled (red) columns; total_lessons is Oylik_Dars_Soni.
+        """
+        today_val = today or today_tashkent()
+        empty = {
+            "cycle_title": "",
+            "total_lessons": 0,
+            "past_dates": [],
+            "past_dates_count": 0,
+            "remaining_lessons": 0,
+        }
+        with self._lock:
+            located = self._locate_active_cycle_with_dates(group_name)
+            if not located:
+                return empty
+            ws, cycle, dated = located
+            _marked, cancelled = self._get_cycle_colored_columns(ws, cycle)
+            live = [(dc, d) for dc, d in dated if dc["col_idx"] not in cancelled]
+            group = self.get_group(group_name) or {}
+            try:
+                total = int(group.get("Oylik_Dars_Soni") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0:
+                total = len(live)
+            past = [d for _dc, d in live if d < today_val]
+            return {
+                "cycle_title": cycle["title"],
+                "total_lessons": total,
+                "past_dates": past,
+                "past_dates_count": len(past),
+                "remaining_lessons": max(0, total - len(past)),
+            }
+
+    def mark_elapsed_lessons_for_student(
+        self, group_name: str, student_id: str, today: Optional[date] = None
+    ) -> int:
+        """
+        SILENTLY writes ✅ into the student's own row for every lesson date of the
+        active cycle strictly before `today` (cancelled columns skipped). Never
+        touches other students, the group lesson counter, or sends any message.
+        Returns the number of cells marked.
+        """
+        today_val = today or today_tashkent()
+        target = _normalize_student_id_key(student_id)
+        with self._lock:
+            located = self._locate_active_cycle_with_dates(group_name)
+            if not located or not target:
+                return 0
+            ws, cycle, dated = located
+            row = next(
+                (
+                    r
+                    for r in cycle["student_rows"]
+                    if _normalize_student_id_key(r["student_id"]) == target
+                ),
+                None,
+            )
+            if row is None:
+                return 0
+            _marked, cancelled = self._get_cycle_colored_columns(ws, cycle)
+            cols = [
+                dc["col_idx"]
+                for dc, d in dated
+                if d < today_val and dc["col_idx"] not in cancelled
+            ]
+            if not cols:
+                return 0
+            is_paid = _is_paid_status(row.get("payment_status", ""))
+            cell_color = GREEN_BG if is_paid else YELLOW_BG
+            r_idx_0 = row["row_idx"]
+            self._retry_sheets_op(
+                ws.batch_update,
+                [
+                    {"range": f"{_col_letter(c)}{r_idx_0 + 1}", "values": [["✅"]]}
+                    for c in cols
+                ],
+                value_input_option="USER_ENTERED",
+            )
+            ss = self._get_spreadsheet()
+            self._retry_sheets_op(
+                ss.batch_update,
+                {
+                    "requests": [
+                        _cell_bg_request(
+                            ws.id,
+                            r_idx_0,
+                            r_idx_0 + 1,
+                            c,
+                            c + 1,
+                            cell_color,
+                            h_align="CENTER",
+                        )
+                        for c in cols
+                    ]
+                },
+            )
+            self._cycle_snapshot_cache.clear()
+            return len(cols)
+
     def _find_group_cycle_worksheets(
         self, group_name: str, year: Optional[int] = None
     ) -> list[tuple[int, gspread.Worksheet]]:
@@ -6825,6 +6988,84 @@ class SheetsManager:
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self.get_student_cycle_history, group_name, student_id, year
+        )
+
+    async def a_enroll_student_in_active_cycle(
+        self,
+        group_name: str,
+        student_id: str,
+        full_name: str,
+        mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Adds a NEW student to the active cycle (unpaid red row + upfront charge) and
+        applies the mid-cycle enrollment choice:
+
+        * mode "full"  (📚 Oy boshidan beri o‘qiydi, or no lesson has elapsed yet):
+          every elapsed lesson date (< today_tashkent) is silently marked ✅ for
+          this student only (no attendance / debt notification) and the full
+          monthly fee is billed.
+        * mode "new"   (🆕 Bugundan qo‘shildi): elapsed dates stay blank; the
+          current cycle is billed prorated for the remaining lessons and the
+          override is stored in SQLite (student_cycle_overrides). The next cycle is
+          billed at 100% again automatically (the override is keyed by cycle).
+        * mode None: legacy behaviour (full fee, nothing marked).
+
+        Returns {added, mode, cycle_title, past_dates_count, total_lessons,
+        remaining_lessons, custom_amount, marked}.
+        """
+        from app import database as _db
+        from app.debt_view import _group_fee_from_row, default_monthly_fee
+
+        info = await self.a_get_active_cycle_elapsed_info(group_name)
+        added = await self.a_add_student_to_active_cycle(
+            group_name, student_id, full_name, charge_upfront=True
+        )
+        past_count = int(info.get("past_dates_count") or 0)
+        result: dict[str, Any] = {
+            "added": bool(added),
+            "mode": mode,
+            "cycle_title": str(info.get("cycle_title") or ""),
+            "past_dates_count": past_count,
+            "total_lessons": int(info.get("total_lessons") or 0),
+            "remaining_lessons": int(info.get("remaining_lessons") or 0),
+            "custom_amount": 0,
+            "marked": 0,
+        }
+        if not added or past_count <= 0 or mode not in {"full", "new"}:
+            return result
+
+        if mode == "full":
+            result["marked"] = await self.a_mark_elapsed_lessons_for_student(
+                group_name, student_id
+            )
+            return result
+
+        group = await self.a_get_group(group_name) or {}
+        monthly_fee = _group_fee_from_row(group, default_monthly_fee())
+        remaining = int(result["remaining_lessons"])
+        amount = _db.compute_prorated_amount(
+            monthly_fee, int(result["total_lessons"]), remaining
+        )
+        result["custom_amount"] = amount
+        if result["cycle_title"] and remaining > 0:
+            await _db.set_cycle_override(
+                student_id, group_name, result["cycle_title"], remaining, amount
+            )
+        return result
+
+    async def a_get_active_cycle_elapsed_info(
+        self, group_name: str, today: Optional[date] = None
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.get_active_cycle_elapsed_info, group_name, today
+        )
+
+    async def a_mark_elapsed_lessons_for_student(
+        self, group_name: str, student_id: str, today: Optional[date] = None
+    ) -> int:
+        return await asyncio.to_thread(
+            self.mark_elapsed_lessons_for_student, group_name, student_id, today
         )
 
     async def a_is_teacher(self, chat_id: int | str) -> bool:

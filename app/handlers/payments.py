@@ -22,6 +22,7 @@ from app import config
 from app.utils import dual_role_header, now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
+    get_cycle_overrides_sync,
     AUDIT_PAYMENT_CONFIRMED,
     AUDIT_PAYMENT_REVERTED,
     get_legacy_debts,
@@ -575,13 +576,56 @@ def _fetch_full_cycle_history_sync(
             if title not in seen_titles:
                 seen_titles.add(title)
                 cycles.append(_enrich_cycle_with_weekdays(c, yr))
+
+    # Prorated ("🆕 Bugundan qo‘shildi") cycles of this student in this group.
+    group_key = group_name.strip().lower()
+    overrides_by_title = {
+        o["cycle_title"]: {
+            "remaining_lessons": o["remaining_lessons"],
+            "custom_amount": o["custom_amount"],
+        }
+        for o in get_cycle_overrides_sync(student_id)
+        if o["group_name"] == group_key
+    }
+    for cyc in cycles:
+        cyc["student_overrides"] = overrides_by_title
+        ov = overrides_by_title.get(str(cyc.get("cycle_title") or "").strip())
+        if ov:
+            cyc["prorated_remaining"] = ov["remaining_lessons"]
+            cyc["prorated_amount"] = ov["custom_amount"]
     return cycles
+
+
+def _debt_sum_with_overrides(
+    debt_raw: str, fee: int, overrides_by_title: Optional[dict[str, Any]]
+) -> int:
+    """Debt total: prorated cycles at their custom amount, every other at full fee."""
+    months = _count_debt_months(debt_raw)
+    titles = {
+        x.strip()
+        for x in str(debt_raw or "").split(";")
+        if x.strip() and x.strip() != "0" and not x.strip().isdigit()
+    }
+    prorated = [
+        v for k, v in (overrides_by_title or {}).items() if k in titles
+    ][: max(months, 0)]
+    return (max(months, 0) - len(prorated)) * int(fee) + sum(
+        int(v.get("custom_amount") or 0) for v in prorated
+    )
 
 
 def _format_cycle_display_title(cycle: dict[str, Any], lang: str) -> str:
     num = int(cycle.get("cycle_number") or 1)
     count = int(cycle.get("lesson_count") or len(cycle.get("lessons", [])) or 12)
-    human = format_human_cycle_title(num, count, lang)
+    if cycle.get("prorated_remaining"):
+        human = t(
+            "human_cycle_label_prorated",
+            lang,
+            num=num,
+            remaining=int(cycle["prorated_remaining"]),
+        )
+    else:
+        human = format_human_cycle_title(num, count, lang)
     raw_title = cycle.get("cycle_title", "")
     return f"{human} — {raw_title}" if raw_title else human
 
@@ -654,15 +698,22 @@ def _format_teacher_payment_text(
     fee = monthly_fee if monthly_fee is not None else _get_default_monthly_fee()
     fee_fmt = _format_uzs(fee)
     debt_count = _count_debt_months(debt_raw)
+    debt_total = _debt_sum_with_overrides(
+        debt_raw, fee, cycle.get("student_overrides")
+    )
 
     fee_lines = _lt("fee_summary_line", lang, fee=fee_fmt)
+    if cycle.get("prorated_amount") and not cycle["is_paid"]:
+        fee_lines += "\n" + _lt(
+            "cycle_fee_line", lang, fee=_format_uzs(int(cycle["prorated_amount"]))
+        )
     if debt_count > 0:
         fee_lines += "\n" + _lt(
             "debt_summary_line",
             lang,
             months=debt_count,
             fee=fee_fmt,
-            total=_format_uzs(debt_count * fee),
+            total=_format_uzs(debt_total),
             cycles=html.escape(debt_raw),
         )
 
@@ -729,8 +780,12 @@ def _format_student_cycle_text(
     cycle_display = _format_cycle_display_title(cycle, lang)
     next_payment_info = _compute_next_payment_info(cycle, lang)
     fee = monthly_fee if monthly_fee is not None else _get_default_monthly_fee()
-    fee_fmt = _format_uzs(fee)
+    cycle_fee = int(cycle.get("prorated_amount") or fee)
+    fee_fmt = _format_uzs(cycle_fee)
     debt_count = _count_debt_months(debt_raw)
+    debt_total = _debt_sum_with_overrides(
+        debt_raw, fee, cycle.get("student_overrides")
+    )
 
     if not is_detailed:
         compact_text = t(
@@ -766,8 +821,8 @@ def _format_student_cycle_text(
             "debt_summary_line",
             lang,
             months=debt_count,
-            fee=fee_fmt,
-            total=_format_uzs(debt_count * fee),
+            fee=_format_uzs(fee),
+            total=_format_uzs(debt_total),
             cycles=html.escape(debt_raw),
         )
     card_block = t(
@@ -790,6 +845,8 @@ def _build_parent_payment_context_lines(
     is_confirm: bool,
     lang: str,
     legacy_rows: Optional[list[dict[str, Any]]] = None,
+    paid_amount: Optional[int] = None,
+    overrides_by_title: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     Real-time payment context for a parent. It names ONLY the specific child
@@ -798,22 +855,29 @@ def _build_parent_payment_context_lines(
     """
     stu_name = str(target_student.get("F.I.O.") or target_student.get("Talaba_ID") or "").strip()
     fee_fmt = _format_uzs(monthly_fee)
+    shown_amount_fmt = _format_uzs(
+        int(paid_amount) if paid_amount is not None else monthly_fee
+    )
 
     if lang == "cyrl":
         amount_label = "Тасдиқланган сумма" if is_confirm else "Янгиланган сумма"
         lines = [
             f"👦 <b>Фарзандингиз {html.escape(stu_name)}</b> ({html.escape(group_name)})",
-            f"💰 {amount_label}: <b>{fee_fmt} сўм</b>",
+            f"💰 {amount_label}: <b>{shown_amount_fmt} сўм</b>",
         ]
     else:
         amount_label = "Tasdiqlangan summa" if is_confirm else "Yangilangan summa"
         lines = [
             f"👦 <b>Farzandingiz {html.escape(stu_name)}</b> ({html.escape(group_name)})",
-            f"💰 {amount_label}: <b>{fee_fmt} so‘m</b>",
+            f"💰 {amount_label}: <b>{shown_amount_fmt} so‘m</b>",
         ]
 
     debt_months = _count_debt_months(str(target_student.get("Qarzdor_Oylar") or "").strip())
-    rem_sum = debt_months * monthly_fee
+    rem_sum = _debt_sum_with_overrides(
+        str(target_student.get("Qarzdor_Oylar") or "").strip(),
+        monthly_fee,
+        overrides_by_title,
+    )
     legacy_list = list(legacy_rows or [])
     legacy_months = sum(max(1, int(r.get("months") or 1)) for r in legacy_list)
     legacy_sum = sum(max(0, int(r.get("amount") or 0)) for r in legacy_list)
@@ -896,6 +960,8 @@ async def _broadcast_payment_event(
     cycle_title: str,
     is_confirm: bool,
     actor_user_id: int,
+    paid_amount: Optional[int] = None,
+    overrides_by_title: Optional[dict[str, Any]] = None,
 ) -> None:
     sheets = get_sheets_manager()
     student_id = str(student.get("Talaba_ID") or "").strip()
@@ -1033,6 +1099,8 @@ async def _broadcast_payment_event(
                 is_confirm=is_confirm,
                 lang=p_lang,
                 legacy_rows=legacy_rows,
+                paid_amount=paid_amount,
+                overrides_by_title=overrides_by_title,
             )
             await bot.send_message(
                 chat_id=p_cid,
@@ -1422,7 +1490,11 @@ async def cb_payment_confirm(callback: CallbackQuery, state: FSMContext) -> None
         actor_id=user_id,
         action=AUDIT_PAYMENT_CONFIRMED,
         target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
-        amount=int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee(),
+        amount=(
+            int(cycle["prorated_amount"])
+            if cycle.get("prorated_amount")
+            else (int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee())
+        ),
         details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
         actor_name=callback.from_user.full_name or "",
     )
@@ -1436,6 +1508,8 @@ async def cb_payment_confirm(callback: CallbackQuery, state: FSMContext) -> None
             cycle_title=_format_cycle_display_title(cycle, "latn"),
             is_confirm=True,
             actor_user_id=user_id,
+            paid_amount=cycle.get("prorated_amount"),
+            overrides_by_title=cycle.get("student_overrides"),
         )
 
     cycle["is_paid"] = True
@@ -1515,7 +1589,11 @@ async def cb_payment_revert(callback: CallbackQuery, state: FSMContext) -> None:
         actor_id=user_id,
         action=AUDIT_PAYMENT_REVERTED,
         target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
-        amount=int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee(),
+        amount=(
+            int(cycle["prorated_amount"])
+            if cycle.get("prorated_amount")
+            else (int(monthly_fee) if monthly_fee is not None else _get_default_monthly_fee())
+        ),
         details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
         actor_name=callback.from_user.full_name or "",
     )
@@ -1529,6 +1607,8 @@ async def cb_payment_revert(callback: CallbackQuery, state: FSMContext) -> None:
             cycle_title=_format_cycle_display_title(cycle, "latn"),
             is_confirm=False,
             actor_user_id=user_id,
+            paid_amount=cycle.get("prorated_amount"),
+            overrides_by_title=cycle.get("student_overrides"),
         )
 
     cycle["is_paid"] = False

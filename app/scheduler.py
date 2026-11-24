@@ -31,6 +31,7 @@ from app.database import (
     list_due_initial_group_notices,
     release_group_initial_notice,
     release_group_weekly_reminder,
+    get_cycle_overrides_for_students,
     get_unpaid_legacy_debts_map,
     get_lesson_topic,
     get_teacher_by_telegram_id,
@@ -359,7 +360,14 @@ def _format_cycle_parent_combined_message(
         cycle_title = first["cycle_title"]
         fee = int(first["monthly_fee"])
         count = len(grp_items)
-        sub_total = count * fee
+        # Prorated ("🆕 Bugundan qo‘shildi") children owe their custom amount for
+        # the cycle that just ended; everyone else owes the full monthly fee.
+        amounts = [
+            int(it["amount"]) if it.get("amount") is not None else int(it["monthly_fee"])
+            for it in grp_items
+        ]
+        sub_total = sum(amounts)
+        uniform_fee = all(a == fee for a in amounts)
         grand_total += sub_total
 
         seen_names: list[str] = []
@@ -370,19 +378,24 @@ def _format_cycle_parent_combined_message(
         names_str = ", ".join(html.escape(n) for n in seen_names)
 
         if count > 1:
+            money = (
+                f"{count} × {_format_uzs(fee)} = {_format_uzs(sub_total)} {currency}"
+                if uniform_fee
+                else f"{_format_uzs(sub_total)} {currency}"
+            )
             if lang == "cyrl":
                 blocks.append(
                     f"👶 Фарзандларингиз: <b>{names_str}</b>\n"
                     f"📚 Гуруҳ: <b>{html.escape(group_name)}</b>\n"
                     f"🗓 Якунланган давр: <b>{html.escape(cycle_title)}</b>\n"
-                    f"💰 Ойлик тўлов: <b>{count} × {_format_uzs(fee)} = {_format_uzs(sub_total)} {currency}</b>"
+                    f"💰 Ойлик тўлов: <b>{money}</b>"
                 )
             else:
                 blocks.append(
                     f"👶 Farzandlaringiz: <b>{names_str}</b>\n"
                     f"📚 Guruh: <b>{html.escape(group_name)}</b>\n"
                     f"🗓 Yakunlangan davr: <b>{html.escape(cycle_title)}</b>\n"
-                    f"💰 Oylik to‘lov: <b>{count} × {_format_uzs(fee)} = {_format_uzs(sub_total)} {currency}</b>"
+                    f"💰 Oylik to‘lov: <b>{money}</b>"
                 )
         else:
             if lang == "cyrl":
@@ -489,6 +502,16 @@ async def handle_cycle_completion(
     local_parent_payloads: dict[int, list[dict[str, Any]]] = (
         defer_parent_payloads if defer_parent_payloads is not None else {}
     )
+    cycle_overrides = await get_cycle_overrides_for_students(list(unpaid_ids))
+
+    def _owed_amount(student_id: str) -> int:
+        for ov in cycle_overrides.get(student_id, []):
+            if (
+                ov["cycle_title"] == str(cycle_title or "").strip()
+                and ov["group_name"] == group_name.strip().lower()
+            ):
+                return int(ov["custom_amount"])
+        return monthly_fee
 
     for uid in unpaid_ids:
         student = students_by_id.get(uid)
@@ -535,6 +558,7 @@ async def handle_cycle_completion(
                         "group_name": group_name,
                         "cycle_title": cycle_title,
                         "monthly_fee": monthly_fee,
+                        "amount": _owed_amount(uid),
                     }
                 )
 
@@ -1433,12 +1457,24 @@ def _weekly_debt_period_text(
     """HTML-safe list of unpaid periods (current cycles + legacy labels)."""
     parts: list[str] = []
     if child_debt:
+        overrides = child_debt.get("overrides") or {}
+
+        def _period(raw_title: str) -> str:
+            label = format_cycle_title(raw_title, lang)
+            ov = overrides.get(raw_title)
+            if not ov:
+                return label
+            remaining = int(ov.get("remaining_lessons") or 0)
+            if lang == "cyrl":
+                return f"{label} — қолган {remaining} та дарс"
+            return f"{label} — qolgan {remaining} ta dars"
+
         for cyc in child_debt.get("cycles") or []:
             title = str(cyc.get("title") or "").strip()
             if title:
-                parts.append(format_cycle_title(title, lang))
+                parts.append(_period(title))
         for title in child_debt.get("extra_titles") or []:
-            parts.append(format_cycle_title(title, lang))
+            parts.append(_period(str(title).strip()))
         for leg in child_debt.get("legacy") or []:
             label = str(leg.get("label") or "").strip()
             if label and label != "—":

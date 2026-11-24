@@ -14,7 +14,11 @@ import uuid
 from datetime import date
 from typing import Any, Optional
 
-from app.database import get_unpaid_legacy_debts_map, save_notification_details
+from app.database import (
+    get_cycle_overrides_for_students,
+    get_unpaid_legacy_debts_map,
+    save_notification_details,
+)
 from app.keyboards import build_expandable_notif_kb
 from app.locales import MONTHS_UZ, WEEKDAYS_FULL, WEEKDAYS_SHORT, t
 
@@ -69,6 +73,7 @@ _TEXTS: dict[str, dict[str, str]] = {
         "header_view": "💳 <b>To‘lovlar holati</b>",
         "admin_dates_line": "  📅 To‘lanmagan darslar: {dates}",
         "admin_legacy_line": "  📜 Avvalgi qarz: {items}",
+        "prorated_suffix": " (qolgan {remaining} ta dars)",
     },
     "cyrl": {
         "currency": "сўм",
@@ -113,6 +118,7 @@ _TEXTS: dict[str, dict[str, str]] = {
         "header_view": "💳 <b>Тўловлар ҳолати</b>",
         "admin_dates_line": "  📅 Тўланмаган дарслар: {dates}",
         "admin_legacy_line": "  📜 Аввалги қарз: {items}",
+        "prorated_suffix": " (қолган {remaining} та дарс)",
     },
 }
 
@@ -211,6 +217,7 @@ def build_child_debt(
     fee: int,
     unpaid_cycles: list[dict[str, Any]],
     legacy_rows: list[dict[str, Any]],
+    overrides: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     debt_raw = str(student.get("Qarzdor_Oylar") or "").strip()
     current_months = count_debt_months(debt_raw)
@@ -241,7 +248,25 @@ def build_child_debt(
         if titled:
             shown_cycles = titled
 
-    current_sum = current_months * int(fee or 0)
+    # Prorated cycles ("🆕 Bugundan qo‘shildi"): only the exact cycle they were
+    # created for is billed at the custom amount; every other cycle is full fee.
+    student_group = str(student.get("Guruh") or "").strip().lower()
+    debt_title_set = set(debt_titles_from_raw(debt_raw))
+    active_overrides: dict[str, dict[str, Any]] = {}
+    for item in overrides or []:
+        title = str(item.get("cycle_title") or "").strip()
+        if (
+            title in debt_title_set
+            and str(item.get("group_name") or "").strip().lower() == student_group
+        ):
+            active_overrides[title] = {
+                "remaining_lessons": int(item.get("remaining_lessons") or 0),
+                "custom_amount": int(item.get("custom_amount") or 0),
+            }
+    prorated_count = min(len(active_overrides), max(current_months, 0))
+    current_sum = (max(current_months, 0) - prorated_count) * int(fee or 0) + sum(
+        v["custom_amount"] for v in active_overrides.values()
+    )
     return {
         "student_id": str(student.get("Talaba_ID") or "").strip(),
         "name": str(student.get("F.I.O.") or student.get("Talaba_ID") or "").strip(),
@@ -250,6 +275,7 @@ def build_child_debt(
         "debt_raw": debt_raw,
         "current_months": current_months,
         "current_sum": current_sum,
+        "overrides": active_overrides,
         "cycles": shown_cycles,
         "extra_titles": extra_titles[: max(0, current_months - len(shown_cycles))],
         "legacy": legacy_items,
@@ -297,23 +323,42 @@ def format_child_detail(child: dict[str, Any], lang: str) -> str:
     if child["cycles"] or child["extra_titles"]:
         lines.append(_dt("current_title", lang))
         for cycle in child["cycles"]:
-            lines.append(
-                _dt(
-                    "current_item",
-                    lang,
-                    title=format_cycle_title(cycle.get("title", ""), lang),
-                    count=int(cycle.get("lesson_count") or len(cycle.get("dates") or [])),
-                    fee=format_uzs(child["fee"]),
+            ov = (child.get("overrides") or {}).get(str(cycle.get("title") or "").strip())
+            if ov:
+                lines.append(
+                    _dt(
+                        "current_item",
+                        lang,
+                        title=format_cycle_title(cycle.get("title", ""), lang)
+                        + _dt("prorated_suffix", lang, remaining=ov["remaining_lessons"]),
+                        count=ov["remaining_lessons"],
+                        fee=format_uzs(ov["custom_amount"]),
+                    )
                 )
-            )
+            else:
+                lines.append(
+                    _dt(
+                        "current_item",
+                        lang,
+                        title=format_cycle_title(cycle.get("title", ""), lang),
+                        count=int(cycle.get("lesson_count") or len(cycle.get("dates") or [])),
+                        fee=format_uzs(child["fee"]),
+                    )
+                )
             lines.append(_dt("dates_line", lang, dates=_dates_text(cycle, lang)))
         for title in child["extra_titles"]:
+            ov = (child.get("overrides") or {}).get(str(title).strip())
             lines.append(
                 _dt(
                     "extra_item",
                     lang,
-                    title=format_cycle_title(title, lang),
-                    fee=format_uzs(child["fee"]),
+                    title=format_cycle_title(title, lang)
+                    + (
+                        _dt("prorated_suffix", lang, remaining=ov["remaining_lessons"])
+                        if ov
+                        else ""
+                    ),
+                    fee=format_uzs(ov["custom_amount"] if ov else child["fee"]),
                 )
             )
     lines.append(
@@ -469,6 +514,7 @@ async def compute_children_debts(
         except Exception:
             logger.exception("Failed loading unpaid cycles")
             unpaid_map = {}
+    overrides_map = await get_cycle_overrides_for_students(sids)
     result: list[dict[str, Any]] = []
     for stu in students:
         sid = str(stu.get("Talaba_ID") or "").strip()
@@ -481,6 +527,7 @@ async def compute_children_debts(
                 fee,
                 unpaid_map.get(sid, []),
                 legacy_map.get(sid, []),
+                overrides_map.get(sid, []),
             )
         )
     return result
@@ -535,6 +582,12 @@ def default_monthly_fee() -> int:
     return 500000
 
 
+async def get_group_monthly_fee(sheets: Any, group_name: str) -> int:
+    """Monthly fee (Oylik_Tolov_Summa, else the default fee) of one group."""
+    group = await sheets.a_get_group(group_name) or {}
+    return _group_fee_from_row(group, default_monthly_fee())
+
+
 async def load_group_fees(sheets: Any) -> tuple[dict[str, int], int]:
     """Returns ({group_name_lower: monthly_fee}, default_fee)."""
     default_fee = default_monthly_fee()
@@ -544,6 +597,21 @@ async def load_group_fees(sheets: Any) -> tuple[dict[str, int], int]:
         for g in all_groups
     }
     return fees, default_fee
+
+
+async def compute_debt_details_map(
+    sheets: Any, students: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """{Talaba_ID: child-debt dict} (incl. prorated overrides); {} on failure."""
+    if not students:
+        return {}
+    try:
+        group_fees, default_fee = await load_group_fees(sheets)
+        children = await compute_children_debts(sheets, students, group_fees, default_fee)
+        return {c["student_id"]: c for c in children}
+    except Exception:
+        logger.exception("Failed computing debt details map")
+        return {}
 
 
 async def compute_total_debt_map(
