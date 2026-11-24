@@ -43,10 +43,14 @@ DEEP_LINK_START_RE = re.compile(r"^/start(?:@\w+)?\s+\S+")
 
 # Callback prefixes strictly tied to specific local FSM flows
 _STRICT_STATE_CALLBACK_PREFIXES: dict[str, tuple[str, ...]] = {
-    "GroupAddStates": ("grp_add:",),
+    "GroupAddStates": ("grp_add:", "grp_cal:"),
     "TeacherAddStates": ("tch_add:",),
     "GroupJoinStates": (),
 }
+
+# Inline calendar callbacks (group creation start-date picker) are NEVER treated
+# as a "tugallanmagan jarayon" violation: they belong to the active flow itself.
+_CALENDAR_CALLBACK_PREFIXES = ("grp_cal:",)
 
 # Navigation / cross-flow callbacks blocked whenever any FSM state is active
 _NON_FSM_BLOCKED_CALLBACK_PREFIXES = (
@@ -107,7 +111,9 @@ class StateGuardMiddleware(BaseMiddleware):
                 return await handler(event, data)
 
             cb_data = event.data or ""
-            if cb_data == "global_cancel_fsm":
+            if cb_data == "global_cancel_fsm" or cb_data.startswith(
+                _CALENDAR_CALLBACK_PREFIXES
+            ):
                 return await handler(event, data)
 
             state_group = current_state.split(":", 1)[0]

@@ -19,7 +19,7 @@ DEFAULT_COURSES: list[tuple[str, str, str, str]] = [
         "hamda so‘zlashuv amaliyoti.",
         "6–12 oy",
         "Haftasiga 3 marta",
-    )
+    ),
 ]
 
 

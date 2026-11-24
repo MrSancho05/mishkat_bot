@@ -3896,13 +3896,15 @@ async def cb_add_group_pick_start(callback: CallbackQuery, state: FSMContext) ->
     await callback.answer()
 
 
-@router.callback_query(GroupAddStates.picking_start_date, F.data == "grp_cal:noop")
+@router.callback_query(
+    StateFilter(GroupAddStates.picking_start_date), F.data == "grp_cal:noop"
+)
 async def cb_group_calendar_noop(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
 @router.callback_query(
-    GroupAddStates.picking_start_date, F.data.startswith("grp_cal:nav:")
+    StateFilter(GroupAddStates.picking_start_date), F.data.startswith("grp_cal:nav:")
 )
 async def cb_group_calendar_nav(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
@@ -3934,7 +3936,7 @@ async def cb_group_calendar_nav(callback: CallbackQuery, state: FSMContext) -> N
 
 
 @router.callback_query(
-    GroupAddStates.picking_start_date, F.data.startswith("grp_cal:day:")
+    StateFilter(GroupAddStates.picking_start_date), F.data.startswith("grp_cal:day:")
 )
 async def cb_group_calendar_day(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
@@ -3986,7 +3988,7 @@ async def cb_group_calendar_day(callback: CallbackQuery, state: FSMContext) -> N
 
 
 @router.callback_query(
-    GroupAddStates.picking_start_date, F.data == "grp_cal:back"
+    StateFilter(GroupAddStates.picking_start_date), F.data == "grp_cal:back"
 )
 async def cb_group_calendar_back(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
@@ -4093,6 +4095,13 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
                 {"Otilgan_Dars_Hisoblagich": str(elapsed_count)},
             )
             await upsert_group_counter(group_name, lesson_count=elapsed_count)
+            # Visually flag the already-conducted lesson columns in {Group}_{Year}.
+            try:
+                await sheets.a_mark_cycle_elapsed_columns(group_name, today)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Could not mark elapsed columns for new group %s", group_name
+                )
         if teacher_chat_id:
             await asyncio.to_thread(
                 _sync_refresh_teacher_groups_column, sheets, teacher_chat_id

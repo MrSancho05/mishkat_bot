@@ -5966,13 +5966,84 @@ class SheetsManager:
             if total <= 0:
                 total = len(live)
             past = [d for _dc, d in live if d < today_val]
+            # Never miss elapsed lessons: take the larger of the date-header count
+            # (< today_tashkent) and the group's Otilgan_Dars_Hisoblagich counter.
+            try:
+                counter = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
+            except (TypeError, ValueError):
+                counter = 0
+            counter = max(0, counter)
+            if total > 0:
+                counter = min(counter, total)
+            elapsed = max(len(past), counter)
             return {
                 "cycle_title": cycle["title"],
                 "total_lessons": total,
                 "past_dates": past,
-                "past_dates_count": len(past),
-                "remaining_lessons": max(0, total - len(past)),
+                "past_dates_count": elapsed,
+                "header_past_count": len(past),
+                "counter": counter,
+                "remaining_lessons": max(0, total - elapsed),
             }
+
+    def mark_cycle_elapsed_columns(
+        self, group_name: str, today: Optional[date] = None
+    ) -> int:
+        """
+        Visually marks every lesson column of the group's ACTIVE cycle whose date
+        is strictly before `today` (Asia/Tashkent) as already conducted: the date
+        header and every existing student cell of that column get the completed
+        yellow background (#FFF2CC). No text, counter or notification is touched.
+        Returns the number of columns marked.
+        """
+        today_val = today or today_tashkent()
+        with self._lock:
+            located = self._locate_active_cycle_with_dates(group_name)
+            if not located:
+                return 0
+            ws, cycle, dated = located
+            cols = [dc["col_idx"] for dc, d in dated if d < today_val]
+            if not cols:
+                return 0
+            header_idx = cycle["header_row_idx"]
+            last_idx = cycle["last_row_idx"]
+            ss = self._get_spreadsheet()
+            requests: list[dict[str, Any]] = []
+            for c in cols:
+                requests.append(
+                    _cell_bg_request(
+                        ws.id,
+                        header_idx,
+                        header_idx + 1,
+                        c,
+                        c + 1,
+                        YELLOW_BG,
+                        bold=True,
+                        h_align="CENTER",
+                    )
+                )
+                if last_idx > header_idx:
+                    requests.append(
+                        _cell_bg_request(
+                            ws.id,
+                            header_idx + 1,
+                            last_idx + 1,
+                            c,
+                            c + 1,
+                            YELLOW_BG,
+                            h_align="CENTER",
+                        )
+                    )
+            self._retry_sheets_op(ss.batch_update, {"requests": requests})
+            self._cycle_snapshot_cache.clear()
+            return len(cols)
+
+    async def a_mark_cycle_elapsed_columns(
+        self, group_name: str, today: Optional[date] = None
+    ) -> int:
+        return await asyncio.to_thread(
+            self.mark_cycle_elapsed_columns, group_name, today
+        )
 
     def mark_elapsed_lessons_for_student(
         self, group_name: str, student_id: str, today: Optional[date] = None
@@ -7043,7 +7114,9 @@ class SheetsManager:
 
         group = await self.a_get_group(group_name) or {}
         monthly_fee = _group_fee_from_row(group, default_monthly_fee())
-        remaining = int(result["remaining_lessons"])
+        # At least 1 remaining lesson is always billed (never a free cycle).
+        remaining = max(1, int(result["remaining_lessons"]))
+        result["remaining_lessons"] = remaining
         amount = _db.compute_prorated_amount(
             monthly_fee, int(result["total_lessons"]), remaining
         )
