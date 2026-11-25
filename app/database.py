@@ -221,6 +221,62 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE group_counters ADD COLUMN start_date TEXT;")
         except Exception:
             pass
+        # Group Telegram chat id (Guruh_TG_Chat_ID) mirrored from Guruhlar; also
+        # updated automatically when a group chat migrates to a supergroup.
+        try:
+            await db.execute("ALTER TABLE group_counters ADD COLUMN tg_chat_id TEXT;")
+        except Exception:
+            pass
+        # Kunlik_Dars_Soni (1 = one lesson per lesson day, 2 = "Juft dars").
+        try:
+            await db.execute(
+                "ALTER TABLE group_counters ADD COLUMN daily_lessons INTEGER NOT NULL DEFAULT 1;"
+            )
+        except Exception:
+            pass
+        # Dars_Vaqti mirror ("14:00", "10:00 / 11:30", "Kelishilgan vaqtda"...).
+        try:
+            await db.execute("ALTER TABLE group_counters ADD COLUMN lesson_time TEXT;")
+        except Exception:
+            pass
+        # Lessons the teacher cancelled ("🚫 Bugungi dars bo‘lmaydi"); session 0
+        # = the whole day of a single-lesson group.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cancelled_lessons (
+                group_name TEXT NOT NULL,
+                lesson_date TEXT NOT NULL,
+                session INTEGER NOT NULL DEFAULT 0,
+                cancelled_by INTEGER,
+                replacement_date TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (group_name, lesson_date, session)
+            );
+            """
+        )
+        # One-time "attendance not marked 2 hours after the lesson" admin alerts.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attendance_missing_alerts (
+                group_name TEXT NOT NULL,
+                lesson_date TEXT NOT NULL,
+                session INTEGER NOT NULL DEFAULT 0,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (group_name, lesson_date, session)
+            );
+            """
+        )
+        # One-time teacher reminder for "Kelishilgan vaqtda" groups (day before).
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agreed_time_reminders (
+                group_name TEXT NOT NULL,
+                lesson_date TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (group_name, lesson_date)
+            );
+            """
+        )
         # Inline-button payloads longer than Telegram's 64-byte callback_data
         # limit (e.g. long / multi-byte group names) are stored here and the
         # button carries only a short deterministic token ("~<hash>").
@@ -2164,6 +2220,198 @@ async def get_group_start_date(group_name: str) -> Optional[str]:
         ) as cursor:
             row = await cursor.fetchone()
             return str(row[0]) if row and row[0] else None
+
+
+async def set_group_tg_chat_id(group_name: str, chat_id: str) -> None:
+    """Stores the group's Telegram chat id ('' clears it) next to its counter."""
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return
+    clean_id = str(chat_id or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE group_counters SET tg_chat_id = ? WHERE LOWER(group_name) = LOWER(?);",
+            (clean_id, clean_name),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO group_counters (group_name, lesson_count, tg_chat_id) "
+                "VALUES (?, 0, ?);",
+                (clean_name, clean_id),
+            )
+        await db.commit()
+
+
+async def get_group_tg_chat_id(group_name: str) -> Optional[str]:
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT tg_chat_id FROM group_counters WHERE LOWER(group_name) = LOWER(?);",
+            (clean_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row and row[0] else None
+
+
+async def set_group_daily_lessons(group_name: str, daily_lessons: int) -> None:
+    """Mirrors Kunlik_Dars_Soni (1 or 2) of a group into SQLite."""
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return
+    value = 2 if int(daily_lessons or 1) >= 2 else 1
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE group_counters SET daily_lessons = ? WHERE LOWER(group_name) = LOWER(?);",
+            (value, clean_name),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO group_counters (group_name, lesson_count, daily_lessons) "
+                "VALUES (?, 0, ?);",
+                (clean_name, value),
+            )
+        await db.commit()
+
+
+async def set_group_lesson_time(group_name: str, lesson_time: str) -> None:
+    """Mirrors Dars_Vaqti of a group (incl. 'Kelishilgan vaqtda') into SQLite."""
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return
+    value = str(lesson_time or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE group_counters SET lesson_time = ? WHERE LOWER(group_name) = LOWER(?);",
+            (value, clean_name),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO group_counters (group_name, lesson_count, lesson_time) "
+                "VALUES (?, 0, ?);",
+                (clean_name, value),
+            )
+        await db.commit()
+
+
+def _lesson_key(group_name: str) -> str:
+    return " ".join(str(group_name or "").split()).casefold()
+
+
+async def record_cancelled_lesson(
+    group_name: str,
+    lesson_date: str,
+    session: int = 0,
+    cancelled_by: Optional[int] = None,
+    replacement_date: str = "",
+) -> bool:
+    """Stores a teacher-cancelled lesson. Returns False when it was already recorded."""
+    key = _lesson_key(group_name)
+    if not key:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO cancelled_lessons "
+            "(group_name, lesson_date, session, cancelled_by, replacement_date, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?);",
+            (
+                key,
+                str(lesson_date).strip(),
+                int(session or 0),
+                cancelled_by,
+                str(replacement_date or ""),
+                now_tashkent().isoformat(),
+            ),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def is_lesson_cancelled(
+    group_name: str, lesson_date: str, session: Optional[int] = None
+) -> bool:
+    """True when the lesson (or, with session=None, any session of that date) was cancelled."""
+    key = _lesson_key(group_name)
+    if not key:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        if session is None:
+            sql = "SELECT 1 FROM cancelled_lessons WHERE group_name = ? AND lesson_date = ? LIMIT 1;"
+            params: tuple[Any, ...] = (key, str(lesson_date).strip())
+        else:
+            sql = (
+                "SELECT 1 FROM cancelled_lessons WHERE group_name = ? AND lesson_date = ? "
+                "AND session IN (?, 0) LIMIT 1;"
+            )
+            params = (key, str(lesson_date).strip(), int(session))
+        async with db.execute(sql, params) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def claim_attendance_missing_alert(
+    group_name: str, lesson_date: str, session: int = 0
+) -> bool:
+    """Atomically reserves the one-time 2-hour admin alert. True = send it now."""
+    key = _lesson_key(group_name)
+    if not key:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO attendance_missing_alerts "
+            "(group_name, lesson_date, session, sent_at) VALUES (?, ?, ?, ?);",
+            (key, str(lesson_date).strip(), int(session or 0), now_tashkent().isoformat()),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def is_attendance_missing_alert_sent(
+    group_name: str, lesson_date: str, session: int = 0
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM attendance_missing_alerts WHERE group_name = ? "
+            "AND lesson_date = ? AND session = ? LIMIT 1;",
+            (_lesson_key(group_name), str(lesson_date).strip(), int(session or 0)),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+
+async def release_attendance_missing_alert(
+    group_name: str, lesson_date: str, session: int = 0
+) -> None:
+    """Undo a claim when no admin could be reached (so a later run retries)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM attendance_missing_alerts WHERE group_name = ? "
+            "AND lesson_date = ? AND session = ?;",
+            (_lesson_key(group_name), str(lesson_date).strip(), int(session or 0)),
+        )
+        await db.commit()
+
+
+async def claim_agreed_time_reminder(group_name: str, lesson_date: str) -> bool:
+    key = _lesson_key(group_name)
+    if not key:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO agreed_time_reminders (group_name, lesson_date, sent_at) "
+            "VALUES (?, ?, ?);",
+            (key, str(lesson_date).strip(), now_tashkent().isoformat()),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def release_agreed_time_reminder(group_name: str, lesson_date: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM agreed_time_reminders WHERE group_name = ? AND lesson_date = ?;",
+            (_lesson_key(group_name), str(lesson_date).strip()),
+        )
+        await db.commit()
 
 
 async def save_callback_token(token: str, data: str) -> None:

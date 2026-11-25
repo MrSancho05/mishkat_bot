@@ -16,6 +16,7 @@ from app.handlers.schedule import router as schedule_router
 from app.handlers.start import router as start_router
 from app.handlers.students import router as students_router
 from app.middlewares import (
+    MainAdminRoleSwitchMenuMiddleware,
     CallbackDataShortenerRequestMiddleware,
     CallbackTokenResolverMiddleware,
     StateGuardMiddleware,
@@ -56,6 +57,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     bot.session.middleware(CallbackDataShortenerRequestMiddleware())
+    bot.session.middleware(MainAdminRoleSwitchMenuMiddleware())
     dp = Dispatcher(storage=MemoryStorage())
 
     state_guard = StateGuardMiddleware()

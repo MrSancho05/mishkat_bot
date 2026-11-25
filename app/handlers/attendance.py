@@ -27,6 +27,7 @@ from app.utils import (
     today_tashkent,
 )
 from app.config import ADMIN_IDS, DB_PATH, TZ
+from app.scheduler import normalize_chat_id_text, send_group_chat_message
 from app.database import (
     get_all_dynamic_admins,
     get_lesson_topic,
@@ -34,12 +35,16 @@ from app.database import (
     get_user,
     get_user_lang,
     has_dual_student_parent_role,
+    is_lesson_cancelled,
+    record_cancelled_lesson,
     upsert_group_counter,
 )
 from app.keyboards import (
     InlineKeyboardBuilder,
     admin_attendance_report_kb,
+    attendance_cancel_today_confirm_kb,
     attendance_marking_kb,
+    attendance_session_picker_kb,
     build_attendance_mode_kb,
     groups_inline_kb,
 )
@@ -53,6 +58,7 @@ from app.locales import (
 )
 from app.sheets import (
     SheetsManager,
+    get_group_daily_lessons,
     get_next_lesson_date_after,
     get_sheets_manager,
     parse_weekdays,
@@ -171,7 +177,7 @@ def _get_card_info() -> tuple[str, str]:
 
 
 def _parse_int(raw: Any) -> Optional[int]:
-    val = str(raw or "").strip()
+    val = normalize_chat_id_text(raw)
     if not val:
         return None
     try:
@@ -414,7 +420,10 @@ async def _resolve_teacher_name(
 
 
 def _get_existing_attendance_for_date_sync(
-    sheets: SheetsManager, group_name: str, lesson_date: date
+    sheets: SheetsManager,
+    group_name: str,
+    lesson_date: date,
+    session: Optional[int] = None,
 ) -> dict[str, str]:
     with sheets._lock:
         ss = sheets._get_spreadsheet()
@@ -430,6 +439,10 @@ def _get_existing_attendance_for_date_sync(
                         dc["col_idx"]
                         for dc in cycle["date_columns"]
                         if dc["date_str"] == date_str
+                        and (
+                            session is None
+                            or int(dc.get("session") or 1) == int(session)
+                        )
                     ),
                     None,
                 )
@@ -551,13 +564,27 @@ def _past_attendance_dates_kb(
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     buttons: list[InlineKeyboardButton] = []
+    # Double lessons: one button per DATE ("1-dars"/"2-dars" is picked next).
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
     for item in past_lessons:
+        key = str(item.get("full_date") or item.get("date_str") or "")
+        if key not in merged:
+            merged[key] = {**item, "_all_cancelled": True, "_all_marked": True}
+            order.append(key)
+        bucket = merged[key]
+        if not item.get("is_cancelled"):
+            bucket["_all_cancelled"] = False
+            if not item.get("is_marked"):
+                bucket["_all_marked"] = False
+    for key in order:
+        item = merged[key]
         date_str = item.get("date_str", "")
         full_date = item.get("full_date", "")
         weekday = item.get("weekday", "")
-        if item.get("is_cancelled"):
+        if item.get("_all_cancelled"):
             icon = "🚫"
-        elif item.get("is_marked"):
+        elif item.get("_all_marked"):
             icon = "✅"
         else:
             icon = "⏳"
@@ -730,8 +757,11 @@ async def _broadcast_group_lesson_progress(
     Telegram chat (Guruh_TG_Chat_ID). It never contains student names, absences
     or debts. Returns True only when the message was delivered; never raises.
     """
-    group_tg_id = _parse_int(group.get("Guruh_TG_Chat_ID") if group else None)
-    if not group_tg_id:
+    if not group or not _parse_int(group.get("Guruh_TG_Chat_ID")):
+        logging.getLogger(__name__).info(
+            "[GROUP_MSG] Lesson progress skipped for %r: no group chat linked",
+            group_name,
+        )
         return False
     clean_topic = " ".join(str(topic or "").split())
     topic_line = (
@@ -750,7 +780,7 @@ async def _broadcast_group_lesson_progress(
         optional_topic_line=topic_line,
         teacher_name=html.escape(teacher_name or "—"),
     )
-    return await _safe_send(bot, group_tg_id, text)
+    return await send_group_chat_message(bot, group, text)
 
 
 async def _trigger_cycle_completion(
@@ -815,9 +845,8 @@ async def _trigger_cycle_completion(
             card_owner=owner_esc,
         )
 
-    group_tg_id = _parse_int(group.get("Guruh_TG_Chat_ID"))
-    if group_tg_id:
-        await _safe_send(bot, group_tg_id, _build_cycle_end_text("latn"))
+    if _parse_int(group.get("Guruh_TG_Chat_ID")):
+        await send_group_chat_message(bot, group, _build_cycle_end_text("latn"))
 
     active_students = [
         s
@@ -1041,45 +1070,18 @@ async def cb_attendance_select_group(
         except ValueError:
             lesson_date = today_date
 
-        existing_marks = await asyncio.to_thread(
-            _get_existing_attendance_for_date_sync, sheets, group_name, lesson_date
-        )
-        students_min = [
-            {"Talaba_ID": s["Talaba_ID"], "F.I.O.": s["F.I.O."]}
-            for s in active_students
-        ]
-        marks_map = {
-            s["Talaba_ID"]: (
-                existing_marks[s["Talaba_ID"]]
-                if existing_marks.get(s["Talaba_ID"]) in {"✅", "❌"}
-                else "✅"
-            )
-            for s in students_min
-        }
-
-        await state.set_state(AttendanceStates.marking_students)
         await state.update_data(
             group_name=group_name,
             cycle_title_hint=cycle_title,
-            lesson_date=lesson_date.isoformat(),
-            students=students_min,
-            marks_map=marks_map,
         )
-        await callback.message.edit_text(
-            t(
-                "attendance_mark_title",
-                lang,
-                group=html.escape(group_name),
-                date=format_uz_date(lesson_date.strftime("%d.%m"), lang),
-            ),
-            reply_markup=attendance_marking_kb(
-                students_min,
-                marks_map,
-                lang,
-                back_cb="att_back:group",
-                include_topic_btn=False,
-            ),
-            parse_mode="HTML",
+        await _open_marking_or_session_picker(
+            callback.message,
+            state,
+            lang,
+            group_name,
+            lesson_date,
+            today_lessons,
+            back_cb="att_back:group",
         )
         await callback.answer()
         return
@@ -1165,59 +1167,33 @@ async def cb_attendance_select_date(
         return
 
     sheets = get_sheets_manager()
-    active_students = await asyncio.to_thread(
-        sheets.get_all_students, group_name, True
+    categorized = await sheets.a_get_group_lesson_dates_categorized(
+        group_name, today_str=today_date.strftime("%d.%m.%Y"), lang=lang
     )
-    if not active_students:
-        await state.clear()
-        await callback.message.edit_text(t("contacts_empty", lang))
-        await callback.answer()
-        return
-
-    existing_marks = await asyncio.to_thread(
-        _get_existing_attendance_for_date_sync, sheets, group_name, lesson_date
-    )
-    students_min = [
-        {"Talaba_ID": s["Talaba_ID"], "F.I.O.": s["F.I.O."]}
-        for s in active_students
+    date_entries = [
+        e
+        for e in (categorized.get("past_lessons") or [])
+        if str(e.get("full_date") or "") == lesson_date.isoformat()
     ]
-    marks_map = {
-        s["Talaba_ID"]: (
-            existing_marks[s["Talaba_ID"]]
-            if existing_marks.get(s["Talaba_ID"]) in {"✅", "❌"}
-            else "✅"
-        )
-        for s in students_min
-    }
-
-    await state.set_state(AttendanceStates.marking_students)
-    await state.update_data(
-        lesson_date=lesson_date.isoformat(),
-        students=students_min,
-        marks_map=marks_map,
-    )
-
-    await callback.message.edit_text(
-        t(
-            "attendance_mark_title",
-            lang,
-            group=html.escape(group_name),
-            date=format_uz_date(lesson_date.strftime("%d.%m"), lang),
-        ),
-        reply_markup=attendance_marking_kb(
-            students_min,
-            marks_map,
-            lang,
-            back_cb="att_back:date",
-            include_topic_btn=False,
-        ),
-        parse_mode="HTML",
+    await _open_marking_or_session_picker(
+        callback.message,
+        state,
+        lang,
+        group_name,
+        lesson_date,
+        date_entries,
+        back_cb="att_back:date",
     )
     await callback.answer()
 
 
 @router.callback_query(
-    AttendanceStates.marking_students, F.data.in_({"att_back:date", "att_back:group"})
+    StateFilter(
+        AttendanceStates.marking_students,
+        AttendanceStates.selecting_session,
+        AttendanceStates.confirming_cancel_today,
+    ),
+    F.data.in_({"att_back:date", "att_back:group"}),
 )
 async def cb_attendance_back(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user or not callback.message:
@@ -1303,14 +1279,23 @@ async def cb_attendance_toggle_student(
             students,
             marks_map,
             lang,
-            back_cb=back_cb,
+            back_cb=str(data.get("att_back_cb") or back_cb),
             include_topic_btn=False,
+            cancel_today_btn=str(data.get("lesson_date") or "")
+            == today_tashkent().isoformat(),
         )
     )
     await callback.answer()
 
 
-@router.callback_query(AttendanceStates.marking_students, F.data == "att_cancel")
+@router.callback_query(
+    StateFilter(
+        AttendanceStates.marking_students,
+        AttendanceStates.selecting_session,
+        AttendanceStates.confirming_cancel_today,
+    ),
+    F.data == "att_cancel",
+)
 async def cb_attendance_cancel_marking(
     callback: CallbackQuery, state: FSMContext
 ) -> None:
@@ -1346,14 +1331,20 @@ async def cb_attendance_finish_instant(
     is_past_date = sana_dmy != today_dmy
     date_display = format_uz_date(date_dm, lang)
 
+    lesson_session = _parse_int(data.get("lesson_session"))
     sheets = get_sheets_manager()
     previous_marks = await asyncio.to_thread(
-        _get_existing_attendance_for_date_sync, sheets, group_name, lesson_date
+        _get_existing_attendance_for_date_sync,
+        sheets,
+        group_name,
+        lesson_date,
+        lesson_session,
     )
     prev_was_marked = any(v in {"✅", "❌"} for v in previous_marks.values())
 
+    # Each session of a double-lesson day is its own column (+1 counter each).
     mark_result = await sheets.a_save_attendance_for_date(
-        group_name, date_dm, marks_map
+        group_name, date_dm, marks_map, session=lesson_session
     )
     cycle_title = mark_result.get("cycle_title") or cycle_title_hint
     was_unmarked = mark_result.get("was_unmarked")
@@ -1776,3 +1767,321 @@ async def cb_admin_report_toggle(callback: CallbackQuery) -> None:
         disable_web_page_preview=True,
     )
     await callback.answer()
+
+# ----------------------------------------------------------------------
+# Double lessons ("1-dars" / "2-dars") and "🚫 Bugungi dars bo‘lmaydi"
+# ----------------------------------------------------------------------
+
+
+def _session_suffix(session: Optional[int], lang: str) -> str:
+    return t("attendance_session_suffix", lang, n=int(session)) if session else ""
+
+
+async def _open_attendance_marking(
+    target_msg: Message,
+    state: FSMContext,
+    lang: str,
+    group_name: str,
+    lesson_date: date,
+    session: Optional[int],
+    back_cb: str,
+) -> None:
+    """Shows the ✅/❌ marking screen of one lesson (one session on double days)."""
+    sheets = get_sheets_manager()
+    active_students = await asyncio.to_thread(sheets.get_all_students, group_name, True)
+    if not active_students:
+        await state.clear()
+        await target_msg.edit_text(t("contacts_empty", lang))
+        return
+    existing_marks = await asyncio.to_thread(
+        _get_existing_attendance_for_date_sync, sheets, group_name, lesson_date, session
+    )
+    students_min = [
+        {"Talaba_ID": s["Talaba_ID"], "F.I.O.": s["F.I.O."]} for s in active_students
+    ]
+    marks_map = {
+        s["Talaba_ID"]: (
+            existing_marks[s["Talaba_ID"]]
+            if existing_marks.get(s["Talaba_ID"]) in {"✅", "❌"}
+            else "✅"
+        )
+        for s in students_min
+    }
+    await state.set_state(AttendanceStates.marking_students)
+    await state.update_data(
+        group_name=group_name,
+        lesson_date=lesson_date.isoformat(),
+        lesson_session=session,
+        students=students_min,
+        marks_map=marks_map,
+        att_back_cb=back_cb,
+    )
+    await _render_marking_screen(target_msg, state, lang)
+
+
+async def _render_marking_screen(target_msg: Message, state: FSMContext, lang: str) -> None:
+    data = await state.get_data()
+    group_name = str(data.get("group_name") or "")
+    lesson_date = date.fromisoformat(str(data["lesson_date"]))
+    session = _parse_int(data.get("lesson_session"))
+    await target_msg.edit_text(
+        t(
+            "attendance_mark_title",
+            lang,
+            group=html.escape(group_name),
+            date=format_uz_date(lesson_date.strftime("%d.%m"), lang),
+        )
+        + _session_suffix(session, lang),
+        reply_markup=attendance_marking_kb(
+            list(data.get("students") or []),
+            dict(data.get("marks_map") or {}),
+            lang,
+            back_cb=str(data.get("att_back_cb") or "att_back:group"),
+            include_topic_btn=False,
+            cancel_today_btn=lesson_date == today_tashkent(),
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def _open_marking_or_session_picker(
+    target_msg: Message,
+    state: FSMContext,
+    lang: str,
+    group_name: str,
+    lesson_date: date,
+    date_entries: list[dict[str, Any]],
+    back_cb: str,
+) -> None:
+    """
+    Double-lesson day (2 columns for the date) -> '1-dars' / '2-dars' picker;
+    otherwise straight to the marking screen of the date's only lesson.
+    """
+    sessions = sorted(
+        (e for e in date_entries if e.get("session")),
+        key=lambda e: int(e.get("session") or 1),
+    )
+    if len(sessions) > 1:
+        await state.set_state(AttendanceStates.selecting_session)
+        await state.update_data(
+            group_name=group_name,
+            lesson_date=lesson_date.isoformat(),
+            att_back_cb=back_cb,
+            att_sessions=[
+                {
+                    "session": int(e.get("session") or 1),
+                    "is_marked": bool(e.get("is_marked")),
+                    "is_cancelled": bool(e.get("is_cancelled")),
+                }
+                for e in sessions
+            ],
+        )
+        await target_msg.edit_text(
+            t(
+                "attendance_select_session",
+                lang,
+                group=html.escape(group_name),
+                date=format_uz_date(lesson_date.strftime("%d.%m"), lang),
+            ),
+            reply_markup=attendance_session_picker_kb(sessions, lang, back_cb=back_cb),
+            parse_mode="HTML",
+        )
+        return
+    only_session = (
+        int(sessions[0].get("session") or 1) if len(sessions) == 1 else None
+    )
+    await _open_attendance_marking(
+        target_msg, state, lang, group_name, lesson_date, only_session, back_cb
+    )
+
+
+@router.callback_query(AttendanceStates.selecting_session, F.data.startswith("att_sess:"))
+async def cb_attendance_select_session(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    data = await state.get_data()
+    group_name = str(data.get("group_name") or "")
+    if not group_name or not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+    session = _parse_int((callback.data or "").split(":", 1)[1])
+    known = {int(x.get("session") or 0): x for x in (data.get("att_sessions") or [])}
+    if session not in known:
+        await callback.answer()
+        return
+    if known[session].get("is_cancelled"):
+        await callback.answer(t("attendance_session_cancelled", lang), show_alert=True)
+        return
+    await _open_attendance_marking(
+        callback.message,
+        state,
+        lang,
+        group_name,
+        date.fromisoformat(str(data["lesson_date"])),
+        session,
+        str(data.get("att_back_cb") or "att_back:group"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AttendanceStates.marking_students, F.data == "att_cancel_today")
+async def cb_attendance_cancel_today_ask(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    """'🚫 Bugungi dars bo‘lmaydi' -> confirmation."""
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    data = await state.get_data()
+    group_name = str(data.get("group_name") or "")
+    if not group_name or not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+    lesson_date = date.fromisoformat(str(data["lesson_date"]))
+    if lesson_date != today_tashkent():
+        await callback.answer(t("lesson_not_today_only_today", lang), show_alert=True)
+        return
+    session = _parse_int(data.get("lesson_session"))
+    await state.set_state(AttendanceStates.confirming_cancel_today)
+    await callback.message.edit_text(
+        t(
+            "lesson_not_today_confirm",
+            lang,
+            group=html.escape(group_name),
+            date=format_uz_date_long(lesson_date, lang),
+            session_line=_session_suffix(session, lang),
+        ),
+        reply_markup=attendance_cancel_today_confirm_kb(lang),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    AttendanceStates.confirming_cancel_today, F.data.startswith("att_cancel_today:")
+)
+async def cb_attendance_cancel_today_decide(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    data = await state.get_data()
+    group_name = str(data.get("group_name") or "")
+    choice = (callback.data or "").split(":", 1)[1]
+    if choice != "yes":
+        await state.set_state(AttendanceStates.marking_students)
+        await _render_marking_screen(callback.message, state, lang)
+        await callback.answer()
+        return
+    if not group_name or not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+
+    lesson_date = date.fromisoformat(str(data["lesson_date"]))
+    session = _parse_int(data.get("lesson_session"))
+    if lesson_date != today_tashkent():
+        await callback.answer(t("lesson_not_today_only_today", lang), show_alert=True)
+        return
+    if await is_lesson_cancelled(group_name, lesson_date.isoformat(), session or 0):
+        await state.clear()
+        await callback.message.edit_text(
+            t("lesson_not_today_already", lang, group=html.escape(group_name)),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    sheets = get_sheets_manager()
+    try:
+        # Column -> "Qoldirildi" (muted gray) + 1 replacement column at the end.
+        # Otilgan_Dars_Hisoblagich is NOT incremented (+0).
+        result = await sheets.a_cancel_lesson_and_shift_date(
+            group_name, lesson_date, session=session, muted=True
+        )
+    except Exception:
+        logger.exception("Teacher lesson cancel failed for %s %s", group_name, lesson_date)
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+
+    new_date = result.get("new_lesson_date")
+    new_session = result.get("new_session")
+    group = await sheets.a_get_group(group_name) or {}
+    is_double = get_group_daily_lessons(group) >= 2
+    new_date_iso = new_date.isoformat() if isinstance(new_date, date) else ""
+    await record_cancelled_lesson(
+        group_name,
+        lesson_date.isoformat(),
+        session or 0,
+        cancelled_by=user_id,
+        replacement_date=new_date_iso,
+    )
+    await state.clear()
+
+    def _new_date_text(l_code: str) -> str:
+        if not isinstance(new_date, date):
+            return "—"
+        text = format_uz_date_long(new_date, l_code)
+        if is_double and new_session:
+            text += _session_suffix(int(new_session), l_code)
+        return text
+
+    counter = _parse_int(group.get("Otilgan_Dars_Hisoblagich")) or 0
+    total = _parse_int(group.get("Oylik_Dars_Soni")) or 12
+    await callback.message.edit_text(
+        t(
+            "lesson_not_today_done",
+            lang,
+            group=html.escape(group_name),
+            date=format_uz_date_long(lesson_date, lang),
+            session_line=_session_suffix(session, lang),
+            new_date=_new_date_text(lang),
+            counter=counter,
+            total=total,
+        ),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+    teacher_name = await _resolve_teacher_name(
+        sheets, group, user_id, callback.from_user.full_name or str(user_id)
+    )
+    if group:
+        await send_group_chat_message(
+            callback.bot,
+            group,
+            t(
+                "lesson_not_today_group_notice",
+                "latn",
+                group=html.escape(group_name),
+                date=format_uz_date_long(lesson_date, "latn"),
+                session_line=_session_suffix(session, "latn"),
+                new_date=_new_date_text("latn"),
+                teacher_name=html.escape(teacher_name or "—"),
+            ),
+        )
+    students = await asyncio.to_thread(sheets.get_all_students, group_name, True)
+    for stu in students:
+        stu_cid = _parse_int(stu.get("Talaba_Chat_ID"))
+        if not stu_cid:
+            continue
+        s_lang = await get_user_lang(stu_cid)
+        await _safe_send(
+            callback.bot,
+            stu_cid,
+            t(
+                "lesson_not_today_group_notice",
+                s_lang,
+                group=html.escape(group_name),
+                date=format_uz_date_long(lesson_date, s_lang),
+                session_line=_session_suffix(session, s_lang),
+                new_date=_new_date_text(s_lang),
+                teacher_name=html.escape(teacher_name or "—"),
+            ),
+        )

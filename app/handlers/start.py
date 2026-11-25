@@ -25,8 +25,9 @@ from app import database
 from app import states as app_states
 from app.scheduler import schedule_group_initial_notice
 from app.utils import legacy_group_join_slug, make_group_join_slug, now_tashkent
-from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
+from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ, is_main_admin
 from app.database import (
+    set_group_tg_chat_id,
     activate_teacher_invite,
     add_user_role,
     create_join_request,
@@ -58,6 +59,8 @@ from app.database import (
 )
 from app.debt_view import format_uzs, get_group_monthly_fee
 from app.keyboards import (
+    MAIN_ROLE_CHOICES,
+    main_admin_role_switch_kb,
     build_dual_role_approval_kb,
     cancel_reply_kb,
     enroll_choice_kb,
@@ -125,6 +128,8 @@ CHANGE_LANG_BUTTON_TEXTS = button_texts("btn_change_lang")
 SWITCH_ROLE_BUTTON_TEXTS = button_texts(
     "btn_switch_to_parent", "btn_switch_to_student"
 )
+# Main admin only: "🔄 Rolni almashtirish" (Admin / Ustoz / Talaba / Ota-ona).
+MAIN_ROLE_SWITCH_TEXTS = button_texts("btn_role_switch")
 # Current labels plus the legacy ones, so old reply keyboards keep working.
 PROFILE_MENU_TEXTS = button_texts("menu_profile")
 CANCEL_TEXTS = {t("btn_cancel", "latn"), t("btn_cancel", "cyrl")}
@@ -2995,6 +3000,74 @@ async def handle_switch_active_role(
     )
 
 
+@router.message(F.chat.type == ChatType.PRIVATE, F.text.in_(MAIN_ROLE_SWITCH_TEXTS))
+async def cmd_main_admin_role_switch(message: Message, state: FSMContext) -> None:
+    """Role picker for the MAIN admin only; everyone else is refused."""
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    if not is_main_admin(user_id):
+        logger.warning("Role switch refused for non-main admin %s", user_id)
+        await message.answer(t("role_switch_forbidden", lang), parse_mode="HTML")
+        return
+    await state.clear()
+    db_user = await get_user(user_id)
+    current = str((db_user or {}).get("active_role") or "admin")
+    if current not in MAIN_ROLE_CHOICES:
+        current = "admin"
+    await message.answer(
+        t("role_switch_prompt", lang),
+        reply_markup=main_admin_role_switch_kb(current, lang),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("main_role:"))
+async def cb_main_admin_role_switch(
+    callback: CallbackQuery, sheets: Optional[SheetsManager] = None
+) -> None:
+    if not callback.from_user:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not is_main_admin(user_id):
+        # Secondary admins / other users can never switch roles.
+        await callback.answer(
+            re.sub(r"<[^>]+>", "", t("role_switch_forbidden", lang)), show_alert=True
+        )
+        return
+    role = (callback.data or "").split(":", 1)[1]
+    if role == "__cancel__":
+        if callback.message:
+            await callback.message.edit_text(t("role_switch_cancelled", lang))
+        await callback.answer()
+        return
+    if role not in MAIN_ROLE_CHOICES:
+        await callback.answer()
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET active_role = ? WHERE telegram_id = ?;", (role, user_id)
+        )
+        await db.commit()
+    sheets_mgr = sheets or get_sheets_manager()
+    display_name = callback.from_user.full_name or "Admin"
+    role_label = t(f"role_switch_{role}", lang)
+    if callback.message:
+        await callback.message.edit_text(
+            t("role_switch_done", lang, role=html.escape(role_label)),
+            parse_mode="HTML",
+        )
+        greeting = await _welcome_menu_text(user_id, display_name, role, lang, sheets_mgr)
+        await callback.message.answer(
+            _with_signature(greeting, lang),
+            reply_markup=build_main_menu(role, lang),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "global_cancel_fsm")
 async def cb_global_cancel_fsm(
     callback: CallbackQuery,
@@ -5076,6 +5149,7 @@ async def cmd_link_group(
 
     canonical_group = group["Guruh_Nomi"]
     await sheets_mgr.a_link_group_tg_chat(canonical_group, message.chat.id)
+    await set_group_tg_chat_id(canonical_group, str(message.chat.id))
     await message.reply(
         _with_signature(
             t("link_group_success", "latn", group=html.escape(canonical_group)),

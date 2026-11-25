@@ -445,6 +445,26 @@ def guest_menu_kb(lang: str = "latn") -> ReplyKeyboardMarkup:
     return builder.as_markup(resize_keyboard=True)
 
 
+MAIN_ROLE_CHOICES: tuple[str, ...] = ("admin", "teacher", "student", "parent")
+
+
+def main_admin_role_switch_kb(
+    current_role: str = "admin", lang: str = "latn"
+) -> InlineKeyboardMarkup:
+    """Main admin only: 👑 Admin / 👨‍🏫 Ustoz / 🎓 Talaba / 👨‍👩‍👧 Ota-ona (2 per row)."""
+    builder = InlineKeyboardBuilder()
+    buttons: list[InlineKeyboardButton] = []
+    for role in MAIN_ROLE_CHOICES:
+        label = t(f"role_switch_{role}", lang)
+        if role == current_role:
+            label = f"✅ {label}"
+        buttons.append(_btn(label, f"main_role:{role}"))
+    for i in range(0, len(buttons), 2):
+        builder.row(*buttons[i : i + 2])
+    builder.row(_btn(t("btn_cancel", lang), "main_role:__cancel__"))
+    return builder.as_markup()
+
+
 def get_main_menu_kb(
     role: str, lang: str = "latn", has_dual_role: bool = False
 ) -> ReplyKeyboardMarkup:
@@ -757,18 +777,32 @@ def lesson_time_mode_kb(
     back_cb: Optional[str] = None,
     cancel_cb: Optional[str] = None,
     keep_cb: Optional[str] = None,
+    daily_lessons: int = 1,
 ) -> InlineKeyboardMarkup:
     """
-    The two lesson-time options shown after the days are chosen:
-    '🕒 Hamma kunlarga bir xil vaqt' / '⚙️ Har bir kun uchun alohida vaqt'.
-    Callback data: '<prefix>:time_mode:uniform' / '<prefix>:time_mode:perday'.
+    Lesson-time options shown after the days are chosen:
+    - lessons per day toggle: '1️⃣ Kuniga 1 ta dars' / '2️⃣ Kuniga 2 ta dars
+      (Juft dars)' ('<prefix>:daily:1' / '<prefix>:daily:2', current one ✅);
+    - '🕒 Hamma kunlarga bir xil vaqt' / '⚙️ Har bir kun uchun alohida vaqt'
+      ('<prefix>:time_mode:uniform' / '<prefix>:time_mode:perday');
+    - '⏭ Vaqtni o‘tkazib yuborish (Kelishilgan vaqtda)' ('<prefix>:time_mode:agreed').
     """
     builder = InlineKeyboardBuilder()
+    is_double = int(daily_lessons or 1) >= 2
+    one_lbl = t("btn_daily_lessons_1", lang)
+    two_lbl = t("btn_daily_lessons_2", lang)
+    builder.row(
+        _btn(f"✅ {one_lbl}" if not is_double else one_lbl, f"{prefix}:daily:1"),
+        _btn(f"✅ {two_lbl}" if is_double else two_lbl, f"{prefix}:daily:2"),
+    )
     builder.row(
         _btn(t("btn_lesson_time_uniform", lang), f"{prefix}:time_mode:uniform")
     )
     builder.row(
         _btn(t("btn_lesson_time_per_day", lang), f"{prefix}:time_mode:perday")
+    )
+    builder.row(
+        _btn(t("btn_lesson_time_agreed", lang), f"{prefix}:time_mode:agreed")
     )
     if keep_cb:
         builder.row(
@@ -1184,7 +1218,7 @@ def attendance_date_picker_kb(
     cancel_cb: str = "att_cancel",
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for item in dates_info:
+    for item in _unique_dates(dates_info):
         date_str = item["date_str"]
         weekday = item.get("weekday") or ""
         if item.get("is_cancelled"):
@@ -1218,6 +1252,7 @@ def attendance_marking_kb(
     back_cb: str = "att_back:date",
     include_topic_btn: bool = True,
     topic_cb: str = "att_topic_current",
+    cancel_today_btn: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for s in students:
@@ -1236,7 +1271,47 @@ def attendance_marking_kb(
         action_row.append(_btn(_lbl("att_topic_btn", lang), topic_cb))
     action_row.append(_btn(t("btn_finish", lang), "att_finish"))
     builder.row(*action_row)
+    if cancel_today_btn:
+        # Teacher: today's lesson will not take place (counter stays +0).
+        builder.row(_btn(t("btn_lesson_not_today", lang), "att_cancel_today"))
     _nav_row(builder, lang=lang, back_cb=back_cb, cancel_cb="att_cancel")
+    return builder.as_markup()
+
+
+def attendance_session_picker_kb(
+    sessions: list[dict],
+    lang: str = "latn",
+    back_cb: str = "att_back:group",
+) -> InlineKeyboardMarkup:
+    """'1-dars' / '2-dars' picker of a double-lesson day (2 buttons per row)."""
+    builder = InlineKeyboardBuilder()
+    buttons: list[InlineKeyboardButton] = []
+    for item in sessions:
+        session = int(item.get("session") or 1)
+        if item.get("is_cancelled"):
+            icon = "🚫"
+        elif item.get("is_marked"):
+            icon = "✅"
+        else:
+            icon = "⏳"
+        buttons.append(
+            _btn(
+                t("attendance_session_btn", lang, n=session, icon=icon),
+                f"att_sess:{session}",
+            )
+        )
+    for i in range(0, len(buttons), 2):
+        builder.row(*buttons[i : i + 2])
+    _nav_row(builder, lang=lang, back_cb=back_cb, cancel_cb="att_cancel")
+    return builder.as_markup()
+
+
+def attendance_cancel_today_confirm_kb(lang: str = "latn") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        _btn(t("btn_lesson_not_today_confirm", lang), "att_cancel_today:yes"),
+        _btn(t("btn_back", lang), "att_cancel_today:no"),
+    )
     return builder.as_markup()
 
 
@@ -1255,6 +1330,19 @@ def topic_group_action_kb(
     return builder.as_markup()
 
 
+def _unique_dates(dates_info: list[dict]) -> list[dict]:
+    """One entry per date: double-lesson days ("DD.MM (1)/(2)") share a date."""
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in dates_info:
+        key = str(item.get("full_date") or item.get("date_str") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def topic_dates_kb(
     dates_info: list[dict],
     lang: str = "latn",
@@ -1262,7 +1350,7 @@ def topic_dates_kb(
     cancel_cb: str = "topic_cancel",
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for item in dates_info:
+    for item in _unique_dates(dates_info):
         date_str = item["date_str"]
         weekday = item.get("weekday") or ""
         if item.get("is_cancelled"):

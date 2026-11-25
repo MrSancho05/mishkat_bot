@@ -14,9 +14,13 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
     TelegramObject,
 )
+
+from app.config import is_main_admin
 
 from app.database import (
     get_callback_token_data,
@@ -48,6 +52,7 @@ _MAIN_MENU_KEYS = (
     "menu_parent_payments",
     "btn_change_lang",
     "menu_admin_courses",
+    "btn_role_switch",
     "menu_guest_courses",
     "menu_guest_enroll",
     "menu_guest_contact",
@@ -275,3 +280,47 @@ class CallbackTokenResolverMiddleware(BaseMiddleware):
                     return None
                 event = event.model_copy(update={"data": original})
         return await handler(event, data)
+
+
+# ----------------------------------------------------------------------
+# "🔄 Rolni almashtirish" — injected ONLY into the main admin's main menus
+# ----------------------------------------------------------------------
+
+ROLE_SWITCH_TEXTS: set[str] = button_texts("btn_role_switch")
+_MAIN_MENU_MARKER_TEXTS: set[str] = button_texts("btn_change_lang")
+
+
+class MainAdminRoleSwitchMenuMiddleware(BaseRequestMiddleware):
+    """
+    Outgoing (bot.session) middleware: every main-menu reply keyboard (it always
+    contains the 🌐 language button) sent to the MAIN admin (ADMIN_ID / first
+    ADMIN_IDS) gets a '🔄 Rolni almashtirish' row — whichever role's menu
+    (Admin / Ustoz / Talaba / Ota-ona) is being shown. Secondary admins and
+    everyone else never receive the button.
+    """
+
+    async def __call__(
+        self,
+        make_request: NextRequestMiddlewareType,
+        bot: Any,
+        method: Any,
+    ) -> Any:
+        markup = getattr(method, "reply_markup", None)
+        chat_id = getattr(method, "chat_id", None)
+        if isinstance(markup, ReplyKeyboardMarkup) and is_main_admin(chat_id):
+            texts = {btn.text for row in markup.keyboard for btn in row}
+            if texts & _MAIN_MENU_MARKER_TEXTS and not texts & ROLE_SWITCH_TEXTS:
+                try:
+                    lang = await get_user_lang(int(str(chat_id)))
+                    new_rows = [list(row) for row in markup.keyboard]
+                    new_rows.append([KeyboardButton(text=t("btn_role_switch", lang))])
+                    method = method.model_copy(
+                        update={
+                            "reply_markup": markup.model_copy(
+                                update={"keyboard": new_rows}
+                            )
+                        }
+                    )
+                except Exception:
+                    _mw_logger.exception("Could not add the role switch button")
+        return await make_request(bot, method)
