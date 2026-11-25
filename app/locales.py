@@ -1,3 +1,4 @@
+import re
 from typing import Any, Optional
 
 MONTHS_UPPER_LATN: dict[int, str] = {
@@ -175,6 +176,7 @@ FIELD_LABELS: dict[str, dict[str, str]] = {
         "Oylik_Tolov_Summa": "Oylik to'lov summasi",
         "Guruh_TG_Chat_ID": "Guruh Telegram kanali/guruhi",
         "Boshlanish_Sanasi": "Boshlanish sanasi",
+        "Kunlik_Dars_Soni": "Kunlik darslar soni",
         "Ustoz_ID": "Ustoz",
         "Ustoz": "Ustoz",
     },
@@ -187,6 +189,7 @@ FIELD_LABELS: dict[str, dict[str, str]] = {
         "Oylik_Tolov_Summa": "Ойлик тўлов суммаси",
         "Guruh_TG_Chat_ID": "Гуруҳ Telegram канали/гуруҳи",
         "Boshlanish_Sanasi": "Бошланиш санаси",
+        "Kunlik_Dars_Soni": "Кунлик дарслар сони",
         "Ustoz_ID": "Устоз",
         "Ustoz": "Устоз",
     },
@@ -761,6 +764,98 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_grp_edit_count": "🔢 Oylik darslar sonini o‘zgartirish",
         "btn_grp_edit_chat": "💬 Guruh chat ID ni o‘zgartirish",
         "btn_grp_edit_start": "📅 Boshlanish sanasini o‘zgartirish",
+        "btn_grp_edit_daily": "🔁 Kunlik darslar sonini o‘zgartirish",
+        # Lessons per day / agreed time
+        "btn_daily_lessons_1": "1️⃣ Kuniga 1 ta dars",
+        "btn_daily_lessons_2": "2️⃣ Kuniga 2 ta dars (Juft dars)",
+        "daily_lessons_line_single": "🔁 Kunlik darslar: <b>1 ta dars</b>",
+        "daily_lessons_line_double": "🔁 Kunlik darslar: <b>2 ta dars (Juft dars)</b>",
+        "btn_lesson_time_agreed": "⏭ Vaqtni o‘tkazib yuborish (Kelishilgan vaqtda)",
+        "lesson_time_agreed_saved": "⏭ Dars vaqti: Kelishilgan vaqtda",
+        "agreed_time_label": "Kelishilgan vaqtda",
+        "lesson_time_enter_double": (
+            "⏰ <b>Juft dars</b>: har bir dars kuni uchun ikkita vaqt kiriting.\n"
+            "Masalan: <code>10:00 / 11:30</code>"
+        ),
+        "lesson_time_day_double_hint": (
+            "🔁 Juft dars: ikkita vaqtni kiriting, masalan <code>10:00 / 11:30</code>"
+        ),
+        "lesson_time_invalid_double": (
+            "❌ Noto‘g‘ri format. Ikkita vaqtni <code>10:00 / 11:30</code> ko‘rinishida "
+            "kiriting (ikkinchi dars birinchisidan keyin bo‘lishi kerak):"
+        ),
+        "agreed_time_teacher_reminder": (
+            "👨‍🏫 Ertaga <b>{guruh_nomi}</b> individual guruhi bilan dars kuningiz "
+            "({hafta_kuni}). Vaqt kelishilgan tartibda belgilangan — talaba bilan "
+            "dars vaqtini kelishib olishingizni eslatamiz.\n\n"
+            "Hurmat bilan, Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        # Attendance: double lessons + "🚫 Bugungi dars bo‘lmaydi"
+        "attendance_select_session": (
+            "📋 <b>{group}</b> — {date}\n\n"
+            "Bu kunda 2 ta dars bor. Qaysi dars uchun yo‘qlama qilasiz?"
+        ),
+        "attendance_session_btn": "{n}-dars {icon}",
+        "attendance_session_suffix": " — <b>{n}-dars</b>",
+        "attendance_session_cancelled": "🚫 Bu dars bekor qilingan.",
+        "btn_lesson_not_today": "🚫 Bugungi dars bo‘lmaydi",
+        "btn_lesson_not_today_confirm": "✅ Ha, dars bo‘lmaydi",
+        "lesson_not_today_only_today": "ℹ️ Bu tugma faqat bugungi dars uchun ishlaydi.",
+        "lesson_not_today_confirm": (
+            "🚫 <b>Bugungi dars bo‘lmaydimi?</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "📅 Sana: <b>{date}</b>{session_line}\n\n"
+            "Darslar hisoblagichi oshirilmaydi, ushbu dars o‘quv oyining oxiriga "
+            "qo‘shimcha dars sifatida ko‘chiriladi."
+        ),
+        "lesson_not_today_done": (
+            "✅ <b>Bugungi dars bekor qilindi.</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "📅 Sana: <b>{date}</b>{session_line}\n"
+            "➡️ O‘rniga qo‘shimcha dars: <b>{new_date}</b>\n"
+            "🔢 O‘tilgan darslar: <b>{counter}/{total}</b> (o‘zgarmadi)"
+        ),
+        "lesson_not_today_already": "ℹ️ <b>{group}</b> guruhining bugungi darsi allaqachon bekor qilingan.",
+        "lesson_not_today_group_notice": (
+            "🚫 <b>Bugungi dars bo‘lmaydi</b>\n\n"
+            "📚 Guruh: <b>{group}</b>\n"
+            "📅 Sana: <b>{date}</b>{session_line}\n"
+            "➡️ Dars o‘quv oyi oxiriga ko‘chirildi: <b>{new_date}</b>\n\n"
+            "👨‍🏫 Ustoz: {teacher_name}\n"
+            "Hurmat bilan, Mishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        # Admin alert: attendance not marked 2 hours after the lesson
+        "attendance_alert_session_line": "\n🔁 Dars: <b>{n}-dars</b>",
+        "attendance_missing_admin_alert": (
+            "⚠️ <b>Yo‘qlama qilinmadi!</b>\n\n"
+            "Dars boshlanganiga <b>2 soatdan</b> oshdi, lekin yo‘qlama hali "
+            "belgilanmagan.\n\n"
+            "📚 Guruh: <b>{guruh_nomi}</b>\n"
+            "👨‍🏫 Ustoz: <b>{ustoz_ismi}</b>\n"
+            "📞 Aloqa: {ustoz_aloqa}\n"
+            "📅 Sana: <b>{sana}</b>\n"
+            "⏰ Dars vaqti: <b>{dars_vaqti}</b>{session_line}"
+        ),
+        "attendance_missing_admin_alert_agreed": (
+            "⚠️ <b>Yo‘qlama qilinmadi!</b>\n\n"
+            "Individual guruhning bugungi dars kuni (vaqt kelishilgan tartibda) "
+            "uchun soat 21:00 gacha yo‘qlama belgilanmadi.\n\n"
+            "📚 Guruh: <b>{guruh_nomi}</b>\n"
+            "👨‍🏫 Ustoz: <b>{ustoz_ismi}</b>\n"
+            "📞 Aloqa: {ustoz_aloqa}\n"
+            "📅 Sana: <b>{sana}</b>\n"
+            "⏰ Dars vaqti: <b>{dars_vaqti}</b>{session_line}"
+        ),
+        # Main admin role switcher
+        "btn_role_switch": "🔄 Rolni almashtirish",
+        "role_switch_prompt": "🔄 <b>Rolni almashtirish</b>\n\nQaysi rol menyusiga o‘tasiz?",
+        "role_switch_admin": "👑 Admin",
+        "role_switch_teacher": "👨‍🏫 Ustoz",
+        "role_switch_student": "🎓 Talaba",
+        "role_switch_parent": "👨‍👩‍👧 Ota-ona",
+        "role_switch_done": "✅ Rol almashtirildi: <b>{role}</b>",
+        "role_switch_cancelled": "❌ Rolni almashtirish bekor qilindi.",
+        "role_switch_forbidden": "⛔️ Rolni almashtirish faqat asosiy admin uchun mavjud.",
         "group_edit_extra_info": (
             "📅 Boshlanish sanasi: <b>{start}</b>\n"
             "💬 Guruh chat ID: <code>{chat}</code>"
@@ -2107,6 +2202,98 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_grp_edit_count": "🔢 Ойлик дарслар сонини ўзгартириш",
         "btn_grp_edit_chat": "💬 Гуруҳ чат ID ни ўзгартириш",
         "btn_grp_edit_start": "📅 Бошланиш санасини ўзгартириш",
+        "btn_grp_edit_daily": "🔁 Кунлик дарслар сонини ўзгартириш",
+        # Lessons per day / agreed time
+        "btn_daily_lessons_1": "1️⃣ Кунига 1 та дарс",
+        "btn_daily_lessons_2": "2️⃣ Кунига 2 та дарс (Жуфт дарс)",
+        "daily_lessons_line_single": "🔁 Кунлик дарслар: <b>1 та дарс</b>",
+        "daily_lessons_line_double": "🔁 Кунлик дарслар: <b>2 та дарс (Жуфт дарс)</b>",
+        "btn_lesson_time_agreed": "⏭ Вақтни ўтказиб юбориш (Келишилган вақтда)",
+        "lesson_time_agreed_saved": "⏭ Дарс вақти: Келишилган вақтда",
+        "agreed_time_label": "Келишилган вақтда",
+        "lesson_time_enter_double": (
+            "⏰ <b>Жуфт дарс</b>: ҳар бир дарс куни учун иккита вақт киритинг.\n"
+            "Масалан: <code>10:00 / 11:30</code>"
+        ),
+        "lesson_time_day_double_hint": (
+            "🔁 Жуфт дарс: иккита вақтни киритинг, масалан <code>10:00 / 11:30</code>"
+        ),
+        "lesson_time_invalid_double": (
+            "❌ Нотўғри формат. Иккита вақтни <code>10:00 / 11:30</code> кўринишида "
+            "киритинг (иккинчи дарс биринчисидан кейин бўлиши керак):"
+        ),
+        "agreed_time_teacher_reminder": (
+            "👨‍🏫 Эртага <b>{guruh_nomi}</b> индивидуал гуруҳи билан дарс кунингиз "
+            "({hafta_kuni}). Вақт келишилган тартибда белгиланган — талаба билан "
+            "дарс вақтини келишиб олишингизни эслатамиз.\n\n"
+            "Ҳурмат билан, Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        # Attendance: double lessons + "🚫 Бугунги дарс бўлмайди"
+        "attendance_select_session": (
+            "📋 <b>{group}</b> — {date}\n\n"
+            "Бу кунда 2 та дарс бор. Қайси дарс учун йўқлама қиласиз?"
+        ),
+        "attendance_session_btn": "{n}-дарс {icon}",
+        "attendance_session_suffix": " — <b>{n}-дарс</b>",
+        "attendance_session_cancelled": "🚫 Бу дарс бекор қилинган.",
+        "btn_lesson_not_today": "🚫 Бугунги дарс бўлмайди",
+        "btn_lesson_not_today_confirm": "✅ Ҳа, дарс бўлмайди",
+        "lesson_not_today_only_today": "ℹ️ Бу тугма фақат бугунги дарс учун ишлайди.",
+        "lesson_not_today_confirm": (
+            "🚫 <b>Бугунги дарс бўлмайдими?</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "📅 Сана: <b>{date}</b>{session_line}\n\n"
+            "Дарслар ҳисоблагичи оширилмайди, ушбу дарс ўқув ойининг охирига "
+            "қўшимча дарс сифатида кўчирилади."
+        ),
+        "lesson_not_today_done": (
+            "✅ <b>Бугунги дарс бекор қилинди.</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "📅 Сана: <b>{date}</b>{session_line}\n"
+            "➡️ Ўрнига қўшимча дарс: <b>{new_date}</b>\n"
+            "🔢 Ўтилган дарслар: <b>{counter}/{total}</b> (ўзгармади)"
+        ),
+        "lesson_not_today_already": "ℹ️ <b>{group}</b> гуруҳининг бугунги дарси аллақачон бекор қилинган.",
+        "lesson_not_today_group_notice": (
+            "🚫 <b>Бугунги дарс бўлмайди</b>\n\n"
+            "📚 Гуруҳ: <b>{group}</b>\n"
+            "📅 Сана: <b>{date}</b>{session_line}\n"
+            "➡️ Дарс ўқув ойи охирига кўчирилди: <b>{new_date}</b>\n\n"
+            "👨‍🏫 Устоз: {teacher_name}\n"
+            "Ҳурмат билан, Мишкат Нодавлат Таълим Муассасаси!"
+        ),
+        # Admin alert: attendance not marked 2 hours after the lesson
+        "attendance_alert_session_line": "\n🔁 Дарс: <b>{n}-дарс</b>",
+        "attendance_missing_admin_alert": (
+            "⚠️ <b>Йўқлама қилинмади!</b>\n\n"
+            "Дарс бошланганига <b>2 соатдан</b> ошди, лекин йўқлама ҳали "
+            "белгиланмаган.\n\n"
+            "📚 Гуруҳ: <b>{guruh_nomi}</b>\n"
+            "👨‍🏫 Устоз: <b>{ustoz_ismi}</b>\n"
+            "📞 Алоқа: {ustoz_aloqa}\n"
+            "📅 Сана: <b>{sana}</b>\n"
+            "⏰ Дарс вақти: <b>{dars_vaqti}</b>{session_line}"
+        ),
+        "attendance_missing_admin_alert_agreed": (
+            "⚠️ <b>Йўқлама қилинмади!</b>\n\n"
+            "Индивидуал гуруҳнинг бугунги дарс куни (вақт келишилган тартибда) "
+            "учун соат 21:00 гача йўқлама белгиланмади.\n\n"
+            "📚 Гуруҳ: <b>{guruh_nomi}</b>\n"
+            "👨‍🏫 Устоз: <b>{ustoz_ismi}</b>\n"
+            "📞 Алоқа: {ustoz_aloqa}\n"
+            "📅 Сана: <b>{sana}</b>\n"
+            "⏰ Дарс вақти: <b>{dars_vaqti}</b>{session_line}"
+        ),
+        # Main admin role switcher
+        "btn_role_switch": "🔄 Ролни алмаштириш",
+        "role_switch_prompt": "🔄 <b>Ролни алмаштириш</b>\n\nҚайси рол менюсига ўтасиз?",
+        "role_switch_admin": "👑 Админ",
+        "role_switch_teacher": "👨‍🏫 Устоз",
+        "role_switch_student": "🎓 Талаба",
+        "role_switch_parent": "👨‍👩‍👧 Ота-она",
+        "role_switch_done": "✅ Рол алмаштирилди: <b>{role}</b>",
+        "role_switch_cancelled": "❌ Ролни алмаштириш бекор қилинди.",
+        "role_switch_forbidden": "⛔️ Ролни алмаштириш фақат асосий админ учун мавжуд.",
         "group_edit_extra_info": (
             "📅 Бошланиш санаси: <b>{start}</b>\n"
             "💬 Гуруҳ чат ID: <code>{chat}</code>"
@@ -3080,6 +3267,10 @@ def format_uz_date(date_str: str, lang: str = "latn") -> str:
     cleaned = str(date_str or "").strip()
     if not cleaned:
         return ""
+    # Double-lesson headers: "05.11 (2)" -> "5-noyabr (2)"
+    session_match = re.match(r"^(\d{1,2}\.\d{1,2}(?:\.\d{4})?)\s*\((\d)\)$", cleaned)
+    if session_match:
+        return f"{format_uz_date(session_match.group(1), lang)} ({session_match.group(2)})"
     safe_lang = lang if lang in MONTHS_UZ else "latn"
     parts = cleaned.split(".")
     if len(parts) not in (2, 3):

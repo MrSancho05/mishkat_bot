@@ -18,6 +18,7 @@ from aiogram.types import (
 
 from app.utils import format_lesson_time_display, today_tashkent
 from app.config import ADMIN_IDS, DB_PATH, TZ
+from app.scheduler import normalize_chat_id_text, send_group_chat_message
 from app.database import (
     get_group_topics_history,
     get_lesson_topic,
@@ -224,7 +225,7 @@ def _topic_phone_key(phone: Any) -> str:
 
 
 def _parse_int_chat_id(raw: Any) -> Optional[int]:
-    val = str(raw or "").strip()
+    val = normalize_chat_id_text(raw)
     if not val:
         return None
     try:
@@ -497,21 +498,8 @@ async def publish_group_topics(
                 teacher_name=teacher_name,
                 lang="latn",
             )
-            try:
-                await bot.send_message(
-                    chat_id=grp_tg_cid,
-                    text=grp_msg,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+            if await send_group_chat_message(bot, group, grp_msg):
                 sent_count += 1
-            except Exception as exc:
-                logger.warning(
-                    "Topic broadcast to group chat %s (%s) failed: %s",
-                    grp_tg_cid,
-                    group_name,
-                    exc,
-                )
 
     # 2. Students & Parents (deduplicated per (parent_chat_id, group_name))
     seen_dm_group: set[tuple[int, str]] = set()

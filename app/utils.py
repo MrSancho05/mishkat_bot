@@ -108,6 +108,26 @@ _PER_DAY_ENTRY_RE = _re.compile(
     r"^\s*([^\W\d_]+)\.?\s*[-:=]?\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*$",
     _re.UNICODE,
 )
+# Double lessons ("Juft dars"): "10:00 / 11:30" for every day, or per day
+# "Shan 10:00 / 11:30, Yak 14:00 / 15:30".
+_TIME_PAIR_RE = _re.compile(
+    r"^\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*(?:/|\||\s)\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*$"
+)
+_PER_DAY_PAIR_ENTRY_RE = _re.compile(
+    r"^\s*([^\W\d_]+)\.?\s*[-:=]?\s*(\d{1,2})\s*[:.]\s*(\d{2})"
+    r"\s*(?:/|\|)\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*$",
+    _re.UNICODE,
+)
+
+# Individual groups whose time is agreed with the student each time.
+AGREED_LESSON_TIME = "Kelishilgan vaqtda"
+AGREED_LESSON_TIME_CYRL = "Келишилган вақтда"
+
+
+def is_agreed_lesson_time(dars_vaqti: object) -> bool:
+    """True for the 'Kelishilgan vaqtda' (flexible / agreed time) marker."""
+    raw = " ".join(str(dars_vaqti or "").split()).casefold()
+    return raw.startswith("kelishilgan") or raw.startswith("келишилган")
 
 
 def normalize_hhmm(raw: object) -> Optional[str]:
@@ -121,30 +141,104 @@ def normalize_hhmm(raw: object) -> Optional[str]:
     return None
 
 
-def parse_lesson_times(dars_vaqti: object) -> tuple[Optional[str], dict[int, str]]:
+def normalize_session_times(raw: object, daily_lessons: int = 1) -> Optional[str]:
     """
-    Parses a ``Dars_Vaqti`` value into ``(uniform_time, per_day_times)``.
+    Validates the time text typed for ONE day.
+    daily_lessons == 1 -> '14:00'
+    daily_lessons == 2 -> '10:00 / 11:30' (two times, the second one later)
+    Returns the canonical string or None when invalid.
+    """
+    text = str(raw or "").strip()
+    if int(daily_lessons or 1) >= 2:
+        pair = _TIME_PAIR_RE.match(text)
+        if not pair:
+            return None
+        first = normalize_hhmm(f"{pair.group(1)}:{pair.group(2)}")
+        second = normalize_hhmm(f"{pair.group(3)}:{pair.group(4)}")
+        if not first or not second or second <= first:
+            return None
+        return f"{first} / {second}"
+    return normalize_hhmm(text)
 
-    * "14:00"                         -> ("14:00", {})
-    * "Du 14:00, Chor 15:30, Ju 17:00" -> (None, {0: "14:00", 2: "15:30", 4: "17:00"})
-    * empty / unparsable               -> (None, {})
+
+def _session_value(value: object) -> list[str]:
+    """'14:00' -> ['14:00']; '10:00 / 11:30' -> ['10:00', '11:30']; else []."""
+    single = normalize_hhmm(value)
+    if single:
+        return [single]
+    pair = _TIME_PAIR_RE.match(str(value or ""))
+    if pair:
+        first = normalize_hhmm(f"{pair.group(1)}:{pair.group(2)}")
+        second = normalize_hhmm(f"{pair.group(3)}:{pair.group(4)}")
+        if first and second:
+            return [first, second]
+    return []
+
+
+def parse_lesson_sessions(
+    dars_vaqti: object,
+) -> tuple[Optional[list[str]], dict[int, list[str]]]:
+    """
+    Like parse_lesson_times, but keeps every session of the day:
+    * "14:00"                               -> (["14:00"], {})
+    * "10:00 / 11:30"                       -> (["10:00", "11:30"], {})
+    * "Du 14:00, Chor 15:30"                -> (None, {0: ["14:00"], 2: ["15:30"]})
+    * "Shan 10:00 / 11:30, Yak 14:00 / 15:30" -> (None, {5: [...], 6: [...]})
+    * "Kelishilgan vaqtda" / empty / junk   -> (None, {})
     """
     raw = str(dars_vaqti or "").strip()
-    if not raw:
+    if not raw or is_agreed_lesson_time(raw):
         return None, {}
-    simple = normalize_hhmm(raw)
-    if simple:
-        return simple, {}
-    per_day: dict[int, str] = {}
+    uniform = _session_value(raw)
+    if uniform:
+        return uniform, {}
+    per_day: dict[int, list[str]] = {}
     for chunk in _re.split(r"[,;\n]+", raw):
+        pair = _PER_DAY_PAIR_ENTRY_RE.match(chunk)
+        if pair:
+            idx = _LESSON_DAY_TOKENS.get(pair.group(1).lower())
+            first = normalize_hhmm(f"{pair.group(2)}:{pair.group(3)}")
+            second = normalize_hhmm(f"{pair.group(4)}:{pair.group(5)}")
+            if idx is not None and first and second:
+                per_day[idx] = [first, second]
+            continue
         entry = _PER_DAY_ENTRY_RE.match(chunk)
         if not entry:
             continue
         idx = _LESSON_DAY_TOKENS.get(entry.group(1).lower())
         hhmm = normalize_hhmm(f"{entry.group(2)}:{entry.group(3)}")
         if idx is not None and hhmm:
-            per_day[idx] = hhmm
+            per_day[idx] = [hhmm]
     return None, per_day
+
+
+def parse_lesson_times(dars_vaqti: object) -> tuple[Optional[str], dict[int, str]]:
+    """
+    Parses a ``Dars_Vaqti`` value into ``(uniform_time, per_day_times)``.
+    For double lessons the FIRST session's start time is returned (used for
+    pre-lesson reminders); see parse_lesson_sessions for every session.
+
+    * "14:00"                         -> ("14:00", {})
+    * "Du 14:00, Chor 15:30, Ju 17:00" -> (None, {0: "14:00", 2: "15:30", 4: "17:00"})
+    * empty / unparsable / "Kelishilgan vaqtda" -> (None, {})
+    """
+    uniform, per_day = parse_lesson_sessions(dars_vaqti)
+    if uniform:
+        return uniform[0], {}
+    return None, {idx: times[0] for idx, times in per_day.items() if times}
+
+
+def get_lesson_sessions_for_weekday(
+    dars_vaqti: str, target_date_or_weekday: Union[date, datetime, int, str, None]
+) -> list[str]:
+    """Every session start time ('HH:MM') of the given day, [] when none."""
+    uniform, per_day = parse_lesson_sessions(dars_vaqti)
+    if uniform:
+        return list(uniform)
+    weekday = _weekday_of(target_date_or_weekday)
+    if weekday is None:
+        return []
+    return list(per_day.get(weekday, []))
 
 
 def _weekday_of(target: Union[date, datetime, int, str, None]) -> Optional[int]:
@@ -184,12 +278,15 @@ def is_per_day_lesson_time(dars_vaqti: object) -> bool:
 
 
 def build_per_day_lesson_time(times_by_weekday: dict[int, str]) -> str:
-    """{0: '14:00', 2: '15:30'} -> 'Du 14:00, Chor 15:30' (weekday order)."""
+    """
+    {0: '14:00', 2: '15:30'} -> 'Du 14:00, Chor 15:30' (weekday order).
+    Double lessons: {5: '10:00 / 11:30'} -> 'Shan 10:00 / 11:30'.
+    """
     parts: list[str] = []
     for idx in sorted(times_by_weekday):
-        hhmm = normalize_hhmm(times_by_weekday[idx])
-        if hhmm and idx in LESSON_DAY_ABBR:
-            parts.append(f"{LESSON_DAY_ABBR[idx]} {hhmm}")
+        sessions = _session_value(times_by_weekday[idx])
+        if sessions and idx in LESSON_DAY_ABBR:
+            parts.append(f"{LESSON_DAY_ABBR[idx]} {' / '.join(sessions)}")
     return ", ".join(parts)
 
 
@@ -202,13 +299,17 @@ def format_lesson_time_display(dars_vaqti: object, lang: str = "latn") -> str:
     from app.locales import WEEKDAYS_SHORT
 
     raw = str(dars_vaqti or "").strip()
-    uniform, per_day = parse_lesson_times(raw)
+    if is_agreed_lesson_time(raw):
+        return AGREED_LESSON_TIME_CYRL if lang == "cyrl" else AGREED_LESSON_TIME
+    uniform, per_day = parse_lesson_sessions(raw)
     if uniform:
-        return uniform
+        return " / ".join(uniform)
     if not per_day:
         return raw
     names = WEEKDAYS_SHORT.get(lang) or WEEKDAYS_SHORT["latn"]
-    return ", ".join(f"{names[idx]} {per_day[idx]}" for idx in sorted(per_day))
+    return ", ".join(
+        f"{names[idx]} {' / '.join(per_day[idx])}" for idx in sorted(per_day)
+    )
 
 
 def format_group_schedule(
@@ -225,7 +326,11 @@ def format_group_schedule(
     from app.locales import WEEKDAYS_SHORT
 
     names = WEEKDAYS_SHORT.get(lang) or WEEKDAYS_SHORT["latn"]
-    uniform, per_day = parse_lesson_times(dars_vaqti)
+    uniform_sessions, per_day_sessions = parse_lesson_sessions(dars_vaqti)
+    uniform = " / ".join(uniform_sessions) if uniform_sessions else None
+    per_day = {idx: " / ".join(v) for idx, v in per_day_sessions.items()}
+    if is_agreed_lesson_time(dars_vaqti):
+        uniform = AGREED_LESSON_TIME_CYRL if lang == "cyrl" else AGREED_LESSON_TIME
     day_idx: list[int] = []
     for tok in _re.split(r"[,;/\s]+", str(dars_kunlari or "").strip()):
         idx = _LESSON_DAY_TOKENS.get(tok.lower().strip(".-"))

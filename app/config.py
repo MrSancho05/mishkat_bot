@@ -32,6 +32,26 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID: str = os.getenv("SPREADSHEET_ID", "").strip()
 ADMIN_IDS: list[int] = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
+# Main (primary) admin: ADMIN_ID from .env, otherwise the first of ADMIN_IDS.
+# Only this account may use "🔄 Rolni almashtirish" (Admin / Ustoz / Talaba /
+# Ota-ona menu switcher); secondary admins (👑 Adminlar) never see it.
+_MAIN_ADMIN_RAW = os.getenv("ADMIN_ID", "").strip()
+try:
+    MAIN_ADMIN_ID: int | None = int(_MAIN_ADMIN_RAW) if _MAIN_ADMIN_RAW else None
+except ValueError:
+    MAIN_ADMIN_ID = None
+if MAIN_ADMIN_ID is None and ADMIN_IDS:
+    MAIN_ADMIN_ID = ADMIN_IDS[0]
+if MAIN_ADMIN_ID is not None and MAIN_ADMIN_ID not in ADMIN_IDS:
+    ADMIN_IDS.insert(0, MAIN_ADMIN_ID)
+
+
+def is_main_admin(user_id: object) -> bool:
+    try:
+        return MAIN_ADMIN_ID is not None and int(str(user_id)) == MAIN_ADMIN_ID
+    except (TypeError, ValueError):
+        return False
+
 
 def _parse_optional_int(raw: str) -> int | None:
     try:

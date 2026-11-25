@@ -62,7 +62,7 @@ from app.locales import (
     format_uz_date,
     t,
 )
-from app.sheets import SheetsManager, get_sheets_manager
+from app.sheets import SheetsManager, _is_paid_status, get_sheets_manager
 from app.states import PaymentStates
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,14 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "💵 Umumiy qarz summasi: <b>{total} so‘m</b>"
         ),
         "btn_remind_debtors": "📢 Eslatma yuborish",
+        "btn_debtors_compact": "🔼 Qisqacha",
+        "btn_debtors_detailed": "📄 Batafsil",
+        "debtor_compact_line": (
+            "• <b>{name}</b> ({group})\n"
+            "  📞 {phone} | 💰 <b>{total} so'm</b>"
+        ),
+        "debtor_unpaid_cycle_line": "  🗓 <b>{cycle}</b>: {lessons}",
+        "debtor_dates_copy_line": "  📋 Sanalar: <code>{dates}</code>",
         "parent_child_payment_block": (
             "👶 Farzand: <b>{child_fio}</b>\n"
             "📚 Guruh: <b>{group_name}</b>\n"
@@ -173,6 +181,14 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "💵 Умумий қарз суммаси: <b>{total} сўм</b>"
         ),
         "btn_remind_debtors": "📢 Эслатма юбориш",
+        "btn_debtors_compact": "🔼 Қисқача",
+        "btn_debtors_detailed": "📄 Батафсил",
+        "debtor_compact_line": (
+            "• <b>{name}</b> ({group})\n"
+            "  📞 {phone} | 💰 <b>{total} сўм</b>"
+        ),
+        "debtor_unpaid_cycle_line": "  🗓 <b>{cycle}</b>: {lessons}",
+        "debtor_dates_copy_line": "  📋 Саналар: <code>{dates}</code>",
         "parent_child_payment_block": (
             "👶 Фарзанд: <b>{child_fio}</b>\n"
             "📚 Гуруҳ: <b>{group_name}</b>\n"
@@ -2019,27 +2035,139 @@ async def _augment_debtors_with_legacy(
     return result
 
 
-@router.message(F.text.in_(DEBTORS_MENU_TEXTS))
-async def cmd_debtors_list(message: Message) -> None:
-    if not message.from_user:
-        return
-    user_id = message.from_user.id
-    lang = await get_user_lang(user_id)
+# Per-user cache of the rendered debtors views, so "🔼 Qisqacha" / "📄 Batafsil"
+# and page switches are instant edits (no Google Sheets re-reads).
+_DEBTOR_VIEW_TTL_SECONDS = 300
+_debtor_view_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+_MARK_ICONS = {"✅": "✅", "❌": "❌"}
 
+
+def _lesson_status_icon(mark: str) -> str:
+    cleaned = str(mark or "").strip()
+    if cleaned in _MARK_ICONS:
+        return _MARK_ICONS[cleaned]
+    if cleaned.casefold().startswith("qoldirildi"):
+        return "🚫"
+    if cleaned in {"+", "1", "bor", "Bor", "Keldi", "keldi"}:
+        return "✅"
+    if cleaned in {"-", "0", "yo'q", "Yo'q", "Kelmadi", "kelmadi"}:
+        return "❌"
+    return "⏳"
+
+
+def _sync_collect_unpaid_cycles(
+    sheets: SheetsManager, debtors: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    {Talaba_ID: [{"title", "lessons": [(label, icon)], "labels": [...]}]} for every
+    UNPAID cycle row of each debtor in their group's cycle sheets (this year and
+    last year). Each group/year sheet is read only once.
+    """
+    by_group: dict[str, set[str]] = {}
+    for d in debtors:
+        sid = str(d.get("Talaba_ID", "")).strip()
+        grp = str(d.get("Guruh", "")).strip()
+        if sid and grp:
+            by_group.setdefault(grp, set()).add(sid)
+    result: dict[str, list[dict[str, Any]]] = {}
+    now_year = now_tashkent().year
+    with sheets._lock:
+        ss = sheets._get_spreadsheet()
+        for grp, sids in by_group.items():
+            for year in (now_year - 1, now_year):
+                try:
+                    ws = sheets._open_group_year_ws(ss, grp, year)
+                except Exception:
+                    continue
+                try:
+                    cycles = sheets.parse_cycles_from_sheet(ws)
+                except Exception:
+                    logger.exception("Debtors view: cannot parse %s %s", grp, year)
+                    continue
+                for cycle in cycles:
+                    for s_row in cycle["student_rows"]:
+                        sid = str(s_row.get("student_id") or "").strip()
+                        if sid not in sids:
+                            continue
+                        if _is_paid_status(str(s_row.get("payment_status") or "")):
+                            continue
+                        lessons = [
+                            (
+                                str(dc.get("label") or dc["date_str"]),
+                                _lesson_status_icon(
+                                    s_row["marks"].get(dc["col_idx"], "")
+                                ),
+                            )
+                            for dc in cycle["date_columns"]
+                        ]
+                        result.setdefault(sid, []).append(
+                            {"title": cycle["title"], "lessons": lessons}
+                        )
+    return result
+
+
+def _format_unpaid_cycles_block(cycles: list[dict[str, Any]], lang: str) -> str:
+    """Detailed view: unpaid cycles, dated lessons with ✅/❌/⏳ and a one-tap
+    copyable <code>DD.MM, DD.MM, ...</code> block of all those dates."""
+    if not cycles:
+        return ""
+    parts: list[str] = []
+    all_labels: list[str] = []
+    for cyc in cycles:
+        lesson_txt = ", ".join(
+            f"{html.escape(label)} {icon}" for label, icon in cyc["lessons"]
+        )
+        parts.append(
+            _lt(
+                "debtor_unpaid_cycle_line",
+                lang,
+                cycle=html.escape(str(cyc["title"])),
+                lessons=lesson_txt or "—",
+            )
+        )
+        all_labels.extend(label for label, _icon in cyc["lessons"])
+    copy_block = ", ".join(html.escape(label) for label in all_labels)
+    tail = (
+        "\n" + _lt("debtor_dates_copy_line", lang, dates=copy_block) if copy_block else ""
+    )
+    return "\n" + "\n".join(parts) + tail
+
+
+def _paginate_lines(header: str, lines: list[str], footer: str) -> list[str]:
+    pages: list[str] = []
+    current = header
+    for line in lines:
+        addition = f"\n{line}"
+        if len(current) + len(addition) > 3600 and current != header:
+            pages.append(current)
+            current = f"{header}\n{line}"
+        else:
+            current += addition
+    if len(current) + len(footer) > 4000:
+        pages.append(current)
+        current = header
+    pages.append(current + footer)
+    return pages
+
+
+async def _build_debtor_views(user_id: int, lang: str) -> Optional[dict[str, Any]]:
+    """
+    Builds both debtors views for the user (None = not authorized):
+    {"compact": [pages], "detailed": [pages]} or {"empty": True}.
+    """
     authorized, debtors, group_fees = await _fetch_authorized_debtors_and_fees(
         user_id
     )
     if not authorized:
-        return
-
+        return None
     if not debtors:
-        await message.answer(t("debtors_empty", lang))
-        return
+        return {"empty": True}
 
     sheets = get_sheets_manager()
     default_fee = _get_default_monthly_fee()
     header = t("debtors_list_header", lang)
-    lines: list[str] = []
+    compact_lines: list[str] = []
+    detailed_lines: list[str] = []
     grand_total = 0
 
     legacy_map_local = {
@@ -2054,6 +2182,13 @@ async def cmd_debtors_list(message: Message) -> None:
         logger.exception("Failed computing combined debts for debtor list")
         child_debts = []
     child_by_sid = {c["student_id"]: c for c in child_debts}
+    try:
+        unpaid_cycles = await asyncio.to_thread(
+            _sync_collect_unpaid_cycles, sheets, debtors
+        )
+    except Exception:
+        logger.exception("Failed collecting unpaid cycle dates for debtors view")
+        unpaid_cycles = {}
 
     for d in debtors:
         name = html.escape(d.get("F.I.O.", ""))
@@ -2147,57 +2282,161 @@ async def cmd_debtors_list(message: Message) -> None:
                 total=_format_uzs(total_debt),
             )
         extra_lines = format_admin_extra_lines(child, lang) if child else ""
-        lines.append(
+        compact_lines.append(
+            _lt(
+                "debtor_compact_line",
+                lang,
+                name=name,
+                group=group,
+                phone=stu_phone_link,
+                total=_format_uzs(total_debt),
+            )
+        )
+        detailed_lines.append(
             f"• <b>{name}</b> ({group}) — <i>{debts}</i> | {amount_part}\n"
             f"  {lesson_stats_line}\n"
             + (f"{extra_lines}\n" if extra_lines else "")
             + f"  📞 {stu_phone_link} | 💬 {stu_tg_link}\n"
             f"  👨‍👩‍👧 {' | '.join(par_parts)}"
+            + _format_unpaid_cycles_block(
+                unpaid_cycles.get(str(d.get("Talaba_ID", "")).strip(), []), lang
+            )
         )
 
-    if not lines:
-        await message.answer(t("debtors_empty", lang))
-        return
+    if not compact_lines:
+        return {"empty": True}
 
-    lines.append(
-        _lt(
-            "debtors_grand_total",
-            lang,
-            count=len(lines),
-            total=_format_uzs(grand_total),
-        )
+    footer = "\n" + _lt(
+        "debtors_grand_total",
+        lang,
+        count=len(compact_lines),
+        total=_format_uzs(grand_total),
     )
+    return {
+        "compact": _paginate_lines(header, compact_lines, footer),
+        "detailed": _paginate_lines(header, detailed_lines, footer),
+    }
 
-    remind_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=_lt("btn_remind_debtors", lang),
-                    callback_data="debt_remind_all",
-                )
-            ]
+
+def _debtors_view_kb(mode: str, page: int, pages: int, lang: str) -> InlineKeyboardMarkup:
+    compact_lbl = _lt("btn_debtors_compact", lang)
+    detailed_lbl = _lt("btn_debtors_detailed", lang)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"✅ {compact_lbl}" if mode == "compact" else compact_lbl,
+                callback_data="debt_view:compact:0",
+            ),
+            InlineKeyboardButton(
+                text=f"✅ {detailed_lbl}" if mode == "detailed" else detailed_lbl,
+                callback_data="debt_view:detailed:0",
+            ),
+        ]
+    ]
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(
+                InlineKeyboardButton(text="◀️", callback_data=f"debt_view:{mode}:{page - 1}")
+            )
+        nav.append(
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="debt_view:noop")
+        )
+        if page < pages - 1:
+            nav.append(
+                InlineKeyboardButton(text="▶️", callback_data=f"debt_view:{mode}:{page + 1}")
+            )
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=_lt("btn_remind_debtors", lang),
+                callback_data="debt_remind_all",
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    chunks: list[str] = []
-    current_chunk = header
-    for line in lines:
-        addition = f"\n{line}"
-        if len(current_chunk) + len(addition) > 3800:
-            chunks.append(current_chunk)
-            current_chunk = line
-        else:
-            current_chunk += addition
-    if current_chunk:
-        chunks.append(current_chunk)
 
-    for idx, chunk in enumerate(chunks):
-        await message.answer(
-            chunk,
-            reply_markup=(remind_kb if idx == len(chunks) - 1 else None),
+async def _get_debtor_views(
+    user_id: int, lang: str, refresh: bool = False
+) -> Optional[dict[str, Any]]:
+    now_ts = datetime.now().timestamp()
+    cached = _debtor_view_cache.get(user_id)
+    if (
+        not refresh
+        and cached is not None
+        and now_ts - cached[0] < _DEBTOR_VIEW_TTL_SECONDS
+        and cached[1].get("lang") == lang
+    ):
+        return cached[1]
+    views = await _build_debtor_views(user_id, lang)
+    if views is not None:
+        views["lang"] = lang
+        _debtor_view_cache[user_id] = (now_ts, views)
+    return views
+
+
+@router.message(F.text.in_(DEBTORS_MENU_TEXTS))
+async def cmd_debtors_list(message: Message) -> None:
+    """⚠️ Qarzdorlar: compact view by default, with 🔼 Qisqacha / 📄 Batafsil toggle."""
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    views = await _get_debtor_views(user_id, lang, refresh=True)
+    if views is None:
+        return
+    if views.get("empty"):
+        await message.answer(t("debtors_empty", lang))
+        return
+    pages = views["compact"]
+    await message.answer(
+        pages[0],
+        reply_markup=_debtors_view_kb("compact", 0, len(pages), lang),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data.startswith("debt_view:"))
+async def cb_debtors_view_toggle(callback: CallbackQuery) -> None:
+    """🔼 Qisqacha / 📄 Batafsil / page switch — updates the SAME message (edit_text)."""
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"compact", "detailed"}:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    mode = parts[1]
+    try:
+        page = max(0, int(parts[2]))
+    except ValueError:
+        page = 0
+    views = await _get_debtor_views(user_id, lang)
+    if views is None:
+        await callback.answer()
+        return
+    if views.get("empty"):
+        await callback.message.edit_text(t("debtors_empty", lang))
+        await callback.answer()
+        return
+    pages = views[mode]
+    page = min(page, len(pages) - 1)
+    try:
+        await callback.message.edit_text(
+            pages[page],
+            reply_markup=_debtors_view_kb(mode, page, len(pages), lang),
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+    except Exception as exc:
+        if "message is not modified" not in str(exc):
+            logger.warning("Debtors view edit failed: %s", exc)
+    await callback.answer()
 
 
 def _format_parent_debt_reminder_text(

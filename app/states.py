@@ -136,6 +136,8 @@ class AttendanceStates(StatesGroup):
     choosing_date = State()
     marking = State()
     marking_students = State()
+    selecting_session = State()
+    confirming_cancel_today = State()
     editing_pending = State()
     entering_topic_date = State()
     entering_topic_title = State()

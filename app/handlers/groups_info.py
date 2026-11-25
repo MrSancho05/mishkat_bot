@@ -27,6 +27,8 @@ from app.utils import (
     build_per_day_lesson_time,
     format_lesson_time_display,
     make_group_join_slug,
+    AGREED_LESSON_TIME,
+    normalize_session_times,
     normalize_hhmm,
     now_tashkent,
     parse_calendar_month,
@@ -89,6 +91,9 @@ from app.locales import (
     t,
 )
 from app.sheets import (
+    get_group_daily_lessons,
+    generate_cycle_slots,
+    slot_headers,
     COLOR_HEADER_GRAY,
     STUDENT_HEADERS,
     SheetsManager,
@@ -1848,10 +1853,13 @@ def _group_edit_fields_kb(group_name: str, lang: str) -> InlineKeyboardMarkup:
                 _fld("btn_grp_edit_start", "start"),
             ],
             [
+                _fld("btn_grp_edit_daily", "daily"),
                 InlineKeyboardButton(
                     text=t("btn_group_full_update", lang),
                     callback_data=f"grp_edit_fld:{group_name}:full_update",
                 ),
+            ],
+            [
                 InlineKeyboardButton(
                     text=t("btn_delete_group", lang),
                     callback_data=f"grp_del_ask:{group_name}",
@@ -1898,8 +1906,10 @@ async def _build_schedule_preview_dates(
     group: dict[str, Any],
     new_count: int,
     new_days_indices: list[int],
+    daily: Optional[int] = None,
 ) -> tuple[list[str], int]:
     today = today_tashkent()
+    daily_lessons = 2 if int(daily or get_group_daily_lessons(group)) >= 2 else 1
     completed_lessons = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
     existing_info = await asyncio.to_thread(
         sheets.get_cycle_dates_with_status, group_name
@@ -1914,11 +1924,15 @@ async def _build_schedule_preview_dates(
                     start_date = date.fromisoformat(full_iso)
                 except ValueError:
                     start_date = today
-        dates = generate_cycle_dates(start_date, new_days_indices, new_count)
-        return [d.strftime("%d.%m") for d in dates], 0
+        slots = generate_cycle_slots(
+            start_date, new_days_indices, new_count, daily_lessons
+        )
+        return slot_headers(slots, daily_lessons), 0
 
     preserved_info = existing_info[:completed_lessons]
-    preserved_strs = [item["date_str"] for item in preserved_info]
+    preserved_strs = [
+        str(item.get("label") or item["date_str"]) for item in preserved_info
+    ]
 
     last_preserved_date: Optional[date] = None
     if preserved_info:
@@ -1935,12 +1949,12 @@ async def _build_schedule_preview_dates(
         upcoming_start = today
 
     remaining = max(0, new_count - len(preserved_strs))
-    upcoming_dates = (
-        generate_cycle_dates(upcoming_start, new_days_indices, remaining)
+    upcoming_slots = (
+        generate_cycle_slots(upcoming_start, new_days_indices, remaining, daily_lessons)
         if remaining > 0
         else []
     )
-    return preserved_strs + [d.strftime("%d.%m") for d in upcoming_dates], len(
+    return preserved_strs + slot_headers(upcoming_slots, daily_lessons), len(
         preserved_strs
     )
 
@@ -1965,7 +1979,12 @@ async def _prompt_schedule_edit_confirmation(
         return
 
     preview_dates, preserved_count = await _build_schedule_preview_dates(
-        sheets, group_name, group, new_count, new_days_indices
+        sheets,
+        group_name,
+        group,
+        new_count,
+        new_days_indices,
+        (await state.get_data()).get("pending_sched_daily"),
     )
     days_latn = _format_days_from_indices(new_days_indices, "latn")
     days_display = _format_days_from_indices(new_days_indices, lang)
@@ -3767,15 +3786,15 @@ async def msg_add_group_time(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
-    match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
-    if not match:
+    daily = int((await state.get_data()).get("ltm_daily") or 1)
+    lesson_time = normalize_session_times(message.text, daily)
+    if not lesson_time:
         await message.answer(
-            t("schedule_invalid_time", lang),
+            t("lesson_time_invalid_double" if daily >= 2 else "schedule_invalid_time", lang),
             reply_markup=_lt_entry_kb("add", lang),
             parse_mode="HTML",
         )
         return
-    lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
     await _finish_lesson_time(message, state, "add", lang, lesson_time)
 
 
@@ -3848,9 +3867,13 @@ def _build_group_add_confirmation(
     lesson_count = int(data["lesson_count"])
     lesson_time = str(data.get("lesson_time") or "")
     monthly_fee = int(data.get("monthly_fee") or 0)
-    lesson_dates = generate_cycle_dates(
-        _group_add_start_date(data), selected_days, lesson_count
-    )
+    daily_lessons = 2 if int(data.get("daily_lessons") or 1) >= 2 else 1
+    lesson_dates = [
+        d
+        for d, _sess in generate_cycle_slots(
+            _group_add_start_date(data), selected_days, lesson_count, daily_lessons
+        )
+    ]
     summary = _lt(
         "add_group_confirm_summary",
         lang,
@@ -3867,6 +3890,10 @@ def _build_group_add_confirmation(
     )
     if monthly_fee > 0:
         summary += "\n" + _lt("add_group_fee_line", lang, amount=_format_uzs(monthly_fee))
+    summary += "\n" + t(
+        "daily_lessons_line_double" if daily_lessons >= 2 else "daily_lessons_line_single",
+        lang,
+    )
     summary += "\n" + t(
         "add_group_start_date_lines",
         lang,
@@ -3972,9 +3999,15 @@ async def cb_group_calendar_day(callback: CallbackQuery, state: FSMContext) -> N
         return
     selected_days = sorted(data["selected_days"])
     effective = first_lesson_date_on_or_after(picked, selected_days)
-    lesson_dates = generate_cycle_dates(
-        effective, selected_days, int(data["lesson_count"])
-    )
+    lesson_dates = [
+        d
+        for d, _sess in generate_cycle_slots(
+            effective,
+            selected_days,
+            int(data["lesson_count"]),
+            2 if int(data.get("daily_lessons") or 1) >= 2 else 1,
+        )
+    ]
     if lesson_dates[-1] < today_tashkent():
         await callback.answer(
             "⚠️ Bu sanadan boshlangan siklning barcha darslari allaqachon o‘tib ketgan. "
@@ -4078,7 +4111,13 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
 
     today = today_tashkent()
     start_date = _group_add_start_date(data)
-    initial_dates = generate_cycle_dates(start_date, selected_days, lesson_count)
+    daily_lessons = 2 if int(data.get("daily_lessons") or 1) >= 2 else 1
+    initial_dates = [
+        d
+        for d, _sess in generate_cycle_slots(
+            start_date, selected_days, lesson_count, daily_lessons
+        )
+    ]
     # Lessons strictly BEFORE today are already elapsed (today's lesson is not):
     # the counter continues seamlessly, e.g. 3 elapsed -> next lesson is 4-dars.
     elapsed_count = count_elapsed_lessons(initial_dates, today)
@@ -4093,6 +4132,7 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             lesson_time,
             "",
             str(monthly_fee) if monthly_fee > 0 else "",
+            daily_lessons,
         )
         cycle_info = await asyncio.to_thread(
             sheets.create_cycle_table,
@@ -4109,6 +4149,8 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
         )
         await upsert_group_counter(group_name, lesson_count=elapsed_count)
         await database.set_group_start_date(group_name, start_date_str)
+        await database.set_group_daily_lessons(group_name, daily_lessons)
+        await database.set_group_lesson_time(group_name, lesson_time)
         if elapsed_count > 0:
             await asyncio.to_thread(
                 sheets.update_group,
@@ -4239,6 +4281,13 @@ async def _show_group_edit_panel(
             lang,
             start=html.escape(start_raw or "—"),
             chat=html.escape(chat_raw or "—"),
+        )
+        + "\n"
+        + t(
+            "daily_lessons_line_double"
+            if get_group_daily_lessons(group) >= 2
+            else "daily_lessons_line_single",
+            lang,
         )
     )
 
@@ -4454,7 +4503,9 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
             reply_markup=group_edit_weekdays_kb(group_name, current_days, lang),
             parse_mode="HTML",
         )
-    elif field == "time":
+    elif field in {"time", "daily"}:
+        # "⏰ Dars vaqti" and "🔁 Kunlik darslar soni" share one screen: the
+        # 1/2 lessons-per-day toggle sits above the time options.
         group = await get_sheets_manager().a_get_group(group_name)
         if not group:
             await callback.answer(_lt("group_not_found", lang), show_alert=True)
@@ -4531,6 +4582,7 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
             "Dars_Vaqti": str(group.get("Dars_Vaqti") or ""),
             "Oylik_Tolov_Summa": str(group.get("Oylik_Tolov_Summa") or ""),
             "Guruh_TG_Chat_ID": str(group.get("Guruh_TG_Chat_ID") or ""),
+            "Kunlik_Dars_Soni": str(get_group_daily_lessons(group)),
         }
         await state.update_data(
             full_old_group_name=canonical,
@@ -4827,16 +4879,17 @@ async def msg_edit_group_time(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
-    group_name = (await state.get_data()).get("edit_group_name", "")
-    match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
-    if not match:
+    edit_data = await state.get_data()
+    group_name = edit_data.get("edit_group_name", "")
+    daily = int(edit_data.get("ltm_daily") or 1)
+    lesson_time = normalize_session_times(message.text, daily)
+    if not lesson_time:
         await message.answer(
-            t("schedule_invalid_time", lang),
+            t("lesson_time_invalid_double" if daily >= 2 else "schedule_invalid_time", lang),
             reply_markup=_lt_entry_kb("edit", lang, group_name),
             parse_mode="HTML",
         )
         return
-    lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
     await _finish_lesson_time(message, state, "edit", lang, lesson_time)
 
 
@@ -4882,10 +4935,23 @@ async def cb_edit_group_schedule_confirm(
         change_items.append(("Dars_Kunlari", old_days, days_str))
     if new_time.strip() != old_time.strip():
         change_items.append(("Dars_Vaqti", old_time, new_time))
+    old_daily = get_group_daily_lessons(old_group)
+    pending_daily = data.get("pending_sched_daily")
+    new_daily = (
+        (2 if int(pending_daily) >= 2 else 1) if pending_daily is not None else old_daily
+    )
+    if new_daily != old_daily:
+        change_items.append(("Kunlik_Dars_Soni", str(old_daily), str(new_daily)))
     if not change_items:
         change_items.append(("Dars_Vaqti", old_time, new_time))
 
     try:
+        if new_daily != old_daily:
+            # Must be stored BEFORE the rebuild: it decides 1 or 2 columns per day.
+            await asyncio.to_thread(
+                sheets.update_group, group_name, {"Kunlik_Dars_Soni": str(new_daily)}
+            )
+            await database.set_group_daily_lessons(group_name, new_daily)
         final_dates = await asyncio.to_thread(
             sheets.rebuild_active_cycle_sheet,
             group_name,
@@ -4902,6 +4968,7 @@ async def cb_edit_group_schedule_confirm(
         await callback.answer()
         return
 
+    await database.set_group_lesson_time(group_name, new_time)
     sent_count = await _broadcast_group_update(
         callback.bot,
         sheets,
@@ -5027,12 +5094,16 @@ async def _advance_full_group_step(
         kb = full_group_edit_weekdays_kb(selected, lang)
     elif next_step == "time":
         eff_days_raw = str(new_vals.get("Dars_Kunlari") or orig.get("Dars_Kunlari") or "")
+        full_daily = 2 if int(
+            new_vals.get("Kunlik_Dars_Soni") or orig.get("Kunlik_Dars_Soni") or 1
+        ) >= 2 else 1
         await state.update_data(
             ltm_ctx="full",
             ltm_days=parse_weekdays(eff_days_raw),
             ltm_group=str(data.get("full_old_group_name") or ""),
             ltm_count=None,
             ltm_entered=[],
+            ltm_daily=full_daily,
         )
         await state.set_state(FullGroupEditStates.choosing_time_mode)
         text = t(
@@ -5042,11 +5113,16 @@ async def _advance_full_group_step(
                 format_lesson_time_display(orig.get("Dars_Vaqti") or "", lang) or "—"
             ),
         )
+        text += "\n\n" + t(
+            "daily_lessons_line_double" if full_daily >= 2 else "daily_lessons_line_single",
+            lang,
+        )
         kb = lesson_time_mode_kb(
             "full_grp",
             lang,
             cancel_cb="full_grp:cancel",
             keep_cb="full_grp:skip_field",
+            daily_lessons=full_daily,
         )
     elif next_step == "fee":
         await state.set_state(FullGroupEditStates.editing_fee)
@@ -5323,15 +5399,15 @@ async def msg_full_group_time(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
-    match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
-    if not match:
+    daily = int((await state.get_data()).get("ltm_daily") or 1)
+    lesson_time = normalize_session_times(message.text, daily)
+    if not lesson_time:
         await message.answer(
-            t("schedule_invalid_time", lang),
+            t("lesson_time_invalid_double" if daily >= 2 else "schedule_invalid_time", lang),
             reply_markup=_lt_entry_kb("full", lang),
             parse_mode="HTML",
         )
         return
-    lesson_time = f"{int(match.group(1)):02d}:{match.group(2)}"
     await _finish_lesson_time(message, state, "full", lang, lesson_time)
 
 
@@ -5369,14 +5445,28 @@ def _lt_back_to_modes_cb(ctx: str, group_name: str = "") -> str:
     return "full_grp:time_mode_back"
 
 
+_LT_PREFIX = {"add": "grp_add", "edit": "grp_edit", "full": "full_grp"}
+
+
 def _lt_entry_kb(ctx: str, lang: str, group_name: str = "") -> InlineKeyboardMarkup:
-    """Keyboard under a time-entry prompt: back (to the two options) + cancel."""
+    """
+    Keyboard under a time-entry prompt: '⏭ Vaqtni o‘tkazib yuborish
+    (Kelishilgan vaqtda)' + back (to the options) + cancel.
+    """
     back = _lt_back_to_modes_cb(ctx, group_name)
     if ctx == "add":
-        return group_add_cancel_kb(lang, back_cb=back)
-    if ctx == "edit":
-        return step_nav_inline_kb(lang, back_cb=back, cancel_cb="grp_edit:cancel")
-    return step_nav_inline_kb(lang, back_cb=back, cancel_cb="full_grp:cancel")
+        base = group_add_cancel_kb(lang, back_cb=back)
+    elif ctx == "edit":
+        base = step_nav_inline_kb(lang, back_cb=back, cancel_cb="grp_edit:cancel")
+    else:
+        base = step_nav_inline_kb(lang, back_cb=back, cancel_cb="full_grp:cancel")
+    skip_row = [
+        InlineKeyboardButton(
+            text=t("btn_lesson_time_agreed", lang),
+            callback_data=f"{_LT_PREFIX[ctx]}:time_mode:agreed",
+        )
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[skip_row, *base.inline_keyboard])
 
 
 async def _show_lesson_time_mode_prompt(
@@ -5388,25 +5478,52 @@ async def _show_lesson_time_mode_prompt(
     group_name: str = "",
     count: Optional[int] = None,
     edit: bool = True,
+    daily: Optional[int] = None,
 ) -> None:
-    """Asks: '🕒 Hamma kunlarga bir xil vaqt' vs '⚙️ Har bir kun uchun alohida vaqt'."""
+    """
+    Asks: '🕒 Hamma kunlarga bir xil vaqt' vs '⚙️ Har bir kun uchun alohida vaqt'
+    (+ '⏭ Vaqtni o‘tkazib yuborish (Kelishilgan vaqtda)'), with the
+    '1️⃣ Kuniga 1 ta dars' / '2️⃣ Kuniga 2 ta dars (Juft dars)' toggle on top.
+    """
     days = sorted({int(d) for d in days_indices})
+    data = await state.get_data()
+    if daily is None:
+        if ctx == "add":
+            daily = int(data.get("daily_lessons") or 1)
+        else:
+            grp_for_daily = (
+                await get_sheets_manager().a_get_group(group_name) if group_name else None
+            )
+            daily = get_group_daily_lessons(grp_for_daily)
+            if ctx == "full":
+                daily = int(
+                    (data.get("full_new") or {}).get("Kunlik_Dars_Soni") or daily
+                )
+    daily = 2 if int(daily or 1) >= 2 else 1
     await state.update_data(
         ltm_ctx=ctx,
         ltm_days=days,
         ltm_group=group_name,
         ltm_count=count,
         ltm_entered=[],
+        ltm_daily=daily,
     )
     await state.set_state(_lt_state(ctx, "mode"))
     text = t(
         "lesson_time_mode_prompt",
         lang,
         days=html.escape(_format_days_from_indices(days, lang)),
+    ) + "\n\n" + t(
+        "daily_lessons_line_double" if daily >= 2 else "daily_lessons_line_single",
+        lang,
     )
     if ctx == "add":
         kb = lesson_time_mode_kb(
-            "grp_add", lang, back_cb="grp_add:back:days", cancel_cb="grp_add:cancel"
+            "grp_add",
+            lang,
+            back_cb="grp_add:back:days",
+            cancel_cb="grp_add:cancel",
+            daily_lessons=daily,
         )
     elif ctx == "edit":
         kb = lesson_time_mode_kb(
@@ -5414,6 +5531,7 @@ async def _show_lesson_time_mode_prompt(
             lang,
             back_cb=f"grp_edit:back:fields:{group_name}",
             cancel_cb="grp_edit:cancel",
+            daily_lessons=daily,
         )
     else:
         kb = lesson_time_mode_kb(
@@ -5421,6 +5539,7 @@ async def _show_lesson_time_mode_prompt(
             lang,
             cancel_cb="full_grp:cancel",
             keep_cb="full_grp:skip_field",
+            daily_lessons=daily,
         )
     await (target_msg.edit_text if edit else target_msg.answer)(
         text, reply_markup=kb, parse_mode="HTML"
@@ -5444,6 +5563,8 @@ async def _prompt_next_day_time(
         total=len(days),
         day=html.escape(names[days[pos]]),
     )
+    if int(data.get("ltm_daily") or 1) >= 2:
+        text += "\n" + t("lesson_time_day_double_hint", lang)
     kb = _lt_entry_kb(ctx, lang, str(data.get("ltm_group") or ""))
     await (target_msg.edit_text if edit else target_msg.answer)(
         text, reply_markup=kb, parse_mode="HTML"
@@ -5459,8 +5580,9 @@ async def _finish_lesson_time(
 ) -> None:
     """Stores the final Dars_Vaqti value and moves to the flow's next step."""
     data = await state.get_data()
+    daily = 2 if int(data.get("ltm_daily") or 1) >= 2 else 1
     if ctx == "add":
-        await state.update_data(lesson_time=lesson_time)
+        await state.update_data(lesson_time=lesson_time, daily_lessons=daily)
         # Next step: monthly tuition fee ("Oylik to'lov summasi") right in creation
         await state.set_state(GroupAddStates.entering_fee)
         await message.answer(
@@ -5486,12 +5608,18 @@ async def _finish_lesson_time(
         if not days:
             days = [0, 2, 4]
         count = int(data.get("ltm_count") or group.get("Oylik_Dars_Soni") or 12)
+        await state.update_data(pending_sched_daily=daily)
         await _prompt_schedule_edit_confirmation(
             message, state, group_name, count, days, lesson_time, lang, edit=False
         )
         return
     full_new = dict(data.get("full_new", {}))
     full_new["Dars_Vaqti"] = lesson_time
+    orig_daily = str((data.get("full_orig") or {}).get("Kunlik_Dars_Soni") or "1")
+    if str(daily) != orig_daily:
+        full_new["Kunlik_Dars_Soni"] = str(daily)
+    else:
+        full_new.pop("Kunlik_Dars_Soni", None)
     await state.update_data(full_new=full_new)
     await _advance_full_group_step(message, state, "fee", lang, edit=False)
 
@@ -5506,17 +5634,21 @@ async def _on_lesson_time_mode_chosen(
         await callback.answer(_lt("no_permission", lang), show_alert=True)
         return
     mode = (callback.data or "").rsplit(":", 1)[-1]
+    if mode == "agreed":
+        await cb_lesson_time_agreed(callback, state)
+        return
     data = await state.get_data()
     group_name = str(data.get("ltm_group") or "")
     if not list(data.get("ltm_days") or []) or mode not in {"uniform", "perday"}:
         await callback.answer()
         return
     await state.update_data(ltm_entered=[])
+    is_double = int(data.get("ltm_daily") or 1) >= 2
     if callback.message:
         if mode == "uniform":
             await state.set_state(_lt_state(ctx, "uniform"))
             await callback.message.edit_text(
-                t("schedule_enter_time", lang),
+                t("lesson_time_enter_double" if is_double else "schedule_enter_time", lang),
                 reply_markup=_lt_entry_kb(ctx, lang, group_name),
                 parse_mode="HTML",
             )
@@ -5564,6 +5696,85 @@ async def cb_full_group_time_mode_back(
     await callback.answer()
 
 
+_LT_CTX_BY_PREFIX = {"grp_add": "add", "grp_edit": "edit", "full_grp": "full"}
+
+
+@router.callback_query(
+    StateFilter(
+        GroupAddStates.choosing_time_mode,
+        GroupEditStates.choosing_time_mode,
+        FullGroupEditStates.choosing_time_mode,
+    ),
+    F.data.regexp(r"^(grp_add|grp_edit|full_grp):daily:[12]$"),
+)
+async def cb_lesson_daily_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    """'1️⃣ Kuniga 1 ta dars' / '2️⃣ Kuniga 2 ta dars (Juft dars)' toggle."""
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    prefix, _, value = (callback.data or "").split(":")
+    ctx = _LT_CTX_BY_PREFIX.get(prefix, "")
+    data = await state.get_data()
+    if ctx != str(data.get("ltm_ctx") or "") or not data.get("ltm_days"):
+        await callback.answer()
+        return
+    new_daily = 2 if value == "2" else 1
+    if int(data.get("ltm_daily") or 1) == new_daily:
+        await callback.answer()
+        return
+    if callback.message:
+        await _show_lesson_time_mode_prompt(
+            callback.message,
+            state,
+            ctx,
+            lang,
+            list(data.get("ltm_days") or []),
+            group_name=str(data.get("ltm_group") or ""),
+            count=data.get("ltm_count"),
+            edit=True,
+            daily=new_daily,
+        )
+    await callback.answer(
+        t("btn_daily_lessons_2" if new_daily == 2 else "btn_daily_lessons_1", lang)
+    )
+
+
+@router.callback_query(
+    StateFilter(
+        GroupAddStates.choosing_time_mode,
+        GroupAddStates.entering_time,
+        GroupAddStates.entering_day_time,
+        GroupEditStates.choosing_time_mode,
+        GroupEditStates.entering_time,
+        GroupEditStates.entering_day_time,
+        FullGroupEditStates.choosing_time_mode,
+        FullGroupEditStates.editing_time,
+        FullGroupEditStates.entering_day_time,
+    ),
+    F.data.regexp(r"^(grp_add|grp_edit|full_grp):time_mode:agreed$"),
+)
+async def cb_lesson_time_agreed(callback: CallbackQuery, state: FSMContext) -> None:
+    """'⏭ Vaqtni o‘tkazib yuborish (Kelishilgan vaqtda)': Dars_Vaqti = 'Kelishilgan vaqtda'."""
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    prefix = (callback.data or "").split(":", 1)[0]
+    ctx = _LT_CTX_BY_PREFIX.get(prefix, "")
+    data = await state.get_data()
+    if ctx != str(data.get("ltm_ctx") or ""):
+        await callback.answer()
+        return
+    await callback.answer(t("lesson_time_agreed_saved", lang))
+    if callback.message:
+        await _finish_lesson_time(callback.message, state, ctx, lang, AGREED_LESSON_TIME)
+
+
 @router.message(
     StateFilter(
         GroupAddStates.entering_day_time,
@@ -5589,11 +5800,11 @@ async def msg_lesson_day_time(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(t("error_generic", lang), parse_mode="HTML")
         return
-    match = TIME_FORMAT_RE.fullmatch((message.text or "").strip())
-    hhmm = normalize_hhmm(f"{match.group(1)}:{match.group(2)}") if match else None
+    daily = int(data.get("ltm_daily") or 1)
+    hhmm = normalize_session_times(message.text, daily)
     if not hhmm:
         await message.answer(
-            t("schedule_invalid_time", lang),
+            t("lesson_time_invalid_double" if daily >= 2 else "schedule_invalid_time", lang),
             reply_markup=_lt_entry_kb(ctx, lang, str(data.get("ltm_group") or "")),
             parse_mode="HTML",
         )
@@ -5718,7 +5929,18 @@ async def cb_full_group_confirm_all(
         if new_group_name.lower() != old_group_name.lower():
             await _rename_group_in_sqlite(old_group_name, new_group_name)
             await database.rename_group_weekly_reminder(old_group_name, new_group_name)
+        if "Dars_Vaqti" in full_new:
+            await database.set_group_lesson_time(
+                new_group_name, str(full_new.get("Dars_Vaqti") or "")
+            )
+        if str(full_new.get("Kunlik_Dars_Soni") or "").strip():
+            await database.set_group_daily_lessons(
+                new_group_name, int(full_new["Kunlik_Dars_Soni"])
+            )
         if str(full_new.get("Guruh_TG_Chat_ID") or "").strip():
+            await database.set_group_tg_chat_id(
+                new_group_name, str(full_new.get("Guruh_TG_Chat_ID")).strip()
+            )
             # A group chat was linked/changed: make sure the 1-hour initial
             # notice timer is running (never restarted if already set/sent).
             schedule_group_initial_notice(callback.bot, new_group_name)
@@ -5857,6 +6079,7 @@ async def msg_edit_group_chat_id(message: Message, state: FSMContext) -> None:
     old_chat = str(group.get("Guruh_TG_Chat_ID") or "").strip()
     if raw != old_chat:
         await asyncio.to_thread(sheets.link_group_tg_chat, canonical, raw)
+        await database.set_group_tg_chat_id(canonical, raw)
         await log_audit_event(
             actor_id=user_id,
             action=AUDIT_GROUP_EDITED,
@@ -6000,7 +6223,7 @@ async def cb_edit_start_calendar_day(
         ),
         actor_name=callback.from_user.full_name or "",
     )
-    date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+    date_strs = list(result.get("date_strs") or [d.strftime("%d.%m") for d in lesson_dates])
     await _broadcast_group_update(
         callback.bot,
         sheets,
@@ -6016,8 +6239,15 @@ async def cb_edit_start_calendar_day(
         triggered_by_user_id=user_id,
     )
 
+    slot_sessions = [sess for _d, sess in (result.get("slots") or [])]
+    is_double = get_group_daily_lessons(group) >= 2
     schedule_lines = "\n".join(
         f"{'✅' if d < today else '▫️'} {idx}-dars — {format_uz_date_long(d, lang)}"
+        + (
+            f" ({slot_sessions[idx - 1]})"
+            if is_double and idx - 1 < len(slot_sessions)
+            else ""
+        )
         for idx, d in enumerate(lesson_dates, start=1)
     )
     notice = t(

@@ -11,6 +11,7 @@ from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramMigrateToChat,
     TelegramRetryAfter,
 )
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,12 +22,23 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app import config
 from app.utils import (
     dual_role_header,
+    get_lesson_sessions_for_weekday,
+    is_agreed_lesson_time,
     get_lesson_time_for_weekday,
     now_tashkent,
     today_tashkent,
 )
 from app.config import ADMIN_IDS, DB_PATH, TZ
 from app.database import (
+    claim_agreed_time_reminder,
+    claim_attendance_missing_alert,
+    get_all_dynamic_admins,
+    is_lesson_cancelled,
+    release_agreed_time_reminder,
+    release_attendance_missing_alert,
+    is_attendance_missing_alert_sent,
+    get_group_tg_chat_id,
+    set_group_tg_chat_id,
     claim_group_initial_notice,
     claim_group_weekly_reminder,
     current_iso_week,
@@ -52,7 +64,7 @@ from app.debt_view import (
     format_cycle_title,
     send_expandable_notice,
 )
-from app.locales import format_uz_date, t
+from app.locales import format_uz_date, format_uz_date_long, format_weekday_full, t
 from app.sheets import (
     SheetsManager,
     get_next_lesson_date_after,
@@ -138,13 +150,34 @@ def _parse_int_chat_id(raw: Any) -> Optional[int]:
             return int_val if int_val != 0 and float(int_val) == raw else None
         except (ValueError, OverflowError):
             return None
-    val = str(raw).strip()
-    if not val or val == "Ma'lumot kiritilmagan":
+    val = normalize_chat_id_text(raw)
+    if not val:
         return None
     if re.fullmatch(r"-?\d+(?:\.0+)?", val):
         int_val = int(val.split(".", 1)[0])
         return int_val if int_val != 0 else None
     return None
+
+
+def normalize_chat_id_text(raw: Any) -> str:
+    """
+    Cleans a chat id read from Google Sheets / SQLite: strips whitespace (incl.
+    non-breaking), quotes / apostrophes, the unicode minus sign and a float
+    '.0' tail, e.g. " '-1001234567890.0' " -> "-1001234567890".
+    Returns "" for empty / placeholder values.
+    """
+    if raw is None or isinstance(raw, bool):
+        return ""
+    val = str(raw)
+    for junk in ("\u00a0", "\u200b", "\u202f"):
+        val = val.replace(junk, "")
+    val = val.strip().strip("'\"`‘’“”").strip()
+    val = val.replace("\u2212", "-").replace("\u2013", "-").replace(" ", "")
+    if not val or val in {"Ma'lumot kiritilmagan", "—", "-"}:
+        return ""
+    if re.fullmatch(r"-?\d+\.0+", val):
+        val = val.split(".", 1)[0]
+    return val
 
 
 def _normalize_phone_key(phone: Any) -> str:
@@ -275,6 +308,109 @@ async def _safe_send_message(
     except Exception as exc:
         logger.exception("Unexpected error sending message to %s: %s", parsed_id, exc)
         return False
+
+
+async def _persist_migrated_group_chat(group_name: str, new_chat_id: int) -> None:
+    """Stores a supergroup's new chat id in Guruhlar (Sheets) and SQLite."""
+    try:
+        await asyncio.to_thread(
+            get_sheets_manager().link_group_tg_chat, group_name, str(new_chat_id)
+        )
+    except Exception:
+        logger.exception(
+            "[GROUP_MSG] Could not store migrated chat id %s for %s in Guruhlar",
+            new_chat_id,
+            group_name,
+        )
+    try:
+        await set_group_tg_chat_id(group_name, str(new_chat_id))
+    except Exception:
+        logger.exception(
+            "[GROUP_MSG] Could not store migrated chat id %s for %s in SQLite",
+            new_chat_id,
+            group_name,
+        )
+
+
+async def send_group_chat_message(
+    bot: Bot,
+    group: Optional[dict[str, Any]],
+    text: str,
+    *,
+    tag: str = "[GROUP_MSG]",
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> bool:
+    """
+    Sends `text` to the group's linked Telegram chat (Guruh_TG_Chat_ID).
+
+    - The chat id is normalized (quotes / spaces / '.0' removed).
+    - When the group was upgraded to a supergroup (TelegramMigrateToChat), the
+      new id is written to Guruhlar + SQLite and the message is re-sent at once.
+    - Every skip / failure is logged with `tag` ([GROUP_MSG] / [INITIAL_NOTICE]).
+    Never raises. Returns True only when the message was delivered.
+    """
+    if not group:
+        logger.warning("%s Skipped: group record not found", tag)
+        return False
+    group_name = str(group.get("Guruh_Nomi") or "").strip()
+    raw_id = group.get("Guruh_TG_Chat_ID")
+    chat_id = _parse_int_chat_id(raw_id)
+    if chat_id is None and normalize_chat_id_text(raw_id):
+        # Sheets may have mangled the id (e.g. scientific notation): fall back to
+        # the copy kept in SQLite when one exists.
+        try:
+            chat_id = _parse_int_chat_id(await get_group_tg_chat_id(group_name))
+        except Exception:
+            chat_id = None
+    if chat_id is None:
+        if normalize_chat_id_text(raw_id):
+            logger.warning(
+                "%s Skipped for %r: Guruh_TG_Chat_ID %r is not a valid chat id",
+                tag,
+                group_name,
+                raw_id,
+            )
+        else:
+            logger.info("%s Skipped for %r: no Guruh_TG_Chat_ID linked", tag, group_name)
+        return False
+
+    safe_text = _safe_limit_message(text, limit=4085)
+    for attempt in range(3):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=safe_text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return True
+        except TelegramMigrateToChat as exc:
+            new_id = int(exc.migrate_to_chat_id)
+            logger.warning(
+                "%s Chat of %r migrated to supergroup: %s -> %s (retrying)",
+                tag,
+                group_name,
+                chat_id,
+                new_id,
+            )
+            await _persist_migrated_group_chat(group_name, new_id)
+            group["Guruh_TG_Chat_ID"] = str(new_id)
+            chat_id = new_id
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after + 0.5)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            logger.warning(
+                "%s Failed for %r (chat %s): %s", tag, group_name, chat_id, exc
+            )
+            return False
+        except Exception as exc:
+            logger.exception(
+                "%s Unexpected error for %r (chat %s): %s", tag, group_name, chat_id, exc
+            )
+            return False
+    logger.warning("%s Gave up sending to %r (chat %s)", tag, group_name, chat_id)
+    return False
 
 
 def _extract_latest_cycle_completion_data(
@@ -484,8 +620,7 @@ async def handle_cycle_completion(
     owner_esc = html.escape(card_owner)
 
     # Group Telegram chat reminder (Latin script)
-    group_tg_chat_id = _parse_int_chat_id(group.get("Guruh_TG_Chat_ID"))
-    if group_tg_chat_id:
+    if _parse_int_chat_id(group.get("Guruh_TG_Chat_ID")):
         group_msg = (
             "🔔 <b>O‘quv oyi yakunlandi!</b>\n\n"
             f"📚 Guruh: <b>{grp_escaped}</b>\n"
@@ -494,7 +629,7 @@ async def handle_cycle_completion(
             f"💳 To‘lov uchun karta: <code>{card_esc}</code>\n"
             f"👤 Karta egasi: <b>{owner_esc}</b>"
         )
-        await _safe_send_message(bot, group_tg_chat_id, group_msg)
+        await send_group_chat_message(bot, group, group_msg)
 
     students = await asyncio.to_thread(
         sheets.get_all_students, group_name=group_name, active_only=False
@@ -719,6 +854,54 @@ def _format_lesson_parent_combined_message(
     return f"{prefix}{body}\n\n{_center_signature(lang)}"
 
 
+def _parse_group_start_date(group: dict[str, Any]) -> Optional[date]:
+    raw = str(group.get("Boshlanish_Sanasi") or "").strip().lstrip("'")
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+async def _send_agreed_time_teacher_reminder(
+    bot: Bot, sheets: SheetsManager, group: dict[str, Any], lesson_day: date
+) -> bool:
+    """
+    One-time (per group/day, SQLite) 20:00 reminder ONLY to the group's teacher
+    for a "Kelishilgan vaqtda" group whose lesson day is tomorrow.
+    """
+    group_name = str(group.get("Guruh_Nomi") or "").strip()
+    teacher_cid = _parse_int_chat_id(group.get("Ustoz_Chat_ID"))
+    if not teacher_cid:
+        teacher_id = str(group.get("Ustoz_ID") or "").strip()
+        if teacher_id:
+            try:
+                teacher = await asyncio.to_thread(sheets.get_teacher_by_id, teacher_id)
+            except Exception:
+                teacher = None
+            teacher_cid = _parse_int_chat_id((teacher or {}).get("Chat_ID"))
+    if not teacher_cid:
+        logger.warning(
+            "[AGREED_TIME] Teacher reminder skipped for %r: no teacher chat id",
+            group_name,
+        )
+        return False
+    if not await claim_agreed_time_reminder(group_name, lesson_day.isoformat()):
+        return False
+    lang = await get_user_lang(teacher_cid)
+    text = t(
+        "agreed_time_teacher_reminder",
+        lang,
+        guruh_nomi=html.escape(group_name),
+        hafta_kuni=html.escape(format_weekday_full(lesson_day, lang)),
+    )
+    delivered = await _safe_send_message(bot, teacher_cid, text)
+    if not delivered:
+        await release_agreed_time_reminder(group_name, lesson_day.isoformat())
+    return delivered
+
+
 async def process_lesson_reminders(bot: Bot) -> None:
     now = now_tashkent()
     today = now.date()
@@ -754,10 +937,25 @@ async def process_lesson_reminders(bot: Bot) -> None:
         if not lesson_days:
             continue
 
+        dars_vaqti = str(group.get("Dars_Vaqti", "") or "")
+        start_date = _parse_group_start_date(group)
+
+        # "Kelishilgan vaqtda" (individual, agreed time): no timed reminders to
+        # students / parents at all — only the teacher is reminded the evening
+        # before the lesson day.
+        if is_agreed_lesson_time(dars_vaqti):
+            if (
+                tomorrow.weekday() in lesson_days
+                and (start_date is None or tomorrow >= start_date)
+                and time(20, 0) <= now.time() < time(20, 15)
+            ):
+                await _send_agreed_time_teacher_reminder(bot, sheets, group, tomorrow)
+            continue
+
         # Per-day schedules ("Du 14:00, Chor 15:30"): every trigger below uses the
         # exact time of the weekday it refers to (today's for same-day / 1h-before
-        # reminders, tomorrow's for the evening-before reminder).
-        dars_vaqti = str(group.get("Dars_Vaqti", "") or "")
+        # reminders, tomorrow's for the evening-before reminder). Double lessons
+        # ("10:00 / 11:30") use the FIRST session's start time.
         today_time = (
             _parse_lesson_time(get_lesson_time_for_weekday(dars_vaqti, today) or "")
             if today.weekday() in lesson_days
@@ -768,6 +966,16 @@ async def process_lesson_reminders(bot: Bot) -> None:
             if tomorrow.weekday() in lesson_days
             else None
         )
+        # Nothing before the group's lesson start date (Boshlanish_Sanasi).
+        if start_date is not None and today < start_date:
+            today_time = None
+        if start_date is not None and tomorrow < start_date:
+            tomorrow_time = None
+        if today_time is not None and await is_lesson_cancelled(
+            group_name, today.isoformat(), 1
+        ):
+            # Teacher pressed "🚫 Bugungi dars bo‘lmaydi" (first session).
+            today_time = None
         if today_time is None and tomorrow_time is None:
             continue
 
@@ -804,9 +1012,9 @@ async def process_lesson_reminders(bot: Bot) -> None:
 
         if target_advance_date and reminder_key:
             if group_tg_id:
-                await _safe_send_message(
+                await send_group_chat_message(
                     bot,
-                    group_tg_id,
+                    group,
                     t(
                         reminder_key,
                         "latn",
@@ -1177,15 +1385,14 @@ async def auto_publish_pending_topics(bot: Bot) -> None:
 
         # 1. Group Telegram Chat (Latin)
         if group:
-            grp_tg_cid = _parse_int_chat_id(group.get("Guruh_TG_Chat_ID"))
-            if grp_tg_cid is not None:
+            if _parse_int_chat_id(group.get("Guruh_TG_Chat_ID")) is not None:
                 grp_msg = _format_topic_group_block(
                     group_name=canonical_name,
                     topic_rows=topic_rows,
                     teacher_name=teacher_name,
                     lang="latn",
                 )
-                await _safe_send_message(bot, grp_tg_cid, grp_msg)
+                await send_group_chat_message(bot, group, grp_msg)
 
         # 2. Collect Students & Parents across all ready groups
         for stu in students_by_group.get(group_key, []):
@@ -1796,7 +2003,7 @@ async def maybe_send_group_weekly_reminder(
             card_esc=html.escape(card_number),
             owner_esc=html.escape(card_owner),
         )
-        delivered = await _safe_send_message(bot, group_tg_id, group_msg)
+        delivered = await send_group_chat_message(bot, group, group_msg)
         if not delivered:
             await release_group_weekly_reminder(canonical_group, previous_week)
         return delivered
@@ -1825,15 +2032,28 @@ async def send_group_initial_notice(
         if group is None:
             group = await asyncio.to_thread(sheets.get_group, clean_name)
         if not group:
-            return False
-        group_tg_id = _parse_int_chat_id(group.get("Guruh_TG_Chat_ID"))
-        if not group_tg_id:
+            logger.warning("[INITIAL_NOTICE] Skipped %r: group not found in Guruhlar", clean_name)
             return False
         canonical_group = str(group.get("Guruh_Nomi", "")).strip() or clean_name
+        raw_chat = group.get("Guruh_TG_Chat_ID")
+        if not _parse_int_chat_id(raw_chat):
+            logger.warning(
+                "[INITIAL_NOTICE] Skipped %r: Guruh_TG_Chat_ID missing/invalid (%r)",
+                canonical_group,
+                raw_chat,
+            )
+            return False
 
-        if await _count_unpaid_active_students(sheets, canonical_group) <= 0:
+        unpaid = await _count_unpaid_active_students(sheets, canonical_group)
+        if unpaid <= 0:
+            logger.info(
+                "[INITIAL_NOTICE] Skipped %r: no active unpaid students", canonical_group
+            )
             return False
         if not await claim_group_initial_notice(canonical_group):
+            logger.info(
+                "[INITIAL_NOTICE] Skipped %r: already sent / claimed", canonical_group
+            )
             return False
 
         card_number, card_owner = _get_payment_card_info()
@@ -1844,8 +2064,17 @@ async def send_group_initial_notice(
             card_esc=html.escape(card_number),
             owner_esc=html.escape(card_owner),
         )
-        delivered = await _safe_send_message(bot, group_tg_id, msg)
-        if not delivered:
+        delivered = await send_group_chat_message(
+            bot, group, msg, tag="[INITIAL_NOTICE]"
+        )
+        if delivered:
+            logger.info(
+                "[INITIAL_NOTICE] Sent to %r (chat %s, %d unpaid)",
+                canonical_group,
+                group.get("Guruh_TG_Chat_ID"),
+                unpaid,
+            )
+        else:
             await release_group_initial_notice(canonical_group)
         return delivered
     except Exception:
@@ -1883,14 +2112,21 @@ async def process_initial_group_notices(bot: Bot) -> None:
     except Exception:
         logger.exception("Failed loading groups for initial group notices")
         return
-    by_key = {
-        str(g.get("Guruh_Nomi", "")).strip().lower(): g
-        for g in groups
-        if str(g.get("Guruh_Nomi", "")).strip()
-    }
+    by_key: dict[str, dict[str, Any]] = {}
+    for g in groups:
+        g_name = str(g.get("Guruh_Nomi", "")).strip()
+        if g_name:
+            by_key[g_name.lower()] = g
+            by_key.setdefault(" ".join(g_name.lower().split()), g)
     for key in pending:
-        grp = by_key.get(key)
+        grp = by_key.get(key) or by_key.get(" ".join(str(key).split()))
         if grp is None:
+            logger.warning(
+                "[INITIAL_NOTICE] Pending timer for %r has no matching Guruhlar row "
+                "(renamed/deleted?); retrying in %s",
+                key,
+                _INITIAL_RETRY_DELAY,
+            )
             _initial_retry_after[key] = now + _INITIAL_RETRY_DELAY
             continue
         if await send_group_initial_notice(
@@ -1950,6 +2186,182 @@ def schedule_group_initial_notice(bot: Optional[Bot], group_name: str) -> None:
     task.add_done_callback(_group_reminder_tasks.discard)
 
 
+# ----------------------------------------------------------------------
+# Admin alert: attendance still not marked 2 hours after the lesson started
+# ----------------------------------------------------------------------
+
+ATTENDANCE_ALERT_DELAY = timedelta(hours=2)
+AGREED_TIME_ALERT_AT = time(21, 0)
+
+
+async def _all_admin_chat_ids() -> list[int]:
+    """ADMIN_IDS (.env) + every admin added via 👑 Adminlar (dynamic_admins)."""
+    ids: list[int] = [int(x) for x in ADMIN_IDS]
+    try:
+        for row in await get_all_dynamic_admins():
+            cid = _parse_int_chat_id(row.get("telegram_id"))
+            if cid and cid not in ids:
+                ids.append(cid)
+    except Exception:
+        logger.exception("[ATTENDANCE_ALERT] Could not load dynamic admins")
+    return ids
+
+
+async def _resolve_group_teacher(
+    sheets: SheetsManager, group: dict[str, Any]
+) -> tuple[str, str]:
+    """(teacher name, 'phone | @username / tg link') for alert texts."""
+    teacher: Optional[dict[str, Any]] = None
+    teacher_id = str(group.get("Ustoz_ID") or "").strip()
+    teacher_cid = _parse_int_chat_id(group.get("Ustoz_Chat_ID"))
+    try:
+        if teacher_id:
+            teacher = await asyncio.to_thread(sheets.get_teacher_by_id, teacher_id)
+        if not teacher and teacher_cid:
+            teacher = await asyncio.to_thread(sheets.get_teacher_by_chat_id, teacher_cid)
+    except Exception:
+        teacher = None
+    name = str((teacher or {}).get("F.I.O.") or "").strip()
+    phone = str((teacher or {}).get("Telefon") or "").strip()
+    username = str((teacher or {}).get("TG_Username") or "").strip().lstrip("@")
+    contact_parts: list[str] = []
+    if phone and phone != "Ma'lumot kiritilmagan":
+        contact_parts.append(html.escape(phone))
+    if username and username != "Ma'lumot kiritilmagan":
+        contact_parts.append(f"@{html.escape(username)}")
+    elif teacher_cid:
+        contact_parts.append(f'<a href="tg://user?id={teacher_cid}">Telegram</a>')
+    return name or "—", " | ".join(contact_parts) or "—"
+
+
+async def process_missing_attendance_alerts(bot: Bot) -> None:
+    """
+    Every few minutes (Asia/Tashkent): for each group with a lesson today whose
+    start time (each session of a double-lesson day) passed >= 2 hours ago — or,
+    for "Kelishilgan vaqtda" groups, from 21:00 — alert ALL admins once
+    (deduplicated per group/date/session in SQLite) when attendance is neither
+    marked in the cycle sheet nor cancelled ("🚫 Bugungi dars bo‘lmaydi").
+    """
+    now = now_tashkent()
+    today = now.date()
+    sheets = get_sheets_manager()
+    try:
+        groups = await asyncio.to_thread(sheets.get_all_groups)
+    except Exception:
+        logger.exception("[ATTENDANCE_ALERT] Failed loading groups")
+        return
+    today_dmy = today.strftime("%d.%m.%Y")
+    admin_ids: Optional[list[int]] = None
+
+    for group in groups:
+        group_name = str(group.get("Guruh_Nomi") or "").strip()
+        lesson_days = parse_weekdays(group.get("Dars_Kunlari", ""))
+        if not group_name or today.weekday() not in lesson_days:
+            continue
+        start_date = _parse_group_start_date(group)
+        if start_date is not None and today < start_date:
+            continue
+
+        dars_vaqti = str(group.get("Dars_Vaqti") or "")
+        due: list[tuple[int, str]] = []  # (session key, time label)
+        if is_agreed_lesson_time(dars_vaqti):
+            if now.time() >= AGREED_TIME_ALERT_AT:
+                due.append((0, t("agreed_time_label", "latn")))
+        else:
+            sessions = get_lesson_sessions_for_weekday(dars_vaqti, today)
+            is_double = len(sessions) > 1
+            for idx, hhmm in enumerate(sessions, start=1):
+                start_time = _parse_lesson_time(hhmm)
+                if start_time is None:
+                    continue
+                lesson_dt = datetime.combine(today, start_time, tzinfo=TZ)
+                if now >= lesson_dt + ATTENDANCE_ALERT_DELAY:
+                    due.append((idx if is_double else 0, hhmm))
+        if not due:
+            continue
+
+        pending: list[tuple[int, str]] = []
+        for session_key, label in due:
+            if await is_attendance_missing_alert_sent(
+                group_name, today.isoformat(), session_key
+            ):
+                continue
+            if await is_lesson_cancelled(group_name, today.isoformat(), session_key or 1):
+                continue
+            pending.append((session_key, label))
+        if not pending:
+            continue
+
+        try:
+            categorized = await asyncio.to_thread(
+                sheets.get_group_lesson_dates_categorized,
+                group_name,
+                today_dmy,
+                "latn",
+            )
+        except Exception:
+            logger.exception("[ATTENDANCE_ALERT] Could not read cycle of %r", group_name)
+            continue
+        today_entries = categorized.get("today_lessons") or []
+        if not today_entries:
+            # Today's date is not a column of the active cycle (shifted / no cycle).
+            continue
+
+        for session_key, label in pending:
+            entry = next(
+                (
+                    e
+                    for e in today_entries
+                    if session_key == 0 or int(e.get("session") or 1) == session_key
+                ),
+                None,
+            )
+            if entry is None or entry.get("is_marked") or entry.get("is_cancelled"):
+                continue
+            if not await claim_attendance_missing_alert(
+                group_name, today.isoformat(), session_key
+            ):
+                continue
+            if admin_ids is None:
+                admin_ids = await _all_admin_chat_ids()
+            teacher_name, teacher_contact = await _resolve_group_teacher(sheets, group)
+            delivered = 0
+            for admin_cid in admin_ids:
+                a_lang = await get_user_lang(admin_cid)
+                session_line = (
+                    t("attendance_alert_session_line", a_lang, n=session_key)
+                    if session_key
+                    else ""
+                )
+                text = t(
+                    "attendance_missing_admin_alert_agreed"
+                    if is_agreed_lesson_time(dars_vaqti)
+                    else "attendance_missing_admin_alert",
+                    a_lang,
+                    guruh_nomi=html.escape(group_name),
+                    ustoz_ismi=html.escape(teacher_name),
+                    ustoz_aloqa=teacher_contact,
+                    sana=format_uz_date_long(today, a_lang),
+                    dars_vaqti=html.escape(label),
+                    session_line=session_line,
+                )
+                if await _safe_send_message(bot, admin_cid, text):
+                    delivered += 1
+                await asyncio.sleep(0.05)
+            if delivered:
+                logger.info(
+                    "[ATTENDANCE_ALERT] %r %s session %s -> %d admin(s)",
+                    group_name,
+                    today.isoformat(),
+                    session_key,
+                    delivered,
+                )
+            else:
+                await release_attendance_missing_alert(
+                    group_name, today.isoformat(), session_key
+                )
+
+
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     global _registered_bot
     _registered_bot = bot
@@ -1972,6 +2384,16 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         next_run_time=now_tz + timedelta(seconds=20),
         args=[bot],
         id="process_initial_group_notices",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        process_missing_attendance_alerts,
+        trigger=IntervalTrigger(minutes=5, timezone=TZ),
+        next_run_time=now_tz + timedelta(seconds=60),
+        args=[bot],
+        id="process_missing_attendance_alerts",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

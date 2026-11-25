@@ -217,6 +217,7 @@ GROUP_HEADERS = [
     "Otilgan_Dars_Hisoblagich",
     "Oylik_Tolov_Summa",
     "Boshlanish_Sanasi",
+    "Kunlik_Dars_Soni",
 ]
 
 TEACHER_HEADERS = [
@@ -290,7 +291,16 @@ def _normalize_read_value(val: Any) -> str:
 # leading apostrophe so USER_ENTERED never turns e.g. "1/2", "12:00", "=A1" or
 # "+Kids" into a date/time/formula/number: the cell keeps the exact typed text.
 LITERAL_TEXT_HEADERS = frozenset(
-    {"Guruh_Nomi", "Guruh", "Sobiq_Guruh", "Boshlanish_Sanasi"}
+    {
+        "Guruh_Nomi",
+        "Guruh",
+        "Sobiq_Guruh",
+        "Boshlanish_Sanasi",
+        # Long supergroup ids (-100...) must never be shown as 1.00E+12.
+        "Guruh_TG_Chat_ID",
+        # "10:00 / 11:30", "Du 14:00, Chor 15:30" and "Kelishilgan vaqtda" stay text.
+        "Dars_Vaqti",
+    }
 )
 
 
@@ -448,6 +458,81 @@ def count_elapsed_lessons(dates: list[date], today: date) -> int:
     return sum(1 for d in dates if d < today)
 
 
+# ----------------------------------------------------------------------
+# Double lessons ("Bir kunda 2 ta dars"): each lesson day has 2 sessions and
+# gets two date columns "DD.MM (1)" / "DD.MM (2)". Oylik_Dars_Soni counts
+# SESSIONS, so 8 lessons on 2-session days = 4 lesson days.
+# ----------------------------------------------------------------------
+
+DATE_HEADER_RE = re.compile(
+    r"^\s*(?P<date>\d{1,2}\.\d{1,2}(?:\.\d{4})?)\s*(?:\(\s*(?P<session>\d)\s*\))?\s*$"
+)
+CANCELLED_LESSON_TEXT = "Qoldirildi"
+# Muted gray used for teacher-cancelled ("🚫 Bugungi dars bo‘lmaydi") columns.
+CANCELLED_MUTED_BG = {"red": 0.851, "green": 0.851, "blue": 0.851}
+
+
+def split_date_header(header: str) -> tuple[str, Optional[int]]:
+    """'05.11 (2)' -> ('05.11', 2); '05.11' -> ('05.11', None); other -> (raw, None)."""
+    raw = str(header or "").strip()
+    match = DATE_HEADER_RE.match(raw)
+    if not match:
+        return raw, None
+    session = match.group("session")
+    return match.group("date"), (int(session) if session else None)
+
+
+def get_group_daily_lessons(group: Optional[dict[str, Any]]) -> int:
+    """Kunlik_Dars_Soni of a Guruhlar row: 2 for double lessons, otherwise 1."""
+    try:
+        value = int(str((group or {}).get("Kunlik_Dars_Soni") or "1").strip() or 1)
+    except (TypeError, ValueError):
+        value = 1
+    return 2 if value >= 2 else 1
+
+
+def slot_header(lesson_date: date, session: int, daily_lessons: int = 1) -> str:
+    """Date column header: 'DD.MM' (single) or 'DD.MM (1)' / 'DD.MM (2)' (double)."""
+    base = lesson_date.strftime("%d.%m")
+    return f"{base} ({session})" if int(daily_lessons) >= 2 else base
+
+
+def generate_cycle_slots(
+    start_date: date, lesson_days: list[int], count: int, daily_lessons: int = 1
+) -> list[tuple[date, int]]:
+    """
+    (date, session) pairs filling `count` lesson columns from start_date:
+    one per lesson day, or 2 per lesson day for double lessons.
+    """
+    if not lesson_days:
+        raise ValueError("lesson_days cannot be empty")
+    if count <= 0:
+        raise ValueError("count must be positive")
+    per_day = 2 if int(daily_lessons) >= 2 else 1
+    slots: list[tuple[date, int]] = []
+    cursor = start_date
+    while len(slots) < count:
+        if cursor.weekday() in lesson_days:
+            for session in range(1, per_day + 1):
+                if len(slots) < count:
+                    slots.append((cursor, session))
+        cursor += timedelta(days=1)
+    return slots
+
+
+def next_slot_after(
+    last_date: date, last_session: int, lesson_days: list[int], daily_lessons: int = 1
+) -> tuple[date, int]:
+    """The lesson slot right after (last_date, last_session)."""
+    if int(daily_lessons) >= 2 and int(last_session or 1) < 2:
+        return last_date, 2
+    return get_next_lesson_date_after(last_date, lesson_days), 1
+
+
+def slot_headers(slots: list[tuple[date, int]], daily_lessons: int = 1) -> list[str]:
+    return [slot_header(d, sess, daily_lessons) for d, sess in slots]
+
+
 def first_lesson_date_on_or_after(start: date, lesson_days: list[int]) -> date:
     """Nearest scheduled lesson date (start itself when it is a lesson day)."""
     if not lesson_days:
@@ -530,6 +615,23 @@ def group_sheet_title_prefixes(group_name: str) -> list[str]:
     return prefixes
 
 
+_SHEET_HASH_TAIL_RE = re.compile(r"~[0-9a-f]{4}$", re.IGNORECASE)
+_TAB_YEAR_RE = re.compile(r"^(.*)_(\d{4})$")
+
+
+def normalize_sheet_base(text: str) -> str:
+    """
+    Loose comparison key for a group name / tab base: forbidden tab characters
+    -> '-', whitespace collapsed, apostrophes trimmed, hash tail ('~db86')
+    removed, case-folded. 'Мишкат 8:00 даги гурух' and the tab base
+    'Мишкат 8-00 даги гурух~db86' both give 'мишкат 8-00 даги гурух'.
+    """
+    base = " ".join(str(text or "").split())
+    base = _SHEET_HASH_TAIL_RE.sub("", base)
+    base = SHEET_TITLE_FORBIDDEN_RE.sub("-", base).strip().strip("'").strip()
+    return base.casefold()
+
+
 def match_group_sheet_title(title: str, group_name: str) -> Optional[int]:
     """Year of a '{Group}_{YYYY}' tab belonging to group_name (case-insensitive), else None."""
     clean_title = str(title or "").strip()
@@ -537,6 +639,36 @@ def match_group_sheet_title(title: str, group_name: str) -> Optional[int]:
         m = re.match(rf"^{re.escape(prefix)}_(\d{{4}})$", clean_title, re.IGNORECASE)
         if m:
             return int(m.group(1))
+    return None
+
+
+def match_group_sheet_title_loose(title: str, group_name: str) -> Optional[int]:
+    """
+    Fallback matcher for tabs whose exact title drifted (manual edits, a hash
+    computed from a slightly different spelling, extra spaces...). Exact matches
+    via match_group_sheet_title always win; this one only compares
+    normalize_sheet_base() keys of the tab base and the group name.
+    """
+    exact = match_group_sheet_title(title, group_name)
+    if exact is not None:
+        return exact
+    m = _TAB_YEAR_RE.match(str(title or "").strip())
+    if not m:
+        return None
+    tab_key = normalize_sheet_base(m.group(1))
+    group_key = normalize_sheet_base(group_name)
+    if not tab_key or not group_key:
+        return None
+    if tab_key == group_key:
+        return int(m.group(2))
+    # Long names are trimmed in the tab title: accept a trimmed prefix only
+    # when the tab carries the hash tail of a sanitized/trimmed title.
+    if (
+        _SHEET_HASH_TAIL_RE.search(m.group(1))
+        and len(tab_key) >= 20
+        and group_key.startswith(tab_key)
+    ):
+        return int(m.group(2))
     return None
 
 
@@ -832,6 +964,7 @@ class SheetsManager:
                     ss.add_worksheet, title=title, rows=rows, cols=cols
                 )
                 self._created_titles.add(title)
+                self._tab_list_cache = None
                 cached_headers: list[str] = []
                 if headers:
                     self._execute_with_retry(
@@ -890,6 +1023,19 @@ class SheetsManager:
                 return self._execute_with_retry(ss.worksheet, title)
             except gspread.WorksheetNotFound:
                 continue
+        # Normalized prefix matching over every tab (hash tails, ':' vs '-',
+        # spacing / case drift) so hashed tab names always resolve.
+        target_year = int(str(year))
+        cached_tabs = getattr(self, "_tab_list_cache", None)
+        now_ts = _time.monotonic()
+        if cached_tabs is not None and now_ts - cached_tabs[0] < 30:
+            all_tabs = cached_tabs[1]
+        else:
+            all_tabs = list(self._execute_with_retry(ss.worksheets))
+            self._tab_list_cache = (now_ts, all_tabs)
+        for ws in all_tabs:
+            if match_group_sheet_title_loose(ws.title, group_name) == target_year:
+                return ws
         raise gspread.WorksheetNotFound(safe_title)
 
     def _get_cached_headers(self, ws: gspread.Worksheet) -> list[str]:
@@ -3950,6 +4096,7 @@ class SheetsManager:
         lesson_time: str = "",
         teacher_id: str = "",
         monthly_price: int | str = "",
+        daily_lessons: int = 1,
     ) -> dict[str, Any]:
         with self._lock:
             ws = self._get_or_create_worksheet(
@@ -3969,6 +4116,7 @@ class SheetsManager:
                 "Dars_Vaqti": _normalize_read_value(lesson_time),
                 "Otilgan_Dars_Hisoblagich": "0",
                 "Oylik_Tolov_Summa": _normalize_read_value(monthly_price),
+                "Kunlik_Dars_Soni": "2" if int(daily_lessons or 1) >= 2 else "1",
             }
             new_row = [row_map.get(h, "") for h in headers]
             new_row_idx = self._append_row_and_get_index(ws, new_row)
@@ -4067,6 +4215,7 @@ class SheetsManager:
             for ws in list(self._execute_with_retry(ss.worksheets)):
                 if match_group_sheet_title(ws.title, canonical_name) is not None:
                     self._execute_with_retry(ss.del_worksheet, ws)
+                    self._tab_list_cache = None
                     self._ws_cache.pop(ws.title, None)
                     deleted_any = True
 
@@ -4181,6 +4330,7 @@ class SheetsManager:
                         if new_ws_title == old_ws_title:
                             continue
                         self._execute_with_retry(ws.update_title, new_ws_title)
+                        self._tab_list_cache = None
                         if old_ws_title in self._ws_cache:
                             cached_ws, cached_hdrs = self._ws_cache.pop(old_ws_title)
                             self._ws_cache[new_ws_title] = (cached_ws, cached_hdrs)
@@ -4191,7 +4341,11 @@ class SheetsManager:
                             new_name,
                         )
 
-            if "Oylik_Dars_Soni" in clean_updates or "Dars_Kunlari" in clean_updates:
+            if (
+                "Oylik_Dars_Soni" in clean_updates
+                or "Dars_Kunlari" in clean_updates
+                or "Kunlik_Dars_Soni" in clean_updates
+            ):
                 grp_now = self.get_group(active_name)
                 if grp_now:
                     new_count = int(grp_now.get("Oylik_Dars_Soni") or 12)
@@ -4453,7 +4607,17 @@ class SheetsManager:
                         tolov_col_idx = col_idx
                         break
                     if col_idx >= 2 and val:
-                        date_columns.append({"col_idx": col_idx, "date_str": val})
+                        pure_date, session = split_date_header(val)
+                        date_columns.append(
+                            {
+                                "col_idx": col_idx,
+                                # Pure 'DD.MM' (double-lesson suffix stripped) so
+                                # every date comparison keeps working unchanged.
+                                "date_str": pure_date,
+                                "session": session,
+                                "label": val,
+                            }
+                        )
 
                 if tolov_col_idx is None:
                     tolov_col_idx = (
@@ -4550,7 +4714,10 @@ class SheetsManager:
                         bg = bg_style.get("rgbColor")
                     if _color_matches(bg, YELLOW_BG) or _color_matches(bg, GREEN_BG):
                         marked_cols.add(c_idx)
-                    elif row_offset == 0 and _color_matches(bg, RED_BG):
+                    elif row_offset == 0 and (
+                        _color_matches(bg, RED_BG)
+                        or _color_matches(bg, CANCELLED_MUTED_BG)
+                    ):
                         cancelled_cols.add(c_idx)
         except Exception:
             pass
@@ -4638,6 +4805,8 @@ class SheetsManager:
                 results.append(
                     {
                         "date_str": date_str,
+                        "label": dc.get("label") or date_str,
+                        "session": dc.get("session"),
                         "col_idx": col_idx,
                         "weekday": weekday_str,
                         "full_date": full_date_iso,
@@ -4722,6 +4891,8 @@ class SheetsManager:
                     {
                         "col_idx": dc["col_idx"],
                         "date_str": dc["date_str"],
+                        "label": dc.get("label") or dc["date_str"],
+                        "session": dc.get("session"),
                         "iso": parsed_date.isoformat(),
                         "is_cancelled": dc["col_idx"] in cancelled_cols,
                     }
@@ -4877,6 +5048,8 @@ class SheetsManager:
 
                 entry = {
                     "date_str": date_str,
+                    "session": dc.get("session"),
+                    "label": dc.get("label") or date_str,
                     "full_date_dmy": parsed_date.strftime("%d.%m.%Y"),
                     "full_date": parsed_date.isoformat(),
                     "col_idx": col_idx,
@@ -4926,7 +5099,11 @@ class SheetsManager:
             if not lesson_days:
                 raise ValueError(f"Group '{group_name}' has no valid Dars_Kunlari")
 
-            lesson_dates = generate_cycle_dates(start_date, lesson_days, lesson_count)
+            daily_lessons = get_group_daily_lessons(group)
+            slots = generate_cycle_slots(
+                start_date, lesson_days, lesson_count, daily_lessons
+            )
+            lesson_dates = [d for d, _sess in slots]
             target_year = year or lesson_dates[0].year
             ws = self.get_or_create_group_year_sheet(group_name, target_year)
             ss = self._get_spreadsheet()
@@ -4938,7 +5115,8 @@ class SheetsManager:
                 )
 
             cycle_title = format_cycle_title(lesson_dates, cycle_number)
-            date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+            # "DD.MM" per lesson, or "DD.MM (1)" / "DD.MM (2)" for double lessons.
+            date_strs = slot_headers(slots, daily_lessons)
             header_row = ["Talaba_ID", "F.I.O.", *date_strs, "To'lov"]
 
             active_students = self.get_all_students(
@@ -5094,8 +5272,8 @@ class SheetsManager:
                 "cycle_title": cycle_title,
                 "cycle_number": cycle_number,
                 "dates": date_strs,
-                "start_date": date_strs[0],
-                "end_date": date_strs[-1],
+                "start_date": lesson_dates[0].strftime("%d.%m"),
+                "end_date": lesson_dates[-1].strftime("%d.%m"),
             }
 
     def create_new_cycle(
@@ -5233,9 +5411,14 @@ class SheetsManager:
 
             completed_lessons = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
 
+            daily_lessons = get_group_daily_lessons(self.get_group(group_name) or group)
+
             if completed_lessons <= 0:
-                lesson_dates = generate_cycle_dates(anchor_date, lesson_days, count)
-                date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+                fresh_slots = generate_cycle_slots(
+                    anchor_date, lesson_days, count, daily_lessons
+                )
+                lesson_dates = [d for d, _sess in fresh_slots]
+                date_strs = slot_headers(fresh_slots, daily_lessons)
                 cycle_title = format_cycle_title(
                     lesson_dates, active_cycle["cycle_number"]
                 )
@@ -5410,31 +5593,48 @@ class SheetsManager:
 
             # Mid-cycle change: completed_lessons > 0
             preserved_cols = active_cycle["date_columns"][:completed_lessons]
-            preserved_date_strs = [dc["date_str"] for dc in preserved_cols]
+            # Keep the exact header (incl. a "(1)"/"(2)" double-lesson suffix).
+            preserved_date_strs = [
+                dc.get("label") or dc["date_str"] for dc in preserved_cols
+            ]
 
             prev_date: Optional[date] = None
+            prev_session = 1
             running_year = sheet_year
             for dc in preserved_cols:
                 try:
-                    d_val, m_val = map(int, dc["date_str"].split("."))
+                    d_val, m_val = map(int, dc["date_str"].split(".")[:2])
                     if prev_date and m_val < prev_date.month:
                         running_year += 1
                     prev_date = date(running_year, m_val, d_val)
+                    prev_session = int(dc.get("session") or 1)
                 except ValueError:
                     pass
 
-            if prev_date and prev_date >= anchor_date:
-                upcoming_start = prev_date + timedelta(days=1)
-            else:
-                upcoming_start = anchor_date
-
             remaining_count = max(0, count - len(preserved_cols))
-            upcoming_dates = (
-                generate_cycle_dates(upcoming_start, lesson_days, remaining_count)
-                if remaining_count > 0
-                else []
-            )
-            upcoming_date_strs = [d.strftime("%d.%m") for d in upcoming_dates]
+            upcoming_slots: list[tuple[date, int]] = []
+            if remaining_count > 0:
+                if (
+                    prev_date
+                    and prev_date >= anchor_date
+                    and daily_lessons >= 2
+                    and prev_session < 2
+                    and prev_date.weekday() in lesson_days
+                ):
+                    # Finish the second session of the last preserved day first.
+                    upcoming_slots.append((prev_date, 2))
+                if prev_date and prev_date >= anchor_date:
+                    upcoming_start = prev_date + timedelta(days=1)
+                else:
+                    upcoming_start = anchor_date
+                still_needed = remaining_count - len(upcoming_slots)
+                if still_needed > 0:
+                    upcoming_slots.extend(
+                        generate_cycle_slots(
+                            upcoming_start, lesson_days, still_needed, daily_lessons
+                        )
+                    )
+            upcoming_date_strs = slot_headers(upcoming_slots, daily_lessons)
             final_date_strs = preserved_date_strs + upcoming_date_strs
 
             title_row_0 = active_cycle["title_row_idx"]
@@ -5618,7 +5818,11 @@ class SheetsManager:
             return final_date_strs
 
     def _find_cycle_for_date_str(
-        self, group_name: str, target_date_str: str, year: Optional[int] = None
+        self,
+        group_name: str,
+        target_date_str: str,
+        year: Optional[int] = None,
+        session: Optional[int] = None,
     ) -> Optional[tuple[gspread.Worksheet, dict[str, Any], int]]:
         target_str = target_date_str.strip()
         short_str = target_str[:5] if re.match(r"^\d{2}\.\d{2}\.\d{4}$", target_str) else target_str
@@ -5635,6 +5839,10 @@ class SheetsManager:
             for cycle in reversed(cycles):
                 for dc in cycle["date_columns"]:
                     if dc["date_str"] == target_str or dc["date_str"] == short_str:
+                        if session is not None and int(dc.get("session") or 1) != int(
+                            session
+                        ):
+                            continue
                         return ws, cycle, dc["col_idx"]
         return None
 
@@ -5671,8 +5879,21 @@ class SheetsManager:
         group_name: str,
         cancel_date: date,
         year: Optional[int] = None,
+        session: Optional[int] = None,
+        muted: bool = False,
     ) -> dict[str, Any]:
-        """Marks cancelled date column Red (#F4CCCC) and appends the next lesson date before To'lov."""
+        """
+        Cancels one lesson column of the active cycle and appends ONE replacement
+        lesson column (next slot after the cycle's last lesson, following
+        Dars_Kunlari / Kunlik_Dars_Soni) right before To'lov, so the cycle keeps
+        all Oylik_Dars_Soni held lessons.
+
+        - default: the column is painted Red (#F4CCCC) (admin cancellation);
+        - muted=True (teacher "🚫 Bugungi dars bo‘lmaydi"): muted gray header and
+          cells, every student cell gets "Qoldirildi".
+        `session` picks "DD.MM (1)" / "DD.MM (2)" of a double-lesson day.
+        Otilgan_Dars_Hisoblagich is never touched (+0).
+        """
         with self._lock:
             group = self.get_group(group_name)
             if not group:
@@ -5680,36 +5901,59 @@ class SheetsManager:
             lesson_days = parse_weekdays(group.get("Dars_Kunlari", ""))
             if not lesson_days:
                 raise ValueError(f"Group '{group_name}' has no Dars_Kunlari")
+            daily_lessons = get_group_daily_lessons(group)
 
             ws, cycle = self._find_cycle_for_date_or_latest(group_name, cancel_date, year)
             ss = self._get_spreadsheet()
             cancel_str = cancel_date.strftime("%d.%m")
+            _marked_cols, already_cancelled = self._get_cycle_colored_columns(ws, cycle)
 
             cancel_col_idx: Optional[int] = None
+            cancel_label = cancel_str
             for dc in cycle["date_columns"]:
-                if dc["date_str"] == cancel_str:
-                    cancel_col_idx = dc["col_idx"]
-                    break
+                if dc["date_str"] != cancel_str:
+                    continue
+                if session is not None and int(dc.get("session") or 1) != int(session):
+                    continue
+                if session is None and dc["col_idx"] in already_cancelled:
+                    continue
+                cancel_col_idx = dc["col_idx"]
+                cancel_label = dc.get("label") or cancel_str
+                break
 
             if cancel_col_idx is None:
                 raise ValueError(
                     f"Date {cancel_str} not found in active cycle '{cycle['title']}'"
                 )
+            if cancel_col_idx in already_cancelled:
+                return {
+                    "cycle_title": cycle["title"],
+                    "cancelled_date": cancel_label,
+                    "new_end_date": "",
+                    "already_cancelled": True,
+                }
 
             sheet_year = (
                 int(ws.title.rsplit("_", 1)[-1]) if "_" in ws.title else cancel_date.year
             )
             prev_date: Optional[date] = None
+            prev_session = 1
             running_year = sheet_year
             for dc in cycle["date_columns"]:
-                d_val, m_val = map(int, dc["date_str"].split("."))
+                try:
+                    d_val, m_val = map(int, dc["date_str"].split(".")[:2])
+                except ValueError:
+                    continue
                 if prev_date and m_val < prev_date.month:
                     running_year += 1
                 prev_date = date(running_year, m_val, d_val)
+                prev_session = int(dc.get("session") or 1)
 
             last_cycle_date = prev_date or cancel_date
-            new_lesson_date = get_next_lesson_date_after(last_cycle_date, lesson_days)
-            new_date_str = new_lesson_date.strftime("%d.%m")
+            new_lesson_date, new_session = next_slot_after(
+                last_cycle_date, prev_session, lesson_days, daily_lessons
+            )
+            new_date_str = slot_header(new_lesson_date, new_session, daily_lessons)
 
             tolov_col_idx = cycle["tolov_col_idx"]
             new_tolov_col_idx = tolov_col_idx + 1
@@ -5744,6 +5988,14 @@ class SheetsManager:
                         "values": [[s_row["payment_status"]]],
                     }
                 )
+            if muted:
+                for s_row in cycle["student_rows"]:
+                    value_updates.append(
+                        {
+                            "range": f"{_col_letter(cancel_col_idx)}{s_row['row_idx'] + 1}",
+                            "values": [[CANCELLED_LESSON_TEXT]],
+                        }
+                    )
             self._execute_with_retry(
                 ws.batch_update, value_updates, value_input_option="USER_ENTERED"
             )
@@ -5788,7 +6040,8 @@ class SheetsManager:
                     end_row_0,
                     cancel_col_idx,
                     cancel_col_idx + 1,
-                    RED_BG,
+                    CANCELLED_MUTED_BG if muted else RED_BG,
+                    bold=False if muted else None,
                     h_align="CENTER",
                 ),
                 _cell_bg_request(
@@ -5832,11 +6085,15 @@ class SheetsManager:
                     )
                 )
             self._execute_with_retry(ss.batch_update, {"requests": requests})
+            self._cycle_snapshot_cache.clear()
 
             return {
                 "cycle_title": cycle["title"],
-                "cancelled_date": cancel_str,
+                "cancelled_date": cancel_label,
                 "new_end_date": new_date_str,
+                "new_lesson_date": new_lesson_date,
+                "new_session": new_session,
+                "already_cancelled": False,
             }
 
     def save_attendance_for_date(
@@ -5845,8 +6102,11 @@ class SheetsManager:
         target_date_str: str,
         attendance_dict: dict[str, str],
         year: Optional[int] = None,
+        session: Optional[int] = None,
     ) -> dict[str, Any]:
         """
+        `session` selects "DD.MM (1)" / "DD.MM (2)" of a double-lesson day; each
+        session is a separate lesson (+1 Otilgan_Dars_Hisoblagich each).
         Writes ✅/❌ into target_date_str column for each student and colors cells Yellow (#FFF2CC)
         (or Green #D9EAD3 if already paid).
         Increments Otilgan_Dars_Hisoblagich in Guruhlar by +1 ONLY if the column was previously unmarked.
@@ -5866,7 +6126,9 @@ class SheetsManager:
             elif re.match(r"^\d{2}\.\d{2}\.\d{4}$", date_str):
                 date_str = datetime.strptime(date_str, "%d.%m.%Y").strftime("%d.%m")
 
-            found = self._find_cycle_for_date_str(group_name, date_str, year)
+            found = self._find_cycle_for_date_str(
+                group_name, date_str, year, session=session
+            )
             if not found:
                 raise ValueError(
                     f"Date '{date_str}' not found in active cycle for group '{group_name}'"
@@ -6089,10 +6351,13 @@ class SheetsManager:
                 count = 12
 
             effective = first_lesson_date_on_or_after(new_start, lesson_days)
-            lesson_dates = generate_cycle_dates(effective, lesson_days, count)
+            daily_lessons = get_group_daily_lessons(group)
+            slots = generate_cycle_slots(effective, lesson_days, count, daily_lessons)
+            lesson_dates = [d for d, _sess in slots]
             if lesson_dates[-1] < today_val:
                 return {"ok": False, "reason": "all_past"}
-            date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+            date_strs = slot_headers(slots, daily_lessons)
+            # Every session dated strictly before today counts as elapsed.
             elapsed = sum(1 for d in lesson_dates if d < today_val)
             start_str = effective.strftime("%d.%m.%Y")
 
@@ -6138,6 +6403,7 @@ class SheetsManager:
                 "ok": True,
                 "start_date": effective,
                 "dates": lesson_dates,
+                "slots": slots,
                 "date_strs": date_strs,
                 "elapsed": elapsed,
                 "total": count,
@@ -6522,7 +6788,7 @@ class SheetsManager:
 
         for g_name in candidate_names:
             for ws in all_sheets:
-                ws_year = match_group_sheet_title(ws.title, g_name)
+                ws_year = match_group_sheet_title_loose(ws.title, g_name)
                 if ws_year is None:
                     continue
                 if year is not None and ws_year != year:
@@ -7405,6 +7671,7 @@ class SheetsManager:
         target_date_str: str,
         attendance_dict: dict[str, str],
         year: Optional[int] = None,
+        session: Optional[int] = None,
     ) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(
@@ -7413,6 +7680,26 @@ class SheetsManager:
                 target_date_str,
                 attendance_dict,
                 year,
+                session,
+            )
+        finally:
+            self._cycle_snapshot_cache.clear()
+
+    async def a_cancel_lesson_and_shift_date(
+        self,
+        group_name: str,
+        cancel_date: date,
+        session: Optional[int] = None,
+        muted: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                self.cancel_lesson_and_shift_date,
+                group_name,
+                cancel_date,
+                None,
+                session,
+                muted,
             )
         finally:
             self._cycle_snapshot_cache.clear()
