@@ -421,7 +421,7 @@ def _get_existing_attendance_for_date_sync(
         date_str = lesson_date.strftime("%d.%m")
         for year_candidate in (lesson_date.year, lesson_date.year - 1):
             try:
-                ws = ss.worksheet(f"{group_name.strip()}_{year_candidate}")
+                ws = sheets._open_group_year_ws(ss, group_name, year_candidate)
             except Exception:
                 continue
             for cycle in reversed(sheets.parse_cycles_from_sheet(ws)):
@@ -453,7 +453,7 @@ def _extract_last_cycle_date_and_unpaid(
         ss = sheets._get_spreadsheet()
         for year_candidate in (reference_date.year, reference_date.year - 1):
             try:
-                ws = ss.worksheet(f"{group_name.strip()}_{year_candidate}")
+                ws = sheets._open_group_year_ws(ss, group_name, year_candidate)
             except Exception:
                 continue
             for cycle in reversed(sheets.parse_cycles_from_sheet(ws)):

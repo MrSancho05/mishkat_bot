@@ -285,9 +285,8 @@ def _extract_latest_cycle_completion_data(
     with sheets._lock:
         ss = sheets._get_spreadsheet()
         for year_candidate in (reference_date.year, reference_date.year - 1):
-            sheet_title = f"{group_name.strip()}_{year_candidate}"
             try:
-                ws = ss.worksheet(sheet_title)
+                ws = sheets._open_group_year_ws(ss, group_name, year_candidate)
             except Exception:
                 continue
             cycles = sheets.parse_cycles_from_sheet(ws)

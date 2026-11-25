@@ -26,6 +26,7 @@ from app.scheduler import schedule_group_initial_notice
 from app.utils import (
     build_per_day_lesson_time,
     format_lesson_time_display,
+    make_group_join_slug,
     normalize_hhmm,
     now_tashkent,
     parse_calendar_month,
@@ -125,7 +126,16 @@ CONFIRM_SCHEDULE_STATE = getattr(
     _FallbackGroupEditStates.confirming_schedule,
 )
 
-INVALID_SHEET_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
+# Group display names (Guruh_Nomi) accept ANY non-empty text: colons, slashes,
+# brackets, quotes, emojis, long names... Only the Google Sheets TAB title is
+# sanitized (app.sheets.make_safe_sheet_title). The exact values below are
+# internal inline-keyboard sentinels and therefore cannot be used as a name.
+RESERVED_GROUP_NAMES = frozenset({"__cancel__", "__back__"})
+
+
+def _is_acceptable_group_name(name: str) -> bool:
+    return bool(name) and name not in RESERVED_GROUP_NAMES
+
 TIME_FORMAT_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 TEACHER_SHEET_NAME = "Ustozlar"
@@ -222,9 +232,8 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Yangi guruh nomini kiriting (masalan: <code>Mishkat Kids</code>):"
         ),
         "add_group_invalid_name": (
-            "❌ Guruh nomi noto‘g‘ri. Nom bo‘sh bo‘lmasligi, 50 belgidan oshmasligi "
-            "va <code>: \\ / ? * [ ]</code> belgilarini o‘z ichiga olmasligi kerak.\n"
-            "Qaytadan kiriting:"
+            "❌ Guruh nomi bo‘sh bo‘lmasligi kerak. Iltimos, guruh nomini "
+            "matn ko‘rinishida kiriting:"
         ),
         "add_group_already_exists": (
             "⚠️ <b>{group}</b> nomli guruh allaqachon mavjud.\n"
@@ -482,9 +491,8 @@ LOCAL_TEXTS: dict[str, dict[str, str]] = {
             "Янги гуруҳ номини киритинг (масалан: <code>Mishkat Kids</code>):"
         ),
         "add_group_invalid_name": (
-            "❌ Гуруҳ номи нотўғри. Ном бўш бўлмаслиги, 50 белгидан ошмаслиги "
-            "ва <code>: \\ / ? * [ ]</code> белгиларини ўз ичига олмаслиги керак.\n"
-            "Қайтадан киритинг:"
+            "❌ Гуруҳ номи бўш бўлмаслиги керак. Илтимос, гуруҳ номини "
+            "матн кўринишида киритинг:"
         ),
         "add_group_already_exists": (
             "⚠️ <b>{group}</b> номли гуруҳ аллақачон мавжуд.\n"
@@ -1135,10 +1143,7 @@ def _sync_update_group_fee(
 
 
 def _make_join_slug(group_name: str) -> str:
-    return (
-        re.sub(r"[^A-Za-z0-9_-]+", "_", group_name.strip()).strip("_")[:55]
-        or "group"
-    )
+    return make_group_join_slug(group_name)
 
 
 def _format_clickable_phone(raw_phone: str, fallback: str = "—") -> str:
@@ -1814,37 +1819,33 @@ def _group_detail_kb(
 
 
 def _group_edit_fields_kb(group_name: str, lang: str) -> InlineKeyboardMarkup:
+    """
+    Admin "✏️ Guruhni tahrirlash" panel: one inline button per group attribute
+    (2-column layout), plus full update / delete and navigation rows.
+    """
+
+    def _fld(label_key: str, field: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=t(label_key, lang), callback_data=f"grp_edit_fld:{group_name}:{field}"
+        )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text=_lt("btn_edit_group_name", lang),
-                    callback_data=f"grp_edit_fld:{group_name}:name",
-                ),
-                InlineKeyboardButton(
-                    text="👨‍🏫 Ustoz" if lang == "latn" else "👨‍🏫 Устоз",
-                    callback_data=f"grp_edit_fld:{group_name}:teacher",
-                ),
+                _fld("btn_grp_edit_name", "name"),
+                _fld("btn_grp_edit_teacher", "teacher"),
             ],
             [
-                InlineKeyboardButton(
-                    text="🔢 Dars soni" if lang == "latn" else "🔢 Дарс сони",
-                    callback_data=f"grp_edit_fld:{group_name}:count",
-                ),
-                InlineKeyboardButton(
-                    text="📆 Dars kunlari" if lang == "latn" else "📆 Дарс кунлари",
-                    callback_data=f"grp_edit_fld:{group_name}:days",
-                ),
+                _fld("btn_grp_edit_days", "days"),
+                _fld("btn_grp_edit_time", "time"),
             ],
             [
-                InlineKeyboardButton(
-                    text="⏰ Dars vaqti" if lang == "latn" else "⏰ Дарс вақти",
-                    callback_data=f"grp_edit_fld:{group_name}:time",
-                ),
-                InlineKeyboardButton(
-                    text=_lt("btn_edit_group_price", lang),
-                    callback_data=f"grp_edit_fld:{group_name}:price",
-                ),
+                _fld("btn_grp_edit_price", "price"),
+                _fld("btn_grp_edit_count", "count"),
+            ],
+            [
+                _fld("btn_grp_edit_chat", "chat"),
+                _fld("btn_grp_edit_start", "start"),
             ],
             [
                 InlineKeyboardButton(
@@ -3512,13 +3513,7 @@ async def msg_add_group_name(message: Message, state: FSMContext) -> None:
         await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     group_name = (message.text or "").strip()
-    if (
-        not group_name
-        or len(group_name) > 50
-        or group_name.startswith("__")
-        or INVALID_SHEET_CHARS_RE.search(group_name)
-        or "\n" in group_name
-    ):
+    if not _is_acceptable_group_name(group_name):
         await message.answer(
             _lt("add_group_invalid_name", lang),
             reply_markup=group_add_cancel_kb(lang, back_cb="grp_add:back:menu"),
@@ -4106,6 +4101,14 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             1,
             initial_dates[0].year,
         )
+        start_date_str = initial_dates[0].strftime("%d.%m.%Y")
+        await asyncio.to_thread(
+            sheets.update_group,
+            group_name,
+            {"Boshlanish_Sanasi": start_date_str},
+        )
+        await upsert_group_counter(group_name, lesson_count=elapsed_count)
+        await database.set_group_start_date(group_name, start_date_str)
         if elapsed_count > 0:
             await asyncio.to_thread(
                 sheets.update_group,
@@ -4225,6 +4228,19 @@ async def _show_group_edit_panel(
     else:
         fee_line = _lt("group_fee_not_set", lang)
     body = f"{body}\n{fee_line}"
+    start_raw = str(group.get("Boshlanish_Sanasi") or "").strip()
+    if not start_raw:
+        start_raw = await database.get_group_start_date(canonical) or ""
+    chat_raw = str(group.get("Guruh_TG_Chat_ID") or "").strip()
+    body = (
+        f"{body}\n"
+        + t(
+            "group_edit_extra_info",
+            lang,
+            start=html.escape(start_raw or "—"),
+            chat=html.escape(chat_raw or "—"),
+        )
+    )
 
     text = f"{notice}\n\n{body}" if notice else body
     kb = _group_edit_fields_kb(canonical, lang)
@@ -4395,7 +4411,8 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
         await state.clear()
         await callback.answer(_lt("no_permission", lang), show_alert=True)
         return
-    _, group_name, field = (callback.data or "").split(":", 2)
+    # Group names may contain ":" -> the trailing token is split off from the right.
+    group_name, field = (callback.data or "").split(":", 1)[1].rsplit(":", 1)
     await state.update_data(edit_group_name=group_name)
     if not callback.message:
         await callback.answer()
@@ -4464,6 +4481,43 @@ async def cb_edit_group_field(callback: CallbackQuery, state: FSMContext) -> Non
             ),
             parse_mode="HTML",
         )
+    elif field == "chat":
+        group = await get_sheets_manager().a_get_group(group_name)
+        if not group:
+            await callback.answer(_lt("group_not_found", lang), show_alert=True)
+            return
+        canonical = group["Guruh_Nomi"].strip()
+        await state.update_data(edit_group_name=canonical)
+        await state.set_state(GroupEditStates.entering_chat_id)
+        await callback.message.edit_text(
+            t(
+                "grp_edit_enter_chat_id",
+                lang,
+                group=html.escape(canonical),
+                current=html.escape(str(group.get("Guruh_TG_Chat_ID") or "—")),
+            ),
+            reply_markup=step_nav_inline_kb(
+                lang,
+                back_cb=f"grp_edit:back:fields:{canonical}",
+                cancel_cb="grp_edit:cancel",
+            ),
+            parse_mode="HTML",
+        )
+    elif field == "start":
+        group = await get_sheets_manager().a_get_group(group_name)
+        if not group:
+            await callback.answer(_lt("group_not_found", lang), show_alert=True)
+            return
+        if not parse_weekdays(group.get("Dars_Kunlari", "")):
+            await callback.answer(t("grp_edit_start_no_days", lang), show_alert=True)
+            return
+        canonical = group["Guruh_Nomi"].strip()
+        current = await _current_group_start_date(group)
+        await state.update_data(edit_group_name=canonical)
+        await state.set_state(GroupEditStates.picking_start_date)
+        await _render_edit_start_calendar(
+            callback.message, group, lang, current, current or today_tashkent()
+        )
     elif field == "full_update":
         group = await get_sheets_manager().a_get_group(group_name)
         if not group:
@@ -4505,13 +4559,7 @@ async def msg_edit_group_new_name(message: Message, state: FSMContext) -> None:
         return
     old_name = (await state.get_data()).get("edit_group_name", "")
     new_name = (message.text or "").strip()
-    if (
-        not new_name
-        or len(new_name) > 50
-        or new_name.startswith("__")
-        or INVALID_SHEET_CHARS_RE.search(new_name)
-        or "\n" in new_name
-    ):
+    if not _is_acceptable_group_name(new_name):
         await message.answer(
             _lt("add_group_invalid_name", lang),
             reply_markup=step_nav_inline_kb(
@@ -4568,7 +4616,8 @@ async def cb_edit_group_teacher(callback: CallbackQuery, state: FSMContext) -> N
         await state.clear()
         await callback.answer(_lt("no_permission", lang), show_alert=True)
         return
-    _, group_name, target = (callback.data or "").split(":", 2)
+    # Group names may contain ":" -> the trailing token is split off from the right.
+    group_name, target = (callback.data or "").split(":", 1)[1].rsplit(":", 1)
     sheets = get_sheets_manager()
     group = await sheets.a_get_group(group_name)
     old_teacher_id = str(group.get("Ustoz_Chat_ID", "") if group else "").strip()
@@ -4664,7 +4713,8 @@ async def cb_edit_group_count(callback: CallbackQuery, state: FSMContext) -> Non
         await state.clear()
         await callback.answer(_lt("no_permission", lang), show_alert=True)
         return
-    _, group_name, count_str = (callback.data or "").split(":", 2)
+    # Group names may contain ":" -> the trailing token is split off from the right.
+    group_name, count_str = (callback.data or "").split(":", 1)[1].rsplit(":", 1)
     sheets = get_sheets_manager()
     group = await sheets.a_get_group(group_name)
     if not group:
@@ -5155,13 +5205,7 @@ async def msg_full_group_name(message: Message, state: FSMContext) -> None:
         await message.answer(_lt("no_permission", lang), parse_mode="HTML")
         return
     new_name = (message.text or "").strip()
-    if (
-        not new_name
-        or len(new_name) > 50
-        or new_name.startswith("__")
-        or INVALID_SHEET_CHARS_RE.search(new_name)
-        or "\n" in new_name
-    ):
+    if not _is_acceptable_group_name(new_name):
         await message.answer(
             _lt("add_group_invalid_name", lang),
             reply_markup=full_group_edit_step_kb(lang),
@@ -5713,3 +5757,286 @@ async def cb_full_group_confirm_all(
             callback.message, state, new_group_name, lang, edit=True, notice=notice
         )
     await callback.answer()
+
+
+# ----------------------------------------------------------------------
+# Admin: edit group Telegram chat ID / lesson start date (📅 Boshlanish sanasi)
+# ----------------------------------------------------------------------
+
+
+def _parse_ddmmyyyy(raw: str) -> Optional[date]:
+    try:
+        return datetime.strptime(str(raw or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+async def _current_group_start_date(group: dict[str, Any]) -> Optional[date]:
+    """Boshlanish_Sanasi from Guruhlar, then SQLite, then the active cycle's 1st date."""
+    canonical = str(group.get("Guruh_Nomi") or "").strip()
+    parsed = _parse_ddmmyyyy(str(group.get("Boshlanish_Sanasi") or ""))
+    if parsed:
+        return parsed
+    parsed = _parse_ddmmyyyy(await database.get_group_start_date(canonical) or "")
+    if parsed:
+        return parsed
+    try:
+        info = await asyncio.to_thread(
+            get_sheets_manager().get_cycle_dates_with_status, canonical
+        )
+    except Exception:
+        info = []
+    if info:
+        try:
+            return date.fromisoformat(str(info[0].get("full_date") or ""))
+        except ValueError:
+            return None
+    return None
+
+
+async def _render_edit_start_calendar(
+    target_msg: Message,
+    group: dict[str, Any],
+    lang: str,
+    selected: Optional[date],
+    month_anchor: date,
+    year_month: Optional[tuple[int, int]] = None,
+) -> None:
+    canonical = str(group.get("Guruh_Nomi") or "").strip()
+    y, m = year_month or (month_anchor.year, month_anchor.month)
+    await target_msg.edit_text(
+        t(
+            "grp_edit_start_calendar_title",
+            lang,
+            group=html.escape(canonical),
+            current=(format_uz_date_long(selected, lang) if selected else "—"),
+            days=_format_days(group.get("Dars_Kunlari", ""), lang),
+            count=html.escape(str(group.get("Oylik_Dars_Soni") or "12")),
+        ),
+        reply_markup=group_start_calendar_kb(
+            y,
+            m,
+            selected=selected,
+            lang=lang,
+            back_cb=f"grp_edit:back:fields:{canonical}",
+        ),
+        parse_mode="HTML",
+    )
+
+
+@router.message(GroupEditStates.entering_chat_id)
+async def msg_edit_group_chat_id(message: Message, state: FSMContext) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await message.answer(_lt("no_permission", lang), parse_mode="HTML")
+        return
+    group_name = str((await state.get_data()).get("edit_group_name") or "")
+    raw = (message.text or "").strip()
+    if not re.fullmatch(r"-?\d{5,20}", raw):
+        await message.answer(
+            t("grp_edit_invalid_chat_id", lang),
+            reply_markup=step_nav_inline_kb(
+                lang,
+                back_cb=f"grp_edit:back:fields:{group_name}",
+                cancel_cb="grp_edit:cancel",
+            ),
+            parse_mode="HTML",
+        )
+        return
+    sheets = get_sheets_manager()
+    group = await sheets.a_get_group(group_name)
+    if not group:
+        await state.clear()
+        await message.answer(_lt("group_not_found", lang), parse_mode="HTML")
+        return
+    canonical = group["Guruh_Nomi"].strip()
+    old_chat = str(group.get("Guruh_TG_Chat_ID") or "").strip()
+    if raw != old_chat:
+        await asyncio.to_thread(sheets.link_group_tg_chat, canonical, raw)
+        await log_audit_event(
+            actor_id=user_id,
+            action=AUDIT_GROUP_EDITED,
+            target=canonical,
+            details=f"Guruh_TG_Chat_ID: {old_chat or '—'} → {raw}",
+            actor_name=message.from_user.full_name or "",
+        )
+        # A group chat was linked/changed: make sure the 1-hour initial notice
+        # timer is running (never restarted if already set/sent).
+        schedule_group_initial_notice(message.bot, canonical)
+        await _broadcast_group_update(
+            message.bot,
+            sheets,
+            canonical,
+            change_items=[("Guruh_TG_Chat_ID", old_chat, raw)],
+            triggered_by_user_id=user_id,
+        )
+    await _show_group_edit_panel(
+        message,
+        state,
+        canonical,
+        lang,
+        edit=False,
+        notice=t(
+            "grp_edit_chat_saved",
+            lang,
+            group=html.escape(canonical),
+            chat=html.escape(raw),
+        ),
+    )
+
+
+@router.callback_query(
+    StateFilter(GroupEditStates.picking_start_date), F.data == "grp_cal:noop"
+)
+async def cb_edit_start_calendar_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.callback_query(
+    StateFilter(GroupEditStates.picking_start_date), F.data.startswith("grp_cal:nav:")
+)
+async def cb_edit_start_calendar_nav(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    parsed = parse_calendar_month((callback.data or "").split(":", 2)[-1])
+    if parsed is None:
+        await callback.answer()
+        return
+    group_name = str((await state.get_data()).get("edit_group_name") or "")
+    group = await get_sheets_manager().a_get_group(group_name)
+    if not group:
+        await state.clear()
+        await callback.answer(_lt("group_not_found", lang), show_alert=True)
+        return
+    if callback.message:
+        current = await _current_group_start_date(group)
+        await _render_edit_start_calendar(
+            callback.message,
+            group,
+            lang,
+            current,
+            current or today_tashkent(),
+            year_month=parsed,
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    StateFilter(GroupEditStates.picking_start_date), F.data.startswith("grp_cal:day:")
+)
+async def cb_edit_start_calendar_day(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    try:
+        picked = date.fromisoformat((callback.data or "").split(":", 2)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    group_name = str((await state.get_data()).get("edit_group_name") or "")
+    sheets = get_sheets_manager()
+    group = await sheets.a_get_group(group_name)
+    if not group:
+        await state.clear()
+        await callback.answer(_lt("group_not_found", lang), show_alert=True)
+        return
+    canonical = group["Guruh_Nomi"].strip()
+    old_start = await _current_group_start_date(group)
+    today = today_tashkent()
+
+    try:
+        result = await sheets.a_reschedule_active_cycle_start(canonical, picked, today)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Failed to reschedule start date for %s", canonical
+        )
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+
+    if not result.get("ok"):
+        reason = result.get("reason")
+        if reason == "all_past":
+            alert = t("grp_edit_start_all_past", lang)
+        elif reason == "year_mismatch":
+            alert = t("grp_edit_start_year_mismatch", lang, year=result.get("sheet_year"))
+        elif reason == "no_days":
+            alert = t("grp_edit_start_no_days", lang)
+        else:
+            alert = _lt("group_not_found", lang)
+        await callback.answer(alert, show_alert=True)
+        return
+
+    effective: date = result["start_date"]
+    lesson_dates: list[date] = list(result["dates"])
+    elapsed = int(result["elapsed"])
+    total = int(result["total"])
+    start_str = effective.strftime("%d.%m.%Y")
+
+    await upsert_group_counter(canonical, lesson_count=elapsed)
+    await database.set_group_start_date(canonical, start_str)
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_GROUP_EDITED,
+        target=canonical,
+        details=(
+            f"Boshlanish_Sanasi: "
+            f"{old_start.strftime('%d.%m.%Y') if old_start else '—'} → {start_str}; "
+            f"Otilgan_Dars_Hisoblagich: {elapsed}"
+        ),
+        actor_name=callback.from_user.full_name or "",
+    )
+    date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+    await _broadcast_group_update(
+        callback.bot,
+        sheets,
+        canonical,
+        change_items=[
+            (
+                "Boshlanish_Sanasi",
+                old_start.strftime("%d.%m.%Y") if old_start else "",
+                start_str,
+            )
+        ],
+        dates_list=date_strs,
+        triggered_by_user_id=user_id,
+    )
+
+    schedule_lines = "\n".join(
+        f"{'✅' if d < today else '▫️'} {idx}-dars — {format_uz_date_long(d, lang)}"
+        for idx, d in enumerate(lesson_dates, start=1)
+    )
+    notice = t(
+        "grp_edit_start_saved",
+        lang,
+        group=html.escape(canonical),
+        start=format_uz_date_long(lesson_dates[0], lang),
+        end=format_uz_date_long(lesson_dates[-1], lang),
+        elapsed=elapsed,
+        total=total,
+        schedule=schedule_lines,
+    )
+    if callback.message:
+        await _show_group_edit_panel(
+            callback.message, state, canonical, lang, edit=True, notice=notice
+        )
+    if effective != picked:
+        await callback.answer(
+            t("grp_edit_start_nearest", lang, date=effective.strftime("%d.%m.%Y"))
+        )
+    else:
+        await callback.answer()

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import html as _html_mod
 import re
 import sqlite3
@@ -215,6 +216,7 @@ GROUP_HEADERS = [
     "Dars_Vaqti",
     "Otilgan_Dars_Hisoblagich",
     "Oylik_Tolov_Summa",
+    "Boshlanish_Sanasi",
 ]
 
 TEACHER_HEADERS = [
@@ -282,6 +284,29 @@ def _normalize_read_value(val: Any) -> str:
     if cleaned == MISSING_TEXT:
         return ""
     return cleaned
+
+
+# Columns that hold free-form group display names. They are written with a
+# leading apostrophe so USER_ENTERED never turns e.g. "1/2", "12:00", "=A1" or
+# "+Kids" into a date/time/formula/number: the cell keeps the exact typed text.
+LITERAL_TEXT_HEADERS = frozenset(
+    {"Guruh_Nomi", "Guruh", "Sobiq_Guruh", "Boshlanish_Sanasi"}
+)
+
+
+def _as_literal_text(val: Any) -> str:
+    text = "" if val is None else str(val)
+    if not text or text == MISSING_TEXT:
+        return text
+    return "'" + text
+
+
+def _protect_literal_columns(headers: list[str], row_values: list[Any]) -> list[Any]:
+    protected = list(row_values)
+    for idx, header in enumerate(headers):
+        if header in LITERAL_TEXT_HEADERS and idx < len(protected):
+            protected[idx] = _as_literal_text(protected[idx])
+    return protected
 
 
 def _normalize_chat_id(val: Any) -> Optional[int]:
@@ -443,6 +468,76 @@ def format_cycle_title(dates: list[date], cycle_number: int) -> str:
     ).most_common(1)[0][0]
     month_name = MONTHS_UPPER_LATN[dominant_month]
     return f"{month_name} {dominant_year} (Sikl #{cycle_number})"
+
+
+# Google Sheets forbids these characters in worksheet (tab) titles. Group display
+# names (Guruh_Nomi) may contain anything; only the TAB title is sanitized.
+SHEET_TITLE_FORBIDDEN_RE = re.compile(r"[:\\/?*\[\]]")
+SHEET_TITLE_MAX_LEN = 95
+_SHEET_TITLE_YEAR_PLACEHOLDER = "0000"
+
+
+def _sheets_len(text: str) -> int:
+    """Length as Google Sheets counts it (UTF-16 code units, emojis count as 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def make_safe_sheet_title(group_name: str, suffix: str = "") -> str:
+    """
+    Deterministic worksheet tab title for a group: '{Safe_Group}_{suffix}'.
+
+    - Names that are already valid tab titles (and short enough) are returned
+      unchanged, so every legacy '{Group}_{Year}' tab keeps matching.
+    - Forbidden characters (: \\ / ? * [ ]) become '-', whitespace/newlines are
+      collapsed, leading/trailing apostrophes are dropped, and the base is
+      trimmed so the whole title stays <= 95 characters.
+    - When the base had to be altered, a short stable hash of the original name
+      is appended ('~ab12') so two different group names never share one tab.
+    """
+    original = str(group_name or "").strip()
+    base = " ".join(original.split())
+    base = SHEET_TITLE_FORBIDDEN_RE.sub("-", base).strip().strip("'").strip()
+    if not base:
+        base = "Guruh"
+    suffix_str = str(suffix).strip() if suffix is not None else ""
+    suffix_part = f"_{suffix_str}" if suffix_str else ""
+
+    if base == original and _sheets_len(base + suffix_part) <= SHEET_TITLE_MAX_LEN:
+        return base + suffix_part
+
+    tag = "~" + hashlib.sha1(original.encode("utf-8")).hexdigest()[:4]
+    budget = SHEET_TITLE_MAX_LEN - _sheets_len(suffix_part) - _sheets_len(tag)
+    budget = max(budget, 1)
+    while base and _sheets_len(base) > budget:
+        base = base[:-1]
+    base = base.rstrip().rstrip("'").rstrip() or "G"
+    return base + tag + suffix_part
+
+
+def group_sheet_title_prefixes(group_name: str) -> list[str]:
+    """
+    Candidate tab-title bases (without the '_{Year}' part) under which a
+    group's cycle worksheets may live: the sanitized base first, then the raw
+    legacy name as a fallback. Year suffixes are always 4 digits, so a 4-char
+    placeholder yields the exact trimming used for every real year.
+    """
+    raw = str(group_name or "").strip()
+    safe_full = make_safe_sheet_title(raw, _SHEET_TITLE_YEAR_PLACEHOLDER)
+    safe_base = safe_full[: -(len(_SHEET_TITLE_YEAR_PLACEHOLDER) + 1)]
+    prefixes = [safe_base]
+    if raw and raw not in prefixes:
+        prefixes.append(raw)
+    return prefixes
+
+
+def match_group_sheet_title(title: str, group_name: str) -> Optional[int]:
+    """Year of a '{Group}_{YYYY}' tab belonging to group_name (case-insensitive), else None."""
+    clean_title = str(title or "").strip()
+    for prefix in group_sheet_title_prefixes(group_name):
+        m = re.match(rf"^{re.escape(prefix)}_(\d{{4}})$", clean_title, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def _col_letter(col_idx_0: int) -> str:
@@ -777,6 +872,26 @@ class SheetsManager:
                 self._ws_cache[title] = (ws, cached_headers)
             return ws
 
+    def _open_group_year_ws(
+        self, ss: gspread.Spreadsheet, group_name: str, year: int | str
+    ) -> gspread.Worksheet:
+        """
+        Opens the '{Group}_{Year}' cycle worksheet using the sanitized tab title
+        (make_safe_sheet_title), falling back to the raw legacy title. Raises
+        gspread.WorksheetNotFound when neither exists.
+        """
+        safe_title = make_safe_sheet_title(group_name, str(year))
+        tried: list[str] = [safe_title]
+        raw_title = f"{str(group_name or '').strip()}_{year}"
+        if raw_title not in tried and not SHEET_TITLE_FORBIDDEN_RE.search(raw_title):
+            tried.append(raw_title)
+        for title in tried:
+            try:
+                return self._execute_with_retry(ss.worksheet, title)
+            except gspread.WorksheetNotFound:
+                continue
+        raise gspread.WorksheetNotFound(safe_title)
+
     def _get_cached_headers(self, ws: gspread.Worksheet) -> list[str]:
         cached = self._ws_cache.get(ws.title)
         if cached is not None and cached[1]:
@@ -869,7 +984,9 @@ class SheetsManager:
         self, ws: gspread.Worksheet, row_values: list[Any]
     ) -> int:
         resp = self._execute_with_retry(
-            ws.append_row, row_values, value_input_option="USER_ENTERED"
+            ws.append_row,
+            _protect_literal_columns(self._get_cached_headers(ws), row_values),
+            value_input_option="USER_ENTERED",
         )
         updated_range = ""
         if isinstance(resp, dict):
@@ -928,7 +1045,7 @@ class SheetsManager:
             self._retry_sheets_op(
                 ws.update,
                 f"A{row_idx}:{end_col_letter}{row_idx}",
-                [normalized_row],
+                [_protect_literal_columns(headers, normalized_row)],
                 value_input_option="USER_ENTERED",
             )
 
@@ -1652,24 +1769,14 @@ class SheetsManager:
                 return False
 
             ss = self._get_spreadsheet()
-            prefix_lower = (
-                f"{target_group.lower()}_{year}"
-                if year is not None
-                else f"{target_group.lower()}_"
-            )
             removed_any = False
 
             for cycle_ws in self._execute_with_retry(ss.worksheets):
-                title_lower = cycle_ws.title.lower()
-                if year is not None:
-                    if title_lower != prefix_lower:
-                        continue
-                else:
-                    if not title_lower.startswith(prefix_lower):
-                        continue
-                    suffix = cycle_ws.title[len(target_group) + 1 :]
-                    if not suffix.isdigit():
-                        continue
+                ws_year = match_group_sheet_title(cycle_ws.title, target_group)
+                if ws_year is None:
+                    continue
+                if year is not None and ws_year != int(year):
+                    continue
 
                 all_vals = self._execute_with_retry(cycle_ws.get_all_values)
                 rows_to_delete = [
@@ -1712,9 +1819,7 @@ class SheetsManager:
 
             for y in ([year] if year else [now_year, now_year - 1]):
                 try:
-                    candidate_ws = self._execute_with_retry(
-                        ss.worksheet, f"{target_group}_{y}"
-                    )
+                    candidate_ws = self._open_group_year_ws(ss, target_group, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(candidate_ws)
@@ -3086,9 +3191,8 @@ class SheetsManager:
 
         for g_name in candidate_names:
             for y in years_to_check:
-                sheet_title = f"{g_name}_{y}"
                 try:
-                    ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                    ws = self._open_group_year_ws(ss, g_name, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(ws)
@@ -3910,9 +4014,7 @@ class SheetsManager:
                 has_existing_cycle = False
                 for y in (now_dt.year, now_dt.year - 1):
                     try:
-                        ws = self._execute_with_retry(
-                            ss.worksheet, f"{canonical_name}_{y}"
-                        )
+                        ws = self._open_group_year_ws(ss, canonical_name, y)
                         if self.parse_cycles_from_sheet(ws):
                             has_existing_cycle = True
                             break
@@ -3927,6 +4029,10 @@ class SheetsManager:
                         resolved_start,
                         cycle_number=1,
                         year=resolved_start.year,
+                    )
+                    self.update_group(
+                        canonical_name,
+                        {"Boshlanish_Sanasi": resolved_start.strftime("%d.%m.%Y")},
                     )
             return group
 
@@ -3958,15 +4064,11 @@ class SheetsManager:
                 deleted_any = True
 
             ss = self._get_spreadsheet()
-            prefix_lower = f"{canonical_lower}_"
             for ws in list(self._execute_with_retry(ss.worksheets)):
-                title_stripped = ws.title.strip()
-                if title_stripped.lower().startswith(prefix_lower):
-                    suffix = title_stripped[len(canonical_name) + 1 :]
-                    if suffix.isdigit():
-                        self._execute_with_retry(ss.del_worksheet, ws)
-                        self._ws_cache.pop(ws.title, None)
-                        deleted_any = True
+                if match_group_sheet_title(ws.title, canonical_name) is not None:
+                    self._execute_with_retry(ss.del_worksheet, ws)
+                    self._ws_cache.pop(ws.title, None)
+                    deleted_any = True
 
             today_str = now_tashkent().strftime("%d.%m.%Y")
             for student in self.get_all_students():
@@ -4054,7 +4156,7 @@ class SheetsManager:
                     stu_updates = [
                         {
                             "range": f"{_col_letter(g_col)}{idx}",
-                            "values": [[new_name]],
+                            "values": [[_as_literal_text(new_name)]],
                         }
                         for idx, raw_row in enumerate(stu_rows[1:], start=2)
                         if len(raw_row) > g_col
@@ -4069,20 +4171,25 @@ class SheetsManager:
                         self._invalidate_students_cache()
 
                 ss = self._get_spreadsheet()
-                prefix_lower = f"{old_canonical.lower()}_"
                 for ws in self._execute_with_retry(ss.worksheets):
-                    if ws.title.lower().startswith(prefix_lower):
-                        suffix = ws.title[len(old_canonical) + 1 :]
-                        if suffix.isdigit():
-                            try:
-                                old_ws_title = ws.title
-                                new_ws_title = f"{new_name}_{suffix}"
-                                self._execute_with_retry(ws.update_title, new_ws_title)
-                                if old_ws_title in self._ws_cache:
-                                    cached_ws, cached_hdrs = self._ws_cache.pop(old_ws_title)
-                                    self._ws_cache[new_ws_title] = (cached_ws, cached_hdrs)
-                            except Exception:
-                                pass
+                    ws_year = match_group_sheet_title(ws.title, old_canonical)
+                    if ws_year is None:
+                        continue
+                    try:
+                        old_ws_title = ws.title
+                        new_ws_title = make_safe_sheet_title(new_name, str(ws_year))
+                        if new_ws_title == old_ws_title:
+                            continue
+                        self._execute_with_retry(ws.update_title, new_ws_title)
+                        if old_ws_title in self._ws_cache:
+                            cached_ws, cached_hdrs = self._ws_cache.pop(old_ws_title)
+                            self._ws_cache[new_ws_title] = (cached_ws, cached_hdrs)
+                    except Exception:
+                        _sheets_logger.exception(
+                            "Failed to rename cycle tab %s -> %s",
+                            ws.title,
+                            new_name,
+                        )
 
             if "Oylik_Dars_Soni" in clean_updates or "Dars_Kunlari" in clean_updates:
                 grp_now = self.get_group(active_name)
@@ -4126,7 +4233,16 @@ class SheetsManager:
     def get_or_create_group_year_sheet(
         self, group_name: str, year: int
     ) -> gspread.Worksheet:
-        sheet_title = f"{group_name.strip()}_{year}"
+        ss = self._get_spreadsheet()
+        try:
+            existing_ws = self._open_group_year_ws(ss, group_name, year)
+        except gspread.WorksheetNotFound:
+            existing_ws = None
+        sheet_title = (
+            existing_ws.title
+            if existing_ws is not None
+            else make_safe_sheet_title(group_name, str(year))
+        )
         ws = self._get_or_create_worksheet(
             sheet_title, headers=None, rows=300, cols=22
         )
@@ -4178,9 +4294,8 @@ class SheetsManager:
         """Reads {group}_{year} and returns the report payload (None if no sheet)."""
         with self._lock:
             ss = self._get_spreadsheet()
-            title = f"{group_name.strip()}_{year}"
             try:
-                ws = self._execute_with_retry(ss.worksheet, title)
+                ws = self._open_group_year_ws(ss, group_name, year)
             except gspread.WorksheetNotFound:
                 return None
             cycles_raw = self.parse_cycles_from_sheet(ws)
@@ -4403,7 +4518,7 @@ class SheetsManager:
         last_row_0 = cycle["last_row_idx"]
         max_col_idx = cycle["tolov_col_idx"]
         a1_range = (
-            f"'{ws.title}'!A{header_row_0 + 1}:"
+            f"'{ws.title.replace(chr(39), chr(39) * 2)}'!A{header_row_0 + 1}:"
             f"{_col_letter(max_col_idx)}{last_row_0 + 1}"
         )
 
@@ -4461,9 +4576,8 @@ class SheetsManager:
             target_ws: Optional[gspread.Worksheet] = None
             cycles: list[dict[str, Any]] = []
             for y in years_to_check:
-                sheet_title = f"{group_name.strip()}_{y}"
                 try:
-                    ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                    ws = self._open_group_year_ws(ss, group_name, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(ws)
@@ -4565,7 +4679,7 @@ class SheetsManager:
             cycles: list[dict[str, Any]] = []
             for y in years_to_check:
                 try:
-                    ws = self._execute_with_retry(ss.worksheet, f"{clean_group}_{y}")
+                    ws = self._open_group_year_ws(ss, clean_group, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(ws)
@@ -4691,9 +4805,8 @@ class SheetsManager:
             target_ws: Optional[gspread.Worksheet] = None
             cycles: list[dict[str, Any]] = []
             for y in years_to_check:
-                sheet_title = f"{group_name.strip()}_{y}"
                 try:
-                    ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                    ws = self._open_group_year_ws(ss, group_name, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(ws)
@@ -5012,9 +5125,7 @@ class SheetsManager:
                 years_to_check = [year] if year else [now_dt.year, now_dt.year - 1]
                 for y in years_to_check:
                     try:
-                        ws = self._execute_with_retry(
-                            ss.worksheet, f"{group['Guruh_Nomi'].strip()}_{y}"
-                        )
+                        ws = self._open_group_year_ws(ss, group["Guruh_Nomi"], y)
                     except gspread.WorksheetNotFound:
                         continue
                     parsed = self.parse_cycles_from_sheet(ws)
@@ -5098,9 +5209,8 @@ class SheetsManager:
             target_ws: Optional[gspread.Worksheet] = None
             cycles: list[dict[str, Any]] = []
             for y in (now_year, now_year - 1):
-                sheet_title = f"{group_name.strip()}_{y}"
                 try:
-                    ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                    ws = self._open_group_year_ws(ss, group_name, y)
                 except gspread.WorksheetNotFound:
                     continue
                 parsed = self.parse_cycles_from_sheet(ws)
@@ -5517,9 +5627,8 @@ class SheetsManager:
         ss = self._get_spreadsheet()
 
         for y in candidate_years:
-            sheet_title = f"{group_name.strip()}_{y}"
             try:
-                ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                ws = self._open_group_year_ws(ss, group_name, y)
             except gspread.WorksheetNotFound:
                 continue
             cycles = self.parse_cycles_from_sheet(ws)
@@ -5537,9 +5646,8 @@ class SheetsManager:
         ss = self._get_spreadsheet()
 
         for y in candidate_years:
-            sheet_title = f"{group_name.strip()}_{y}"
             try:
-                ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                ws = self._open_group_year_ws(ss, group_name, y)
             except gspread.WorksheetNotFound:
                 continue
             cycles = self.parse_cycles_from_sheet(ws)
@@ -5915,7 +6023,7 @@ class SheetsManager:
         now_year = now_tashkent().year
         for y in (now_year, now_year + 1, now_year - 1):
             try:
-                ws = self._execute_with_retry(ss.worksheet, f"{clean_group}_{y}")
+                ws = self._open_group_year_ws(ss, clean_group, y)
             except gspread.WorksheetNotFound:
                 continue
             parsed = self.parse_cycles_from_sheet(ws)
@@ -5942,6 +6050,284 @@ class SheetsManager:
                 dated.append((dc, parsed_date))
             return ws, cycle, dated
         return None
+
+    def reschedule_active_cycle_start(
+        self, group_name: str, new_start: date, today: Optional[date] = None
+    ) -> dict[str, Any]:
+        """
+        Moves the group's ACTIVE cycle to a new lesson start date.
+
+        - Regenerates the cycle's Oylik_Dars_Soni (8/12) lesson dates strictly
+          from `new_start` (first lesson day on/after it) using Dars_Kunlari.
+        - Rewrites ONLY the date headers of the active cycle block in
+          '{Safe_Group_Tab}_{Year}' (and the To'lov column position if the
+          lesson count differs). Every enrolled student row, its Talaba_ID /
+          F.I.O., attendance marks (kept by lesson order) and payment status are
+          preserved; the cycle title (debt key) is left untouched.
+        - Stores Boshlanish_Sanasi and recalculates Otilgan_Dars_Hisoblagich as
+          the number of new lesson dates strictly before today (Asia/Tashkent),
+          then marks those elapsed columns yellow.
+
+        Returns {"ok": True, "start_date", "dates", "elapsed", "total",
+        "cycle_title", "created"} or {"ok": False, "reason": ...} where reason is
+        one of "group_not_found", "no_days", "all_past", "year_mismatch".
+        """
+        today_val = today or today_tashkent()
+        with self._lock:
+            group = self.get_group(group_name)
+            if not group:
+                return {"ok": False, "reason": "group_not_found"}
+            canonical = group["Guruh_Nomi"].strip()
+            lesson_days = parse_weekdays(group.get("Dars_Kunlari", ""))
+            if not lesson_days:
+                return {"ok": False, "reason": "no_days"}
+            try:
+                count = int(group.get("Oylik_Dars_Soni") or 12)
+            except (TypeError, ValueError):
+                count = 12
+            if count <= 0:
+                count = 12
+
+            effective = first_lesson_date_on_or_after(new_start, lesson_days)
+            lesson_dates = generate_cycle_dates(effective, lesson_days, count)
+            if lesson_dates[-1] < today_val:
+                return {"ok": False, "reason": "all_past"}
+            date_strs = [d.strftime("%d.%m") for d in lesson_dates]
+            elapsed = sum(1 for d in lesson_dates if d < today_val)
+            start_str = effective.strftime("%d.%m.%Y")
+
+            located = self._locate_active_cycle_with_dates(canonical)
+            created = False
+            if not located:
+                info = self.create_cycle_table(
+                    canonical, effective, year=lesson_dates[0].year
+                )
+                cycle_title = str(info.get("cycle_title") or "")
+                created = True
+            else:
+                ws, cycle, _dated = located
+                try:
+                    sheet_year = int(ws.title.rsplit("_", 1)[-1])
+                except ValueError:
+                    sheet_year = lesson_dates[0].year
+                if lesson_dates[0].year != sheet_year:
+                    return {
+                        "ok": False,
+                        "reason": "year_mismatch",
+                        "sheet_year": sheet_year,
+                    }
+                cycle_title = cycle["title"]
+                self._rewrite_cycle_date_headers(ws, cycle, date_strs)
+
+            self.update_group(
+                canonical,
+                {
+                    "Boshlanish_Sanasi": start_str,
+                    "Otilgan_Dars_Hisoblagich": str(elapsed),
+                },
+            )
+            self._cycle_snapshot_cache.clear()
+            if elapsed > 0:
+                try:
+                    self.mark_cycle_elapsed_columns(canonical, today_val)
+                except Exception:
+                    _sheets_logger.exception(
+                        "Could not mark elapsed columns for %s", canonical
+                    )
+            return {
+                "ok": True,
+                "start_date": effective,
+                "dates": lesson_dates,
+                "date_strs": date_strs,
+                "elapsed": elapsed,
+                "total": count,
+                "cycle_title": cycle_title,
+                "created": created,
+            }
+
+    def _rewrite_cycle_date_headers(
+        self, ws: gspread.Worksheet, cycle: dict[str, Any], date_strs: list[str]
+    ) -> None:
+        """
+        Rewrites the date header row of `cycle` with `date_strs` in place.
+        Student rows keep their ID / F.I.O. / marks (by lesson order) / payment
+        status; the To'lov column moves when the number of dates changes.
+        Formatting of the date area is reset (paid -> green, recorded unpaid ->
+        yellow, empty unpaid -> red) so stale elapsed/cancelled colours of the
+        old dates never leak into the new schedule.
+        """
+        ss = self._get_spreadsheet()
+        title_row_0 = cycle["title_row_idx"]
+        header_row_0 = cycle["header_row_idx"]
+        old_date_cols = [dc["col_idx"] for dc in cycle["date_columns"]]
+        old_tolov_col_0 = cycle["tolov_col_idx"]
+        old_total_cols = old_tolov_col_0 + 1
+        new_n = len(date_strs)
+        new_tolov_col_0 = 2 + new_n
+        new_total_cols = new_tolov_col_0 + 1
+        max_cols = max(old_total_cols, new_total_cols)
+        end_row_0 = cycle["last_row_idx"] + 1
+
+        if ws.col_count < max_cols + 5:
+            self._execute_with_retry(ws.resize, cols=max_cols + 5)
+
+        value_updates: list[dict[str, Any]] = [
+            {
+                "range": (
+                    f"C{header_row_0 + 1}:"
+                    f"{_col_letter(new_tolov_col_0)}{header_row_0 + 1}"
+                ),
+                "values": [[*date_strs, "To'lov"]],
+            }
+        ]
+        for s_row in cycle["student_rows"]:
+            marks_in_order = [
+                str(s_row["marks"].get(c, "") or "") for c in old_date_cols
+            ]
+            kept = (marks_in_order + [""] * new_n)[:new_n]
+            p_status = s_row["payment_status"] or "To'lanmagan"
+            r_num = s_row["row_idx"] + 1
+            value_updates.append(
+                {
+                    "range": f"C{r_num}:{_col_letter(new_tolov_col_0)}{r_num}",
+                    "values": [[*kept, p_status]],
+                }
+            )
+
+        if old_total_cols > new_total_cols:
+            self._execute_with_retry(
+                ws.batch_clear,
+                [
+                    f"{_col_letter(new_total_cols)}{title_row_0 + 1}:"
+                    f"{_col_letter(old_total_cols - 1)}{end_row_0}"
+                ],
+            )
+        self._execute_with_retry(
+            ws.batch_update, value_updates, value_input_option="USER_ENTERED"
+        )
+
+        requests: list[dict[str, Any]] = [
+            {
+                "unmergeCells": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": title_row_0,
+                        "endRowIndex": title_row_0 + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": max_cols,
+                    }
+                }
+            },
+            _clear_borders_request(ws.id, title_row_0, end_row_0, 0, max_cols),
+        ]
+        if max_cols > new_total_cols:
+            requests.append(
+                _cell_bg_request(
+                    ws.id,
+                    title_row_0,
+                    end_row_0,
+                    new_total_cols,
+                    max_cols,
+                    COLOR_WHITE,
+                    bold=False,
+                )
+            )
+        requests.extend(
+            [
+                {
+                    "mergeCells": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": title_row_0,
+                            "endRowIndex": title_row_0 + 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": new_total_cols,
+                        },
+                        "mergeType": "MERGE_ALL",
+                    }
+                },
+                _cell_bg_request(
+                    ws.id,
+                    title_row_0,
+                    title_row_0 + 1,
+                    0,
+                    new_total_cols,
+                    COLOR_TITLE_BLUE,
+                    bold=True,
+                    h_align="CENTER",
+                ),
+                _cell_bg_request(
+                    ws.id,
+                    header_row_0,
+                    header_row_0 + 1,
+                    0,
+                    2,
+                    COLOR_HEADER_GRAY,
+                    bold=True,
+                    h_align="CENTER",
+                ),
+                _cell_bg_request(
+                    ws.id,
+                    header_row_0,
+                    header_row_0 + 1,
+                    2,
+                    new_tolov_col_0,
+                    COLOR_WHITE,
+                    bold=True,
+                    h_align="CENTER",
+                ),
+                _cell_bg_request(
+                    ws.id,
+                    header_row_0,
+                    header_row_0 + 1,
+                    new_tolov_col_0,
+                    new_tolov_col_0 + 1,
+                    COLOR_HEADER_GRAY,
+                    bold=True,
+                    h_align="CENTER",
+                ),
+                _borders_request(ws.id, title_row_0, end_row_0, 0, new_total_cols),
+            ]
+        )
+        for s_row in cycle["student_rows"]:
+            r_0 = s_row["row_idx"]
+            is_paid = _is_paid_status(s_row["payment_status"])
+            marks_in_order = [
+                str(s_row["marks"].get(c, "") or "") for c in old_date_cols
+            ]
+            kept = (marks_in_order + [""] * new_n)[:new_n]
+            for offset, mark in enumerate(kept):
+                if is_paid:
+                    color = GREEN_BG
+                elif _is_recorded_mark(mark):
+                    color = YELLOW_BG
+                else:
+                    color = RED_BG
+                requests.append(
+                    _cell_bg_request(
+                        ws.id,
+                        r_0,
+                        r_0 + 1,
+                        2 + offset,
+                        3 + offset,
+                        color,
+                        bold=is_paid,
+                        h_align="CENTER",
+                    )
+                )
+            requests.append(
+                _cell_bg_request(
+                    ws.id,
+                    r_0,
+                    r_0 + 1,
+                    new_tolov_col_0,
+                    new_tolov_col_0 + 1,
+                    GREEN_BG if is_paid else RED_BG,
+                    bold=is_paid,
+                    h_align="CENTER",
+                )
+            )
+        self._execute_with_retry(ss.batch_update, {"requests": requests})
 
     def get_active_cycle_elapsed_info(
         self, group_name: str, today: Optional[date] = None
@@ -6135,14 +6521,10 @@ class SheetsManager:
         matched: list[tuple[int, gspread.Worksheet]] = []
 
         for g_name in candidate_names:
-            pattern = re.compile(
-                rf"^{re.escape(g_name)}_(\d{{4}})$", re.IGNORECASE
-            )
             for ws in all_sheets:
-                m = pattern.match(ws.title.strip())
-                if not m:
+                ws_year = match_group_sheet_title(ws.title, g_name)
+                if ws_year is None:
                     continue
-                ws_year = int(m.group(1))
                 if year is not None and ws_year != year:
                     continue
                 matched.append((ws_year, ws))
@@ -6443,9 +6825,8 @@ class SheetsManager:
         with self._lock:
             ss = self._get_spreadsheet()
             target_year = year or now_tashkent().year
-            sheet_title = f"{group_name.strip()}_{target_year}"
             try:
-                ws = self._execute_with_retry(ss.worksheet, sheet_title)
+                ws = self._open_group_year_ws(ss, group_name, target_year)
             except gspread.WorksheetNotFound:
                 return []
 
@@ -6979,6 +7360,13 @@ class SheetsManager:
             new_lesson_count,
             new_days,
             new_time,
+        )
+
+    async def a_reschedule_active_cycle_start(
+        self, group_name: str, new_start: date, today: Optional[date] = None
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.reschedule_active_cycle_start, group_name, new_start, today
         )
 
     async def a_get_cycle_dates_with_status(

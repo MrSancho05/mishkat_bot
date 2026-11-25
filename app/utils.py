@@ -338,12 +338,39 @@ def _fmt_money(amount: int) -> str:
     return f"{int(amount or 0):,}".replace(",", " ")
 
 
+def legacy_group_join_slug(group_name: str) -> str:
+    """Original '?start=join_<slug>' slug (kept so already shared links still work)."""
+    import re
+
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(group_name or "").strip())
+    return cleaned.strip("_")[:55] or "group"
+
+
+def make_group_join_slug(group_name: str) -> str:
+    """
+    Deterministic deep-link slug for a group of ANY name.
+    Plain ASCII names (letters, digits, '_' '-', up to 55 chars) keep exactly the
+    legacy slug; any other name (spaces, ':' '/', Cyrillic, emojis, long...)
+    gets a short stable hash suffix so different groups never share one link.
+    The result always fits Telegram's 64-char /start payload with 'join_'.
+    """
+    import hashlib
+
+    raw = str(group_name or "").strip()
+    legacy = legacy_group_join_slug(raw)
+    if legacy == raw:
+        return legacy
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    base = legacy if legacy != "group" else "g"
+    return f"{base[:46].rstrip('_-') or 'g'}-{digest}"
+
+
 def annual_report_filename(group_name: str, year: int) -> str:
     """'Mishkat_Yillik_Hisobot_{group_name}_{year}.html' with a filesystem-safe group."""
     import re
 
     safe = re.sub(r"[^\w\-]+", "_", str(group_name or "").strip(), flags=re.UNICODE)
-    safe = safe.strip("_") or "Guruh"
+    safe = safe.strip("_")[:80].strip("_") or "Guruh"
     return f"Mishkat_Yillik_Hisobot_{safe}_{year}.html"
 
 

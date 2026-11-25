@@ -174,6 +174,7 @@ FIELD_LABELS: dict[str, dict[str, str]] = {
         "Tolov_Summasi": "Oylik to'lov summasi",
         "Oylik_Tolov_Summa": "Oylik to'lov summasi",
         "Guruh_TG_Chat_ID": "Guruh Telegram kanali/guruhi",
+        "Boshlanish_Sanasi": "Boshlanish sanasi",
         "Ustoz_ID": "Ustoz",
         "Ustoz": "Ustoz",
     },
@@ -185,6 +186,7 @@ FIELD_LABELS: dict[str, dict[str, str]] = {
         "Tolov_Summasi": "Ойлик тўлов суммаси",
         "Oylik_Tolov_Summa": "Ойлик тўлов суммаси",
         "Guruh_TG_Chat_ID": "Гуруҳ Telegram канали/гуруҳи",
+        "Boshlanish_Sanasi": "Бошланиш санаси",
         "Ustoz_ID": "Устоз",
         "Ustoz": "Устоз",
     },
@@ -750,6 +752,60 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_archive_group": "🗄 Zaxira guruhi",
         "btn_delete_group": "🗑 Guruhni o'chirish",
         "btn_keep_current": "⏭ Eskisi qolsin",
+        # Admin "✏️ Guruhni tahrirlash" panel: one button per group attribute
+        "btn_grp_edit_name": "📝 Guruh nomini o‘zgartirish",
+        "btn_grp_edit_teacher": "👨‍🏫 Ustozni o‘zgartirish",
+        "btn_grp_edit_days": "📆 Dars kunlarini o‘zgartirish",
+        "btn_grp_edit_time": "⏰ Dars vaqtini o‘zgartirish",
+        "btn_grp_edit_price": "💰 Oylik to‘lovni o‘zgartirish",
+        "btn_grp_edit_count": "🔢 Oylik darslar sonini o‘zgartirish",
+        "btn_grp_edit_chat": "💬 Guruh chat ID ni o‘zgartirish",
+        "btn_grp_edit_start": "📅 Boshlanish sanasini o‘zgartirish",
+        "group_edit_extra_info": (
+            "📅 Boshlanish sanasi: <b>{start}</b>\n"
+            "💬 Guruh chat ID: <code>{chat}</code>"
+        ),
+        "grp_edit_enter_chat_id": (
+            "💬 <b>{group}</b> — guruh Telegram chat ID sini o‘zgartirish\n\n"
+            "Joriy chat ID: <code>{current}</code>\n\n"
+            "Yangi chat ID ni kiriting (masalan: <code>-1001234567890</code>):"
+        ),
+        "grp_edit_invalid_chat_id": (
+            "❌ Chat ID noto‘g‘ri. Faqat raqamlardan iborat bo‘lishi kerak "
+            "(masalan: <code>-1001234567890</code>). Qaytadan kiriting:"
+        ),
+        "grp_edit_chat_saved": (
+            "✅ <b>{group}</b> guruhining chat ID si yangilandi: <code>{chat}</code>"
+        ),
+        "grp_edit_start_calendar_title": (
+            "📅 <b>{group}</b> — boshlanish sanasini o‘zgartirish\n\n"
+            "Joriy boshlanish sanasi: <b>{current}</b>\n"
+            "Dars kunlari: <b>{days}</b> | Oylik darslar: <b>{count} ta</b>\n\n"
+            "Kalendardan yangi boshlanish sanasini tanlang. Joriy siklning "
+            "barcha dars sanalari shu kundan boshlab qayta tuziladi:"
+        ),
+        "grp_edit_start_saved": (
+            "✅ <b>{group}</b> guruhining boshlanish sanasi yangilandi!\n\n"
+            "📅 Boshlanish: <b>{start}</b>\n"
+            "🏁 Tugash: <b>{end}</b>\n"
+            "🔢 O‘tilgan darslar: <b>{elapsed}/{total}</b>\n\n"
+            "🗓 <b>Yangi dars jadvali:</b>\n{schedule}"
+        ),
+        "grp_edit_start_all_past": (
+            "⚠️ Bu sanadan boshlangan siklning barcha darslari allaqachon o‘tib ketgan. "
+            "Iltimos, yaqinroq sanani tanlang."
+        ),
+        "grp_edit_start_year_mismatch": (
+            "⚠️ Joriy sikl {year}-yil jadvalida joylashgan. Iltimos, {year}-yil "
+            "ichidagi sanani tanlang."
+        ),
+        "grp_edit_start_no_days": (
+            "⚠️ Avval guruhning dars kunlarini belgilang."
+        ),
+        "grp_edit_start_nearest": "📅 {date} — eng yaqin dars kuni",
+        "callback_token_expired": (
+            "⌛️ Bu tugma eskirgan. Iltimos, menyudan qaytadan tanlang."
+        ),
         "group_full_edit_name": (
             "1/6 📝 <b>Guruh nomi</b>\n"
             "Hozirgi qiymat: <b>{current}</b>\n"
@@ -2042,6 +2098,60 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_archive_group": "🗄 Захира гуруҳи",
         "btn_delete_group": "🗑 Гуруҳни ўчириш",
         "btn_keep_current": "⏭ Эскиси қолсин",
+        # Admin "✏️ Гуруҳни таҳрирлаш" panel: one button per group attribute
+        "btn_grp_edit_name": "📝 Гуруҳ номини ўзгартириш",
+        "btn_grp_edit_teacher": "👨‍🏫 Устозни ўзгартириш",
+        "btn_grp_edit_days": "📆 Дарс кунларини ўзгартириш",
+        "btn_grp_edit_time": "⏰ Дарс вақтини ўзгартириш",
+        "btn_grp_edit_price": "💰 Ойлик тўловни ўзгартириш",
+        "btn_grp_edit_count": "🔢 Ойлик дарслар сонини ўзгартириш",
+        "btn_grp_edit_chat": "💬 Гуруҳ чат ID ни ўзгартириш",
+        "btn_grp_edit_start": "📅 Бошланиш санасини ўзгартириш",
+        "group_edit_extra_info": (
+            "📅 Бошланиш санаси: <b>{start}</b>\n"
+            "💬 Гуруҳ чат ID: <code>{chat}</code>"
+        ),
+        "grp_edit_enter_chat_id": (
+            "💬 <b>{group}</b> — гуруҳ Telegram чат ID сини ўзгартириш\n\n"
+            "Жорий чат ID: <code>{current}</code>\n\n"
+            "Янги чат ID ни киритинг (масалан: <code>-1001234567890</code>):"
+        ),
+        "grp_edit_invalid_chat_id": (
+            "❌ Чат ID нотўғри. Фақат рақамлардан иборат бўлиши керак "
+            "(масалан: <code>-1001234567890</code>). Қайтадан киритинг:"
+        ),
+        "grp_edit_chat_saved": (
+            "✅ <b>{group}</b> гуруҳининг чат ID си янгиланди: <code>{chat}</code>"
+        ),
+        "grp_edit_start_calendar_title": (
+            "📅 <b>{group}</b> — бошланиш санасини ўзгартириш\n\n"
+            "Жорий бошланиш санаси: <b>{current}</b>\n"
+            "Дарс кунлари: <b>{days}</b> | Ойлик дарслар: <b>{count} та</b>\n\n"
+            "Календардан янги бошланиш санасини танланг. Жорий циклнинг "
+            "барча дарс саналари шу кундан бошлаб қайта тузилади:"
+        ),
+        "grp_edit_start_saved": (
+            "✅ <b>{group}</b> гуруҳининг бошланиш санаси янгиланди!\n\n"
+            "📅 Бошланиш: <b>{start}</b>\n"
+            "🏁 Тугаш: <b>{end}</b>\n"
+            "🔢 Ўтилган дарслар: <b>{elapsed}/{total}</b>\n\n"
+            "🗓 <b>Янги дарс жадвали:</b>\n{schedule}"
+        ),
+        "grp_edit_start_all_past": (
+            "⚠️ Бу санадан бошланган циклнинг барча дарслари аллақачон ўтиб кетган. "
+            "Илтимос, яқинроқ санани танланг."
+        ),
+        "grp_edit_start_year_mismatch": (
+            "⚠️ Жорий цикл {year}-йил жадвалида жойлашган. Илтимос, {year}-йил "
+            "ичидаги санани танланг."
+        ),
+        "grp_edit_start_no_days": (
+            "⚠️ Аввал гуруҳнинг дарс кунларини белгиланг."
+        ),
+        "grp_edit_start_nearest": "📅 {date} — энг яқин дарс куни",
+        "callback_token_expired": (
+            "⌛️ Бу тугма эскирган. Илтимос, менюдан қайтадан танланг."
+        ),
         "group_full_edit_name": (
             "1/6 📝 <b>Гуруҳ номи</b>\n"
             "Ҳозирги қиймат: <b>{current}</b>\n"

@@ -1,11 +1,28 @@
+import hashlib
+import logging
 import re
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import BaseMiddleware
+from aiogram.client.session.middlewares.base import (
+    BaseRequestMiddleware,
+    NextRequestMiddlewareType,
+)
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+)
 
-from app.database import get_user_lang
+from app.database import (
+    get_callback_token_data,
+    get_user_lang,
+    save_callback_token,
+)
 from app.keyboards import global_cancel_fsm_kb
 from app.locales import button_texts, t
 
@@ -138,4 +155,123 @@ class StateGuardMiddleware(BaseMiddleware):
 
             return await handler(event, data)
 
+        return await handler(event, data)
+
+# ----------------------------------------------------------------------
+# Long callback_data support (unrestricted group names)
+# ----------------------------------------------------------------------
+# Telegram rejects inline buttons whose callback_data exceeds 64 bytes. Group
+# names are embedded in many callbacks ("grp_edit:open:{group}", ...), so long
+# or multi-byte names would break those keyboards. Every outgoing inline
+# keyboard is scanned; an over-long payload is swapped for a short
+# deterministic token "~<hash>" persisted in SQLite, and the incoming callback
+# is expanded back to the exact original payload before any filter/handler
+# (including StateGuardMiddleware) sees it.
+
+TELEGRAM_CALLBACK_MAX_BYTES = 64
+CALLBACK_TOKEN_PREFIX = "~"
+_TOKEN_CACHE_LIMIT = 5000
+_token_cache: "OrderedDict[str, str]" = OrderedDict()
+_mw_logger = logging.getLogger(__name__)
+
+
+def callback_token_for(data: str) -> str:
+    digest = hashlib.sha1(data.encode("utf-8")).hexdigest()[:24]
+    return f"{CALLBACK_TOKEN_PREFIX}{digest}"
+
+
+def _remember_token(token: str, data: str) -> None:
+    _token_cache[token] = data
+    _token_cache.move_to_end(token)
+    while len(_token_cache) > _TOKEN_CACHE_LIMIT:
+        _token_cache.popitem(last=False)
+
+
+async def shorten_callback_data(data: str) -> str:
+    if len(data.encode("utf-8")) <= TELEGRAM_CALLBACK_MAX_BYTES:
+        return data
+    token = callback_token_for(data)
+    if _token_cache.get(token) != data:
+        await save_callback_token(token, data)
+        _remember_token(token, data)
+    return token
+
+
+async def resolve_callback_token(token: str) -> Optional[str]:
+    cached = _token_cache.get(token)
+    if cached is not None:
+        _token_cache.move_to_end(token)
+        return cached
+    data = await get_callback_token_data(token)
+    if data is not None:
+        _remember_token(token, data)
+    return data
+
+
+async def _shorten_inline_markup(
+    markup: InlineKeyboardMarkup,
+) -> Optional[InlineKeyboardMarkup]:
+    changed = False
+    new_rows: list[list[InlineKeyboardButton]] = []
+    for row in markup.inline_keyboard:
+        new_row: list[InlineKeyboardButton] = []
+        for button in row:
+            cb = button.callback_data
+            if isinstance(cb, str) and cb:
+                short = await shorten_callback_data(cb)
+                if short != cb:
+                    button = button.model_copy(update={"callback_data": short})
+                    changed = True
+            new_row.append(button)
+        new_rows.append(new_row)
+    if not changed:
+        return None
+    return markup.model_copy(update={"inline_keyboard": new_rows})
+
+
+class CallbackDataShortenerRequestMiddleware(BaseRequestMiddleware):
+    """Outgoing (bot.session) middleware: tokenizes over-long callback_data."""
+
+    async def __call__(
+        self,
+        make_request: NextRequestMiddlewareType,
+        bot: Any,
+        method: Any,
+    ) -> Any:
+        markup = getattr(method, "reply_markup", None)
+        if isinstance(markup, InlineKeyboardMarkup):
+            try:
+                new_markup = await _shorten_inline_markup(markup)
+            except Exception:
+                _mw_logger.exception("Failed to shorten inline keyboard callbacks")
+                new_markup = None
+            if new_markup is not None:
+                method = method.model_copy(update={"reply_markup": new_markup})
+        return await make_request(bot, method)
+
+
+class CallbackTokenResolverMiddleware(BaseMiddleware):
+    """Incoming (outer callback_query) middleware: expands '~<hash>' tokens."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if isinstance(event, CallbackQuery):
+            cb_data = event.data or ""
+            if cb_data.startswith(CALLBACK_TOKEN_PREFIX):
+                original = await resolve_callback_token(cb_data)
+                if original is None:
+                    lang = (
+                        await get_user_lang(event.from_user.id)
+                        if event.from_user
+                        else "latn"
+                    )
+                    await event.answer(
+                        t("callback_token_expired", lang), show_alert=True
+                    )
+                    return None
+                event = event.model_copy(update={"data": original})
         return await handler(event, data)

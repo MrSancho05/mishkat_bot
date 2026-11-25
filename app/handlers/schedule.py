@@ -1113,12 +1113,13 @@ async def cb_reminder_enter_topic(
         return
     user_id = callback.from_user.id
     lang = await get_user_lang(user_id)
-    parts = callback.data.split(":", 2)
-    if len(parts) < 3:
+    # Group names may contain ":" -> the date is split off from the right.
+    parts = callback.data.split(":", 1)[1].rsplit(":", 1) if ":" in callback.data else []
+    if len(parts) < 2:
         await callback.answer()
         return
-    group_name = parts[1].strip()
-    date_str = parts[2].strip()
+    group_name = parts[0].strip()
+    date_str = parts[1].strip()
 
     if not await _can_manage_group(user_id, group_name):
         await callback.answer(_lt("topic_no_permission", lang), show_alert=True)

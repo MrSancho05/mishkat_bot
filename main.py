@@ -15,7 +15,11 @@ from app.handlers.payments import router as payments_router
 from app.handlers.schedule import router as schedule_router
 from app.handlers.start import router as start_router
 from app.handlers.students import router as students_router
-from app.middlewares import StateGuardMiddleware
+from app.middlewares import (
+    CallbackDataShortenerRequestMiddleware,
+    CallbackTokenResolverMiddleware,
+    StateGuardMiddleware,
+)
 from app.scheduler import setup_scheduler
 from app.sheets import get_sheets_manager
 from app.utils import send_annual_archive_document, to_tashkent
@@ -51,10 +55,13 @@ async def main() -> None:
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    bot.session.middleware(CallbackDataShortenerRequestMiddleware())
     dp = Dispatcher(storage=MemoryStorage())
 
     state_guard = StateGuardMiddleware()
     dp.message.outer_middleware(state_guard)
+    # Token resolver must run BEFORE the state guard so it sees real payloads.
+    dp.callback_query.outer_middleware(CallbackTokenResolverMiddleware())
     dp.callback_query.outer_middleware(state_guard)
 
     dp.include_router(start_router)

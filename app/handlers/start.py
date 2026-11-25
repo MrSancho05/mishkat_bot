@@ -24,7 +24,7 @@ from aiogram.types import (
 from app import database
 from app import states as app_states
 from app.scheduler import schedule_group_initial_notice
-from app.utils import now_tashkent
+from app.utils import legacy_group_join_slug, make_group_join_slug, now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ
 from app.database import (
     activate_teacher_invite,
@@ -862,7 +862,7 @@ def _sync_update_student_name_in_active_cycles(
         now_year = now_tashkent().year
         for y in (now_year, now_year - 1):
             try:
-                ws = ss.worksheet(f"{group_name.strip()}_{y}")
+                ws = sheets._open_group_year_ws(ss, group_name, y)
             except gspread.WorksheetNotFound:
                 continue
             updates = [
@@ -1119,8 +1119,7 @@ def _extract_user_phone_from_sheets_sync(
 
 
 def _slugify_group_name(group_name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", group_name.strip())
-    return cleaned.strip("_")[:55] or "group"
+    return make_group_join_slug(group_name)
 
 
 def _find_group_by_join_slug(
@@ -1131,8 +1130,12 @@ def _find_group_by_join_slug(
     for grp in all_groups:
         if grp.get("Guruh_Nomi", "").strip().lower() == clean_slug:
             return grp
+    # Current collision-safe slug first, then the legacy slug of old links.
     for grp in all_groups:
-        if _slugify_group_name(grp.get("Guruh_Nomi", "")).lower() == clean_slug:
+        if make_group_join_slug(grp.get("Guruh_Nomi", "")).lower() == clean_slug:
+            return grp
+    for grp in all_groups:
+        if legacy_group_join_slug(grp.get("Guruh_Nomi", "")).lower() == clean_slug:
             return grp
     return None
 

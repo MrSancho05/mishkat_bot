@@ -35,6 +35,8 @@ class GroupEditStates(StatesGroup):
     editing_price = State()
     confirming = State()
     confirm_delete_group = State()
+    entering_chat_id = State()
+    picking_start_date = State()
 
 
 class FullGroupEditStates(StatesGroup):

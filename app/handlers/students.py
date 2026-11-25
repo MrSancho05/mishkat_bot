@@ -21,6 +21,7 @@ from aiogram.types import (
 from app import database
 from app.scheduler import schedule_group_initial_notice
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, SUPPORT_PHONE
+from app.utils import make_group_join_slug
 from app.database import (
     AUDIT_STUDENT_DELETED,
     AUDIT_STUDENT_RESTORED,
@@ -613,10 +614,7 @@ def _pb_parent_label(data: dict[str, Any], lang: str) -> str:
 
 
 def _slugify_group_name(group_name: str) -> str:
-    return (
-        re.sub(r"[^A-Za-z0-9_-]+", "_", group_name.strip()).strip("_")[:55]
-        or "group"
-    )
+    return make_group_join_slug(group_name)
 
 
 def _student_has_device(student: dict[str, Any]) -> bool:

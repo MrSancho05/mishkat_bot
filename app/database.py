@@ -215,6 +215,24 @@ async def init_db() -> None:
             );
             """
         )
+        # Lesson start date (Boshlanish_Sanasi, "dd.mm.yyyy") of the group's
+        # active cycle, mirrored from Guruhlar.
+        try:
+            await db.execute("ALTER TABLE group_counters ADD COLUMN start_date TEXT;")
+        except Exception:
+            pass
+        # Inline-button payloads longer than Telegram's 64-byte callback_data
+        # limit (e.g. long / multi-byte group names) are stored here and the
+        # button carries only a short deterministic token ("~<hash>").
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS callback_tokens (
+                token TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS teachers (
@@ -2114,6 +2132,57 @@ async def upsert_group_counter(
             (group_name, new_count, new_reminded, new_1h_reminded),
         )
         await db.commit()
+
+
+async def set_group_start_date(group_name: str, start_date_str: str) -> None:
+    """Stores the group's lesson start date ("dd.mm.yyyy") next to its counter."""
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE group_counters SET start_date = ? WHERE LOWER(group_name) = LOWER(?);",
+            (start_date_str.strip(), clean_name),
+        )
+        if cursor.rowcount == 0:
+            await db.execute(
+                "INSERT INTO group_counters (group_name, lesson_count, start_date) "
+                "VALUES (?, 0, ?);",
+                (clean_name, start_date_str.strip()),
+            )
+        await db.commit()
+
+
+async def get_group_start_date(group_name: str) -> Optional[str]:
+    clean_name = (group_name or "").strip()
+    if not clean_name:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT start_date FROM group_counters WHERE LOWER(group_name) = LOWER(?);",
+            (clean_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row and row[0] else None
+
+
+async def save_callback_token(token: str, data: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO callback_tokens (token, data, created_at) "
+            "VALUES (?, ?, ?);",
+            (token, data, now_tashkent().isoformat()),
+        )
+        await db.commit()
+
+
+async def get_callback_token_data(token: str) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT data FROM callback_tokens WHERE token = ?;", (token,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row else None
 
 
 # ----------------------------------------------------------------------
