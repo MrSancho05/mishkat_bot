@@ -2242,6 +2242,21 @@ async def set_group_tg_chat_id(group_name: str, chat_id: str) -> None:
         await db.commit()
 
 
+async def get_group_name_by_tg_chat_id(chat_id: int | str) -> Optional[str]:
+    """Group linked to this Telegram chat in SQLite (group_counters.tg_chat_id)."""
+    clean_id = str(chat_id or "").strip()
+    if not clean_id:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT group_name FROM group_counters WHERE TRIM(COALESCE(tg_chat_id, '')) = ? "
+            "LIMIT 1;",
+            (clean_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return str(row[0]) if row and row[0] else None
+
+
 async def get_group_tg_chat_id(group_name: str) -> Optional[str]:
     clean_name = (group_name or "").strip()
     if not clean_name:

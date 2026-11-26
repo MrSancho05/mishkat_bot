@@ -2596,6 +2596,20 @@ async def cb_teacher_manage_assign_execute(
         )
         old_teacher_name = old_t_info["name"] or old_teacher_chat_id
 
+    if old_group:
+        new_ids = await asyncio.to_thread(sheets.resolve_teacher_ids, teacher_id)
+        old_ids = (
+            str(old_group.get("Ustoz_ID") or "").strip(),
+            old_teacher_chat_id,
+        )
+        if (new_ids[0] and new_ids[0] == old_ids[0]) or (
+            new_ids[1] and new_ids[1] == old_ids[1]
+        ):
+            # Exact same teacher: only backfill a missing ID, never re-notify.
+            await asyncio.to_thread(sheets.set_group_teacher, group_name, teacher_id)
+            await callback.answer(t("teacher_unchanged", lang), show_alert=True)
+            return
+
     try:
         result = await sheets.a_assign_teacher_to_group(teacher_id, group_name)
     except Exception:
@@ -4121,6 +4135,20 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
     # Lessons strictly BEFORE today are already elapsed (today's lesson is not):
     # the counter continues seamlessly, e.g. 3 elapsed -> next lesson is 4-dars.
     elapsed_count = count_elapsed_lessons(initial_dates, today)
+    teacher_ustoz_id = ""
+    if teacher_chat_id:
+        try:
+            # Always store Ustoz_ID (TCH001...) next to Ustoz_Chat_ID.
+            teacher_ustoz_id, resolved_chat = await asyncio.to_thread(
+                sheets.resolve_teacher_ids,
+                teacher_chat_id,
+                teacher_label if teacher_label and teacher_label != teacher_chat_id else "",
+            )
+            teacher_chat_id = resolved_chat or teacher_chat_id
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not resolve Ustoz_ID for %s", teacher_chat_id
+            )
     try:
         await asyncio.to_thread(
             sheets.add_group,
@@ -4130,7 +4158,7 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             lesson_count,
             _format_days_from_indices(selected_days, "latn"),
             lesson_time,
-            "",
+            teacher_ustoz_id,
             str(monthly_fee) if monthly_fee > 0 else "",
             daily_lessons,
         )
@@ -4706,10 +4734,36 @@ async def cb_edit_group_teacher(callback: CallbackQuery, state: FSMContext) -> N
         return
 
     new_teacher_id = str(user_id) if target == "__self__" else target
+    name_hint = (callback.from_user.full_name or "") if target == "__self__" else ""
+    if not name_hint and new_teacher_id.lstrip("-").isdigit():
+        db_teacher = await get_teacher_by_telegram_id(int(new_teacher_id))
+        name_hint = str((db_teacher or {}).get("full_name") or "").strip()
+    try:
+        # Writes BOTH Ustoz_ID (e.g. TCH001) and Ustoz_Chat_ID to Guruhlar.
+        assign = await asyncio.to_thread(
+            sheets.set_group_teacher, group_name, new_teacher_id, name_hint
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Teacher assignment failed for %s", group_name
+        )
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+    if not assign["changed"]:
+        # Same teacher picked again: no duplicate notifications / broadcasts.
+        if callback.message:
+            await _show_group_edit_panel(
+                callback.message,
+                state,
+                group_name,
+                lang,
+                edit=True,
+                notice=t("teacher_unchanged", lang),
+            )
+        await callback.answer()
+        return
+    new_teacher_id = assign["chat_id"] or new_teacher_id
     await _clear_group_link_in_teacher_meta(group_name)
-    await asyncio.to_thread(
-        sheets.update_group, group_name, {"Ustoz_Chat_ID": new_teacher_id}
-    )
     if old_teacher_id and old_teacher_id != new_teacher_id:
         await asyncio.to_thread(
             _sync_refresh_teacher_groups_column, sheets, old_teacher_id

@@ -1355,6 +1355,9 @@ def topic_dates_kb(
         weekday = item.get("weekday") or ""
         if item.get("is_cancelled"):
             status_icon = "🚫"
+        elif "has_topic" in item:
+            # Topic picker: ✅ only when THIS date has a saved topic, else ❌.
+            status_icon = "✅" if item.get("has_topic") else "❌"
         elif item.get("is_marked"):
             status_icon = "✅"
         else:

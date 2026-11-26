@@ -660,6 +660,16 @@ TEXTS: dict[str, dict[str, str]] = {
         "link_group_success": (
             "✅ Ushbu Telegram guruhi <b>{group}</b> guruhi bilan muvaffaqiyatli bog‘landi!"
         ),
+        "link_group_already_linked": (
+            "ℹ️ Ushbu guruh allaqachon o‘quv markazi tizimiga ulangan va eslatmalar faol!\n\n"
+            "Bu buyruq faqat markaz ma’muriyati (admin) tomonidan guruhni birinchi marta "
+            "ulash uchun ishlatiladi — sizdan hech qanday qo‘shimcha harakat talab etilmaydi.\n\n"
+            "Hurmat bilan,\nMishkat Nodavlat Ta'lim Muassasasi!"
+        ),
+        "link_group_admin_only": (
+            "⚠️ Bu buyruq faqat o‘quv markazi admini uchun mo‘ljallangan. "
+            "Guruhni tizimga ulashni adminning o‘zi amalga oshiradi."
+        ),
 
         # Student Group Self-Join (?start=join_<Group>)
         "join_group_not_found": (
@@ -765,6 +775,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_grp_edit_chat": "💬 Guruh chat ID ni o‘zgartirish",
         "btn_grp_edit_start": "📅 Boshlanish sanasini o‘zgartirish",
         "btn_grp_edit_daily": "🔁 Kunlik darslar sonini o‘zgartirish",
+        "teacher_unchanged": "ℹ️ Ustoz o‘zgarmadi (avvalgi ustoz saqlab qolindi).",
         # Lessons per day / agreed time
         "btn_daily_lessons_1": "1️⃣ Kuniga 1 ta dars",
         "btn_daily_lessons_2": "2️⃣ Kuniga 2 ta dars (Juft dars)",
@@ -826,6 +837,8 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         # Admin alert: attendance not marked 2 hours after the lesson
         "attendance_alert_session_line": "\n🔁 Dars: <b>{n}-dars</b>",
+        "btn_attendance_now": "📋 Hoziroq yo‘qlama qilish",
+        "attendance_no_teacher": "ustoz biriktirilmagan",
         "attendance_missing_admin_alert": (
             "⚠️ <b>Yo‘qlama qilinmadi!</b>\n\n"
             "Dars boshlanganiga <b>2 soatdan</b> oshdi, lekin yo‘qlama hali "
@@ -2098,6 +2111,16 @@ TEXTS: dict[str, dict[str, str]] = {
         "link_group_success": (
             "✅ Ушбу Telegram гуруҳи <b>{group}</b> гуруҳи билан муваффақиятли боғланди!"
         ),
+        "link_group_already_linked": (
+            "ℹ️ Ушбу гуруҳ аллақачон ўқув маркази тизимига уланган ва эслатмалар фаол!\n\n"
+            "Бу буйруқ фақат марказ маъмурияти (админ) томонидан гуруҳни биринчи марта "
+            "улаш учун ишлатилади — сиздан ҳеч қандай қўшимча ҳаракат талаб этилмайди.\n\n"
+            "Ҳурмат билан,\nМишкат Нодавлат Таълим Муассасаси!"
+        ),
+        "link_group_admin_only": (
+            "⚠️ Бу буйруқ фақат ўқув маркази админи учун мўлжалланган. "
+            "Гуруҳни тизимга улашни админнинг ўзи амалга оширади."
+        ),
 
         # Student Group Self-Join (?start=join_<Group>)
         "join_group_not_found": (
@@ -2203,6 +2226,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_grp_edit_chat": "💬 Гуруҳ чат ID ни ўзгартириш",
         "btn_grp_edit_start": "📅 Бошланиш санасини ўзгартириш",
         "btn_grp_edit_daily": "🔁 Кунлик дарслар сонини ўзгартириш",
+        "teacher_unchanged": "ℹ️ Устоз ўзгармади (аввалги устоз сақлаб қолинди).",
         # Lessons per day / agreed time
         "btn_daily_lessons_1": "1️⃣ Кунига 1 та дарс",
         "btn_daily_lessons_2": "2️⃣ Кунига 2 та дарс (Жуфт дарс)",
@@ -2264,6 +2288,8 @@ TEXTS: dict[str, dict[str, str]] = {
         ),
         # Admin alert: attendance not marked 2 hours after the lesson
         "attendance_alert_session_line": "\n🔁 Дарс: <b>{n}-дарс</b>",
+        "btn_attendance_now": "📋 Ҳозироқ йўқлама қилиш",
+        "attendance_no_teacher": "устоз бириктирилмаган",
         "attendance_missing_admin_alert": (
             "⚠️ <b>Йўқлама қилинмади!</b>\n\n"
             "Дарс бошланганига <b>2 соатдан</b> ошди, лекин йўқлама ҳали "
