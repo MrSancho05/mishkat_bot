@@ -23,10 +23,11 @@ from aiogram.types import (
 
 from app import database
 from app import states as app_states
-from app.scheduler import schedule_group_initial_notice
+from app.scheduler import normalize_chat_id_text, schedule_group_initial_notice
 from app.utils import legacy_group_join_slug, make_group_join_slug, now_tashkent
 from app.config import ADMIN_IDS, DB_PATH, STUDENT_SHEET_NAME, TZ, is_main_admin
 from app.database import (
+    get_group_name_by_tg_chat_id,
     set_group_tg_chat_id,
     activate_teacher_invite,
     add_user_role,
@@ -5111,6 +5112,24 @@ async def msg_profile_phone_fallback(message: Message) -> None:
 # ----------------------------------------------------------------------
 
 
+async def _find_group_linked_to_chat(
+    sheets_mgr: SheetsManager, chat_id: int
+) -> Optional[str]:
+    """Name of the group whose Guruh_TG_Chat_ID (Guruhlar or SQLite) is this chat."""
+    target = str(chat_id)
+    try:
+        for grp in await asyncio.to_thread(sheets_mgr.get_all_groups):
+            if normalize_chat_id_text(grp.get("Guruh_TG_Chat_ID")) == target:
+                return str(grp.get("Guruh_Nomi") or "").strip() or None
+    except Exception:
+        logger.exception("link_group: could not read Guruhlar")
+    try:
+        return await get_group_name_by_tg_chat_id(target)
+    except Exception:
+        logger.exception("link_group: could not read SQLite group chats")
+        return None
+
+
 @router.message(Command("link_group"))
 async def cmd_link_group(
     message: Message,
@@ -5125,12 +5144,29 @@ async def cmd_link_group(
         await message.reply(t("link_group_private_error", lang), parse_mode="HTML")
         return
 
+    sheets_mgr = sheets or get_sheets_manager()
+    is_admin_sender = user_id in ADMIN_IDS or bool(await _get_dynamic_admin(user_id))
     group_name = (command.args or "").strip()
+
+    if not is_admin_sender:
+        # Regular members (students / parents) who tap /link_group: never an
+        # error wall — tell them politely whether this chat is already linked.
+        linked_group = await _find_group_linked_to_chat(sheets_mgr, message.chat.id)
+        if linked_group:
+            await message.reply(t("link_group_already_linked", lang), parse_mode="HTML")
+            return
+        named_group = await sheets_mgr.a_get_group(group_name) if group_name else None
+        is_group_teacher = bool(named_group) and (
+            str(named_group.get("Ustoz_Chat_ID", "")).strip() == str(user_id)
+        )
+        if not is_group_teacher:
+            await message.reply(t("link_group_admin_only", lang), parse_mode="HTML")
+            return
+
     if not group_name:
         await message.reply(t("link_group_usage", "latn"), parse_mode="HTML")
         return
 
-    sheets_mgr = sheets or get_sheets_manager()
     group = await sheets_mgr.a_get_group(group_name)
     if not group:
         await message.reply(
@@ -5140,8 +5176,7 @@ async def cmd_link_group(
         return
 
     if not (
-        user_id in ADMIN_IDS
-        or await _get_dynamic_admin(user_id)
+        is_admin_sender
         or str(group.get("Ustoz_Chat_ID", "")).strip() == str(user_id)
     ):
         await message.reply(t("link_group_no_permission", "latn"), parse_mode="HTML")

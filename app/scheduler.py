@@ -2345,7 +2345,21 @@ async def process_missing_attendance_alerts(bot: Bot) -> None:
                     dars_vaqti=html.escape(label),
                     session_line=session_line,
                 )
-                if await _safe_send_message(bot, admin_cid, text):
+                # Deep link straight into that group's attendance screen
+                # (long group names are tokenized by the callback middleware).
+                attend_kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=t("btn_attendance_now", a_lang),
+                                callback_data=(
+                                    f"att_now:{session_key}:{today.isoformat()}:{group_name}"
+                                ),
+                            )
+                        ]
+                    ]
+                )
+                if await _safe_send_message(bot, admin_cid, text, reply_markup=attend_kb):
                     delivered += 1
                 await asyncio.sleep(0.05)
             if delivered:

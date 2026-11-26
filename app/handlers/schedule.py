@@ -27,6 +27,7 @@ from app.database import (
     get_user_lang,
     mark_topics_published,
     save_lesson_topic,
+    get_lesson_topics_for_group,
 )
 from app.keyboards import (
     InlineKeyboardBuilder,
@@ -1042,13 +1043,49 @@ async def _send_student_or_parent_schedule(message: Message, lang: str) -> None:
 # ======================================================================
 
 
+def _topic_date_key(raw: Any) -> str:
+    """'05.11' / '05.11.2026' / '2026-11-05' / '05.11 (2)' -> '05.11'."""
+    text = str(raw or "").strip()
+    iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+    if iso:
+        return f"{iso.group(3)}.{iso.group(2)}"
+    dm = re.match(r"^(\d{1,2})\.(\d{1,2})", text)
+    if dm:
+        return f"{int(dm.group(1)):02d}.{int(dm.group(2)):02d}"
+    return text
+
+
+async def _attach_topic_status(
+    group_name: str, dates_info: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """
+    Sets has_topic per date: True ONLY when that exact date has a non-empty
+    saved topic in SQLite (lesson_topics), so the picker shows ✅ for dates with
+    a topic and ❌ for the others (never derived from attendance colouring).
+    """
+    try:
+        rows = await get_lesson_topics_for_group(group_name)
+    except Exception:
+        logger.exception("Could not load lesson topics of %s", group_name)
+        rows = []
+    with_topic = {
+        _topic_date_key(r.get("lesson_date"))
+        for r in rows
+        if str(r.get("topic") or r.get("topic_title") or "").strip()
+    }
+    return [
+        {**item, "has_topic": _topic_date_key(item.get("date_str")) in with_topic}
+        for item in dates_info
+    ]
+
+
 async def _get_topic_dates_for_group(
     group_name: str, lang: str
 ) -> list[dict[str, Any]]:
     sheets = get_sheets_manager()
     dates_info = await sheets.a_get_cycle_dates_with_status(group_name, lang=lang)
     if dates_info:
-        return dates_info
+        return await _attach_topic_status(group_name, dates_info)
     group = await sheets.a_get_group(group_name)
     lesson_days = parse_weekdays(group.get("Dars_Kunlari", "") if group else "")
     if not lesson_days:
@@ -1056,15 +1093,18 @@ async def _get_topic_dates_for_group(
     today = today_tashkent()
     gen_dates = generate_cycle_dates(today, lesson_days, 8)
     wd_map = WEEKDAYS_SHORT.get(lang, WEEKDAYS_SHORT["latn"])
-    return [
-        {
-            "date_str": d.strftime("%d.%m"),
-            "weekday": wd_map.get(d.weekday(), ""),
-            "is_marked": False,
-            "is_cancelled": False,
-        }
-        for d in gen_dates
-    ]
+    return await _attach_topic_status(
+        group_name,
+        [
+            {
+                "date_str": d.strftime("%d.%m"),
+                "weekday": wd_map.get(d.weekday(), ""),
+                "is_marked": False,
+                "is_cancelled": False,
+            }
+            for d in gen_dates
+        ],
+    )
 
 
 @router.message(F.text.in_(TOPIC_MENU_TEXTS))

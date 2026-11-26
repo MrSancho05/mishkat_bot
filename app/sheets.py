@@ -3852,6 +3852,73 @@ class SheetsManager:
                 "group_assigned": assigned_group,
             }
 
+    def resolve_teacher_ids(
+        self, teacher_ref: str | int, full_name_hint: str = ""
+    ) -> tuple[str, str]:
+        """
+        (Ustoz_ID, Chat_ID) of a teacher given either its Ustoz_ID ("TCH001") or
+        Telegram chat id, looked up in Ustozlar. A chat id with no Ustozlar row
+        is registered there (with full_name_hint) so Ustoz_ID is never blank.
+        Returns ("", chat_id) only when nothing at all can be resolved.
+        """
+        with self._lock:
+            ref = _normalize_read_value(teacher_ref)
+            if not ref:
+                return "", ""
+            teacher = self.get_teacher(ref)
+            if teacher is None and re.fullmatch(r"-?\d+", ref) and full_name_hint.strip():
+                teacher = self.add_teacher(full_name=full_name_hint.strip(), chat_id=ref)
+            if not teacher:
+                return "", ref if re.fullmatch(r"-?\d+", ref) else ""
+            t_id = _normalize_read_value(teacher.get("Ustoz_ID"))
+            t_chat = _chat_id_str(
+                teacher.get("Chat_ID") or teacher.get("Ustoz_Chat_ID")
+            ) or (ref if re.fullmatch(r"-?\d+", ref) else "")
+            return t_id, t_chat
+
+    def set_group_teacher(
+        self, group_name: str, teacher_ref: str | int, full_name_hint: str = ""
+    ) -> dict[str, Any]:
+        """
+        Writes BOTH Ustoz_ID and Ustoz_Chat_ID of the resolved teacher to the
+        group's Guruhlar row (non-empty cells are re-coloured white, clearing any
+        yellow "missing" highlight). When the exact same teacher is already
+        assigned, nothing is rewritten except a missing Ustoz_ID/Chat_ID being
+        filled, and {"changed": False} is returned so callers skip notifications.
+        """
+        with self._lock:
+            group = self.get_group(group_name)
+            if not group:
+                raise ValueError(f"Group not found: {group_name}")
+            canonical = group["Guruh_Nomi"].strip()
+            new_id, new_chat = self.resolve_teacher_ids(teacher_ref, full_name_hint)
+            old_id = _normalize_read_value(group.get("Ustoz_ID"))
+            old_chat = _chat_id_str(group.get("Ustoz_Chat_ID")) or _normalize_read_value(
+                group.get("Ustoz_Chat_ID")
+            )
+            same_teacher = bool(
+                (new_id and old_id and new_id == old_id)
+                or (new_chat and old_chat and new_chat == old_chat)
+            )
+            updates: dict[str, Any] = {}
+            if same_teacher:
+                if new_id and not old_id:
+                    updates["Ustoz_ID"] = new_id
+                if new_chat and not old_chat:
+                    updates["Ustoz_Chat_ID"] = new_chat
+            else:
+                updates = {"Ustoz_ID": new_id, "Ustoz_Chat_ID": new_chat}
+            if updates:
+                self.update_group(canonical, updates)
+            return {
+                "changed": not same_teacher,
+                "group_name": canonical,
+                "ustoz_id": new_id,
+                "chat_id": new_chat,
+                "old_ustoz_id": old_id,
+                "old_chat_id": old_chat,
+            }
+
     def assign_teacher_to_group(
         self, teacher_id: str, group_name: str
     ) -> dict[str, Any]:

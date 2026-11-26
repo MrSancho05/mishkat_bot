@@ -26,7 +26,7 @@ from app.utils import (
     now_tashkent,
     today_tashkent,
 )
-from app.config import ADMIN_IDS, DB_PATH, TZ
+from app.config import ADMIN_IDS, DB_PATH, TZ, is_main_admin
 from app.scheduler import normalize_chat_id_text, send_group_chat_message
 from app.database import (
     get_all_dynamic_admins,
@@ -311,6 +311,9 @@ async def _get_all_admin_ids() -> list[int]:
 
 async def _get_authorized_groups(user_id: int) -> tuple[bool, list[dict[str, Any]]]:
     sheets = get_sheets_manager()
+    if is_main_admin(user_id):
+        # Main admin: every group of every teacher, whatever menu/role is shown.
+        return True, await asyncio.to_thread(sheets.get_all_groups)
     is_admin = await _is_admin(user_id)
     if is_admin:
         if hasattr(sheets, "a_get_groups_for_role"):
@@ -340,6 +343,53 @@ async def _get_authorized_groups(user_id: int) -> tuple[bool, list[dict[str, Any
     if not groups:
         return False, []
     return True, groups
+
+
+async def _att_groups_kb(
+    user_id: int, groups: list[dict[str, Any]], lang: str
+) -> InlineKeyboardMarkup:
+    """
+    Group picker of the attendance flow. The MAIN admin (who may take
+    attendance for every group of every teacher) sees "📚 Group — 👨‍🏫 Teacher"
+    on each button; everyone else keeps the usual 2-column group buttons.
+    """
+    if not is_main_admin(user_id):
+        return groups_inline_kb(
+            groups, prefix="att_grp", lang=lang, include_back=True, include_cancel=True
+        )
+    sheets = get_sheets_manager()
+    try:
+        teachers = await asyncio.to_thread(sheets.get_all_teachers, False)
+    except Exception:
+        teachers = []
+    by_id = {
+        str(tch.get("Ustoz_ID") or "").strip(): str(tch.get("F.I.O.") or "").strip()
+        for tch in teachers
+    }
+    by_cid = {
+        normalize_chat_id_text(tch.get("Chat_ID")): str(tch.get("F.I.O.") or "").strip()
+        for tch in teachers
+    }
+    builder = InlineKeyboardBuilder()
+    for grp in groups:
+        name = str(grp.get("Guruh_Nomi") or "").strip()
+        if not name:
+            continue
+        teacher = (
+            by_id.get(str(grp.get("Ustoz_ID") or "").strip())
+            or by_cid.get(normalize_chat_id_text(grp.get("Ustoz_Chat_ID")))
+            or t("attendance_no_teacher", lang)
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📚 {name} — 👨‍🏫 {teacher}", callback_data=f"att_grp:{name}"
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text=t("btn_back", lang), callback_data="att_grp:__back__"),
+        InlineKeyboardButton(text=t("btn_cancel", lang), callback_data="att_grp:__cancel__"),
+    )
+    return builder.as_markup()
 
 
 async def _filter_today_groups(
@@ -973,12 +1023,10 @@ async def cb_attendance_select_mode(
 
         await callback.message.edit_text(
             t("attendance_select_group", lang),
-            reply_markup=groups_inline_kb(
+            reply_markup=await _att_groups_kb(
+                callback.from_user.id,
                 today_groups,
-                prefix="att_grp",
-                lang=lang,
-                include_back=True,
-                include_cancel=True,
+                lang,
             ),
             parse_mode="HTML",
         )
@@ -989,12 +1037,10 @@ async def cb_attendance_select_mode(
     await state.update_data(att_mode="other", att_today_str=today_str)
     await callback.message.edit_text(
         t("attendance_select_group", lang),
-        reply_markup=groups_inline_kb(
+        reply_markup=await _att_groups_kb(
+            callback.from_user.id,
             groups,
-            prefix="att_grp",
-            lang=lang,
-            include_back=True,
-            include_cancel=True,
+            lang,
         ),
         parse_mode="HTML",
     )
@@ -1137,12 +1183,10 @@ async def cb_attendance_select_date(
         await state.set_state(AttendanceStates.selecting_group)
         await callback.message.edit_text(
             t("attendance_select_group", lang),
-            reply_markup=groups_inline_kb(
+            reply_markup=await _att_groups_kb(
+                callback.from_user.id,
                 groups,
-                prefix="att_grp",
-                lang=lang,
-                include_back=True,
-                include_cancel=True,
+                lang,
             ),
             parse_mode="HTML",
         )
@@ -1241,12 +1285,10 @@ async def cb_attendance_back(callback: CallbackQuery, state: FSMContext) -> None
 
     await callback.message.edit_text(
         t("attendance_select_group", lang),
-        reply_markup=groups_inline_kb(
+        reply_markup=await _att_groups_kb(
+            callback.from_user.id,
             groups,
-            prefix="att_grp",
-            lang=lang,
-            include_back=True,
-            include_cancel=True,
+            lang,
         ),
         parse_mode="HTML",
     )
@@ -2085,3 +2127,58 @@ async def cb_attendance_cancel_today_decide(
                 teacher_name=html.escape(teacher_name or "—"),
             ),
         )
+
+
+@router.callback_query(F.data.startswith("att_now:"))
+async def cb_attendance_now_from_alert(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    """
+    '📋 Hoziroq yo‘qlama qilish' on the 2-hour missed-attendance alert:
+    att_now:<session>:<YYYY-MM-DD>:<group name> -> opens that exact lesson's
+    marking screen (in a new message, the alert itself stays).
+    """
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    parts = (callback.data or "").split(":", 3)
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    _, session_raw, date_raw, group_name = parts
+    try:
+        lesson_date = date.fromisoformat(date_raw)
+    except ValueError:
+        await callback.answer(t("error_generic", lang), show_alert=True)
+        return
+    if not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+    if lesson_date > today_tashkent():
+        await callback.answer(_lt("future_date_forbidden", lang), show_alert=True)
+        return
+    session = _parse_int(session_raw) or None
+    if session and await is_lesson_cancelled(group_name, lesson_date.isoformat(), session):
+        await callback.answer(t("attendance_session_cancelled", lang), show_alert=True)
+        return
+    await state.clear()
+    is_today = lesson_date == today_tashkent()
+    await state.update_data(
+        att_mode="today" if is_today else "other",
+        att_today_str=today_tashkent().strftime("%d.%m.%Y"),
+        group_name=group_name,
+        cycle_title_hint="",
+    )
+    target = await callback.message.answer("⏳")
+    await _open_attendance_marking(
+        target,
+        state,
+        lang,
+        group_name,
+        lesson_date,
+        session,
+        "att_back:group" if is_today else "att_back:date",
+    )
+    await callback.answer()
