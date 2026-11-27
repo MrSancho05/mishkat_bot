@@ -8,6 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.config import BOT_TOKEN
 from app.database import init_db
+from app.handlers.ai import router as ai_router
 from app.handlers.attendance import router as attendance_router
 from app.handlers.groups_info import router as groups_info_router
 from app.handlers.guest import router as guest_router
@@ -73,6 +74,9 @@ async def main() -> None:
     dp.include_router(attendance_router)
     dp.include_router(payments_router)
     dp.include_router(groups_info_router)
+    # MUST stay last: the AI assistant only gets private text/voice that no
+    # command, menu button, callback or active FSM state handled above.
+    dp.include_router(ai_router)
 
     loop = asyncio.get_running_loop()
 

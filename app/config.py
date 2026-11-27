@@ -46,6 +46,16 @@ if MAIN_ADMIN_ID is not None and MAIN_ADMIN_ID not in ADMIN_IDS:
     ADMIN_IDS.insert(0, MAIN_ADMIN_ID)
 
 
+# ----------------------------------------------------------------------
+# Mishkat AI Assistant (Google Gemini via the google-genai SDK)
+# ----------------------------------------------------------------------
+# Without GEMINI_API_KEY the assistant is simply OFF: no client is created,
+# nothing is sent to Google and every existing menu keeps working unchanged.
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
+AI_ENABLED: bool = bool(GEMINI_API_KEY)
+
+
 def is_main_admin(user_id: object) -> bool:
     try:
         return MAIN_ADMIN_ID is not None and int(str(user_id)) == MAIN_ADMIN_ID
