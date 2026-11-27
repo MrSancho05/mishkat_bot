@@ -111,6 +111,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>{group}</b> — {date} mavzusi saqlandi. U 30 daqiqadan so‘ng "
             "avtomatik e’lon qilinadi."
         ),
+        "done_payment_revert": "↩️ <b>{student}</b> ({group}) — <b>{cycle}</b> to‘lovi bekor qilindi.",
+        "done_topic_published": "✅ <b>{group}</b> — {date} mavzusi saqlandi va e’lon qilindi (yuborildi: {sent}).",
+        "done_student_edit": "✅ <b>{student}</b>: {field} → <b>{value}</b>",
+        "done_device_link": "📱 <b>{student}</b> uchun qurilmaga ulash havolasi:\n<code>{link}</code>",
+        "done_group_update": "✅ <b>{group}</b> guruhi yangilandi: {parts}",
+        "done_group_delete": "🗑 <b>{group}</b> guruhi o‘chirildi (talabalar Zahira guruhiga o‘tkazildi).",
+        "done_teacher_invite": "🔗 Ustoz taklif havolasi ({group}):\n<code>{link}</code>",
+        "link_group_hint": "👥 Telegram guruhini ulash uchun guruh chatida yuboring:\n<code>/link_group {group}</code>",
         "lbl_group": "📚 Guruh",
         "lbl_student": "👤 Talaba",
         "lbl_cycle": "🗓 Sikl",
@@ -155,6 +163,14 @@ TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>{group}</b> — {date} мавзуси сақланди. У 30 дақиқадан сўнг "
             "автоматик эълон қилинади."
         ),
+        "done_payment_revert": "↩️ <b>{student}</b> ({group}) — <b>{cycle}</b> тўлови бекор қилинди.",
+        "done_topic_published": "✅ <b>{group}</b> — {date} мавзуси сақланди ва эълон қилинди (юборилди: {sent}).",
+        "done_student_edit": "✅ <b>{student}</b>: {field} → <b>{value}</b>",
+        "done_device_link": "📱 <b>{student}</b> учун қурилмага улаш ҳаволаси:\n<code>{link}</code>",
+        "done_group_update": "✅ <b>{group}</b> гуруҳи янгиланди: {parts}",
+        "done_group_delete": "🗑 <b>{group}</b> гуруҳи ўчирилди (талабалар Захира гуруҳига ўтказилди).",
+        "done_teacher_invite": "🔗 Устоз таклиф ҳаволаси ({group}):\n<code>{link}</code>",
+        "link_group_hint": "👥 Telegram гуруҳини улаш учун гуруҳ чатида юборинг:\n<code>/link_group {group}</code>",
         "lbl_group": "📚 Гуруҳ",
         "lbl_student": "👤 Талаба",
         "lbl_cycle": "🗓 Цикл",
@@ -299,7 +315,10 @@ def _remember(user_id: int, user_text: str, model_text: str) -> None:
 
 
 class ToolContext:
-    def __init__(self, user_id: int, role: str, lang: str, actor_name: str) -> None:
+    def __init__(
+        self, user_id: int, role: str, lang: str, actor_name: str, bot: Any = None
+    ) -> None:
+        self.bot = bot
         self.user_id = user_id
         self.role = role
         self.lang = lang
@@ -365,6 +384,82 @@ def _names(groups: list[dict[str, Any]]) -> list[str]:
     return [str(g.get("Guruh_Nomi") or "") for g in groups][:40]
 
 
+def _name_match_score(q_tokens: list[str], name_parts: list[str]) -> float:
+    """
+    Every typed word must match a DIFFERENT part of the name: a prefix
+    ("Ali Val" -> "Ali Valiyev") or a close spelling (>= 0.8, "Valiev" ->
+    "Valiyev"). Word order is free. "Vali Aliyev" therefore never matches
+    "Ali Valiyev". Returns 0 when not matched, else a score in (0, 1].
+    """
+    if not q_tokens or not name_parts:
+        return 0.0
+    remaining = list(name_parts)
+    total = 0.0
+    for tok in q_tokens:
+        best_idx, best_score = -1, 0.0
+        for idx, part in enumerate(remaining):
+            if part == tok:
+                score = 1.0
+            elif part.startswith(tok) and len(tok) >= 2:
+                score = 0.9
+            else:
+                score = difflib.SequenceMatcher(None, tok, part).ratio()
+                if score < 0.8:
+                    score = 0.0
+            if score > best_score:
+                best_idx, best_score = idx, score
+        if best_idx < 0:
+            return 0.0
+        total += best_score
+        remaining.pop(best_idx)
+    # Prefer names whose every part was mentioned ("Ali Valiyev" over "Ali Valiyev Karim").
+    return total / len(q_tokens) - 0.01 * len(remaining)
+
+
+def _fuzzy_pick(
+    query: str, students: list[dict[str, Any]]
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """Talaba_ID / phone / fuzzy F.I.O. match inside `students`."""
+    q = _norm(query)
+    if not q:
+        return None, {"error": "student_required"}
+    for s in students:
+        if _norm(s.get("Talaba_ID")) == q:
+            return s, {}
+    q_digits = re.sub(r"\D", "", q)
+    if len(q_digits) >= 7:
+        phone_hits = [
+            s
+            for s in students
+            if q_digits[-9:] in re.sub(r"\D", "", str(s.get("Talaba_Tel") or ""))
+        ]
+        if len(phone_hits) == 1:
+            return phone_hits[0], {}
+    scored: list[tuple[float, dict[str, Any]]] = []
+    q_tokens = q.split()
+    for s in students:
+        name = _norm(s.get("F.I.O."))
+        if not name:
+            continue
+        score = _name_match_score(q_tokens, name.split())
+        if score > 0:
+            scored.append((score, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored:
+        return None, {"error": "student_not_found_or_not_allowed", "query": query}
+    best = scored[0]
+    ties = [s for r, s in scored if r >= best[0] - 0.02]
+    if len(ties) > 1:
+        return None, {
+            "error": "ambiguous_student",
+            "query": query,
+            "candidates": [
+                f"{s.get('F.I.O.')} ({s.get('Talaba_ID')}, {s.get('Guruh')})" for s in ties[:6]
+            ],
+        }
+    return best[1], {}
+
+
 async def _match_student(
     ctx: ToolContext, query: str, group_name: str = ""
 ) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
@@ -378,44 +473,7 @@ async def _match_student(
             or str(s.get("Sobiq_Guruh") or "").strip().lower() == g_key
         ]
         students = scoped or students
-    q = _norm(query)
-    if not q:
-        return None, {"error": "student_required"}
-    for s in students:
-        if _norm(s.get("Talaba_ID")) == q:
-            return s, {}
-    q_digits = re.sub(r"\D", "", q)
-    if len(q_digits) >= 7:
-        phone_hits = [
-            s
-            for s in students
-            if q_digits[-9:] and q_digits[-9:] in re.sub(r"\D", "", str(s.get("Talaba_Tel") or ""))
-        ]
-        if len(phone_hits) == 1:
-            return phone_hits[0], {}
-    scored: list[tuple[float, dict[str, Any]]] = []
-    q_tokens = q.split()
-    for s in students:
-        name = _norm(s.get("F.I.O."))
-        if not name:
-            continue
-        ratio = difflib.SequenceMatcher(None, q, name).ratio()
-        if all(any(tok in part for part in name.split()) for tok in q_tokens):
-            ratio = max(ratio, 0.9)
-        scored.append((ratio, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    if not scored or scored[0][0] < 0.6:
-        return None, {"error": "student_not_found_or_not_allowed"}
-    best = scored[0]
-    ties = [s for r, s in scored if r >= best[0] - 0.03]
-    if len(ties) > 1:
-        return None, {
-            "error": "ambiguous_student",
-            "candidates": [
-                f"{s.get('F.I.O.')} ({s.get('Talaba_ID')}, {s.get('Guruh')})" for s in ties[:6]
-            ],
-        }
-    return best[1], {}
+    return _fuzzy_pick(query, students)
 
 
 def _parse_lesson_date(raw: str) -> Optional[date]:
@@ -712,16 +770,13 @@ async def _make_draft(ctx: ToolContext, action: str, payload: dict[str, Any]) ->
     }
 
 
-async def tool_prepare_schedule_update(
-    ctx: ToolContext,
-    group: str = "",
-    lesson_time: str = "",
-    lesson_days: str = "",
-    lesson_count: int = 0,
+def _validate_schedule(
+    grp: dict[str, Any], lesson_time: str = "", lesson_days: str = "", lesson_count: int = 0
 ) -> dict[str, Any]:
-    grp, err = await _match_group(ctx, group)
-    if not grp:
-        return err
+    """
+    Validates a schedule change against the group's current values. Returns
+    {"group", "old", "new", "changed"} or {"error": ...}. Nothing is written.
+    """
     old_days = parse_weekdays(grp.get("Dars_Kunlari", ""))
     new_days = parse_weekdays(lesson_days) if lesson_days else old_days
     if lesson_days and not new_days:
@@ -775,11 +830,28 @@ async def tool_prepare_schedule_update(
             "count": new_count,
         },
     }
-    if (
+    payload["changed"] = not (
         payload["new"]["time"] == payload["old"]["time"]
         and new_days == old_days
         and new_count == old_count
-    ):
+    )
+    return payload
+
+
+async def tool_prepare_schedule_update(
+    ctx: ToolContext,
+    group: str = "",
+    lesson_time: str = "",
+    lesson_days: str = "",
+    lesson_count: int = 0,
+) -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    payload = _validate_schedule(grp, lesson_time, lesson_days, lesson_count)
+    if payload.get("error"):
+        return payload
+    if not payload.pop("changed"):
         return {"error": "nothing_changes"}
     return await _make_draft(ctx, "schedule", payload)
 
@@ -923,146 +995,615 @@ async def tool_prepare_lesson_topic(
     return await _make_draft(ctx, "topic", payload)
 
 
+# ----------------------------------------------------------------------
+# Extended tools: every button-menu capability of the admin / teacher roles
+# ----------------------------------------------------------------------
+
+STUDENT_EDITABLE_FIELDS = {
+    "F.I.O.": "F.I.O.",
+    "fio": "F.I.O.",
+    "name": "F.I.O.",
+    "Talaba_Tel": "Talaba_Tel",
+    "phone": "Talaba_Tel",
+    "Talaba_TG": "Talaba_TG",
+    "telegram": "Talaba_TG",
+    "Otasi_FIO": "Otasi_FIO",
+    "father_name": "Otasi_FIO",
+    "Otasi_Tel": "Otasi_Tel",
+    "father_phone": "Otasi_Tel",
+    "Onasi_FIO": "Onasi_FIO",
+    "mother_name": "Onasi_FIO",
+    "Onasi_Tel": "Onasi_Tel",
+    "mother_phone": "Onasi_Tel",
+}
+
+
+def _active_roster(students: list[dict[str, Any]], group_name: str) -> list[dict[str, Any]]:
+    key = group_name.strip().lower()
+    return [
+        s
+        for s in students
+        if str(s.get("Guruh") or "").strip().lower() == key
+        and str(s.get("Status") or "").strip() == "O'qiyapti"
+    ]
+
+
+def _parse_fee(raw: Any) -> Optional[int]:
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if not digits:
+        return None
+    amount = int(digits)
+    if amount <= 0 or amount > 100_000_000:
+        return None
+    return amount * 1000 if amount < 10000 else amount
+
+
+async def _match_teacher(query: str) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    teachers = await asyncio.to_thread(get_sheets_manager().get_all_teachers, False)
+    q = _norm(query)
+    if not q:
+        return None, {"error": "teacher_required"}
+    for tch in teachers:
+        if q in {_norm(tch.get("Ustoz_ID")), _norm(tch.get("Chat_ID"))}:
+            return tch, {}
+    by_name = {_norm(tch.get("F.I.O.")): tch for tch in teachers if _norm(tch.get("F.I.O."))}
+    hits = [tch for name, tch in by_name.items() if _name_match_score(q.split(), name.split()) > 0]
+    if len(hits) == 1:
+        return hits[0], {}
+    close = difflib.get_close_matches(q, list(by_name), n=3, cutoff=0.6)
+    if len(close) == 1 and not hits:
+        return by_name[close[0]], {}
+    cands = hits or [by_name[c] for c in close]
+    if cands:
+        return None, {
+            "error": "ambiguous_teacher",
+            "candidates": [f"{c.get('F.I.O.')} ({c.get('Ustoz_ID')})" for c in cands[:6]],
+        }
+    return None, {
+        "error": "teacher_not_found",
+        "teachers": [f"{t.get('F.I.O.')} ({t.get('Ustoz_ID')})" for t in teachers[:30]],
+    }
+
+
+async def tool_list_today_groups(ctx: ToolContext) -> dict[str, Any]:
+    """Groups that have a lesson today (by Dars_Kunlari and start date)."""
+    today = today_tashkent()
+    groups = []
+    for g in await ctx.groups():
+        if today.weekday() not in parse_weekdays(g.get("Dars_Kunlari", "")):
+            continue
+        start_raw = str(g.get("Boshlanish_Sanasi") or "").strip().lstrip("'")
+        try:
+            if start_raw and datetime.strptime(start_raw, "%d.%m.%Y").date() > today:
+                continue
+        except ValueError:
+            pass
+        groups.append(
+            {
+                "name": g.get("Guruh_Nomi"),
+                "time": format_lesson_time_display(g.get("Dars_Vaqti"), "latn"),
+                "lessons_done": g.get("Otilgan_Dars_Hisoblagich"),
+                "monthly_lessons": g.get("Oylik_Dars_Soni"),
+            }
+        )
+    return {"date": today.strftime("%d.%m.%Y"), "groups": groups}
+
+
+async def tool_group_contacts(ctx: ToolContext, group: str = "") -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    roster = _active_roster(await ctx.students(), grp["Guruh_Nomi"])
+    return {
+        "group": grp["Guruh_Nomi"],
+        "students": [
+            {
+                "name": s.get("F.I.O."),
+                "phone": s.get("Talaba_Tel"),
+                "telegram": s.get("Talaba_TG"),
+                "father": s.get("Otasi_FIO"),
+                "father_phone": s.get("Otasi_Tel"),
+                "mother": s.get("Onasi_FIO"),
+                "mother_phone": s.get("Onasi_Tel"),
+                "bot_linked": bool(str(s.get("Talaba_Chat_ID") or "").strip()),
+            }
+            for s in roster
+        ],
+    }
+
+
+async def tool_debtor_lesson_dates(ctx: ToolContext, student: str = "") -> dict[str, Any]:
+    """Detailed debtor view: unpaid cycles with every lesson date + status."""
+    from app.handlers.payments import _sync_collect_unpaid_cycles
+
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    cycles = await asyncio.to_thread(
+        _sync_collect_unpaid_cycles, get_sheets_manager(), [stu]
+    )
+    rows = cycles.get(str(stu.get("Talaba_ID") or "").strip(), [])
+    return {
+        "student": stu.get("F.I.O."),
+        "group": stu.get("Guruh"),
+        "unpaid_cycles": [
+            {
+                "cycle": c["title"],
+                "lessons": [f"{label} {icon}" for label, icon in c["lessons"]],
+                "dates_copy": ", ".join(label for label, _icon in c["lessons"]),
+            }
+            for c in rows
+        ],
+    }
+
+
+async def tool_student_invite_link(ctx: ToolContext, group: str = "") -> dict[str, Any]:
+    """Self-join link (?start=join_<slug>) of a group — read-only, no change."""
+    from app.utils import make_group_join_slug
+
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    if ctx.bot is None:
+        return {"error": "bot_unavailable"}
+    me = await ctx.bot.get_me()
+    return {
+        "group": grp["Guruh_Nomi"],
+        "student_invite_link": f"https://t.me/{me.username}?start=join_{make_group_join_slug(grp['Guruh_Nomi'])}",
+        "note": "Students and parents open this link to request joining the group.",
+    }
+
+
+async def tool_center_statistics(ctx: ToolContext) -> dict[str, Any]:
+    sheets = get_sheets_manager()
+    students = await asyncio.to_thread(sheets.get_all_students, None, False)
+    groups = await asyncio.to_thread(sheets.get_all_groups)
+    teachers = await asyncio.to_thread(sheets.get_all_teachers, False)
+    leads = await get_recent_leads(500)
+    debt = await tool_list_debtors(ctx)
+    active = [s for s in students if str(s.get("Status") or "").strip() == "O'qiyapti"]
+    return {
+        "active_students": len(active),
+        "reserve_students": len(students) - len(active),
+        "groups": len(groups),
+        "groups_without_teacher": [
+            g.get("Guruh_Nomi")
+            for g in groups
+            if not str(g.get("Ustoz_ID") or g.get("Ustoz_Chat_ID") or "").strip()
+        ],
+        "teachers": len(teachers),
+        "debtors": debt.get("count", 0),
+        "total_debt_uzs": debt.get("total_debt_uzs", 0),
+        "leads_new": sum(1 for r in leads if r.get("status") != "contacted"),
+        "leads_contacted": sum(1 for r in leads if r.get("status") == "contacted"),
+    }
+
+
+async def tool_prepare_attendance(
+    ctx: ToolContext,
+    group: str = "",
+    date: str = "bugun",
+    absent: Optional[list[str]] = None,
+    present: Optional[list[str]] = None,
+    session: int = 0,
+) -> dict[str, Any]:
+    """
+    Attendance draft: everyone ✅ except `absent`; when only `present` is
+    given, everyone else is ❌. Today or a past lesson date of the active cycle.
+    """
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    name = grp["Guruh_Nomi"]
+    lesson_day = _parse_lesson_date(date or "bugun")
+    today = today_tashkent()
+    if lesson_day is None:
+        return {"error": "invalid_date", "hint": "DD.MM, 'bugun' or 'kecha'"}
+    if lesson_day > today:
+        return {"error": "future_date_not_allowed"}
+    sheets = get_sheets_manager()
+    cat = await asyncio.to_thread(
+        sheets.get_group_lesson_dates_categorized, name, today.strftime("%d.%m.%Y"), "latn"
+    )
+    if lesson_day == today:
+        entries = list(cat.get("today_lessons") or [])
+    else:
+        entries = [
+            e for e in cat.get("past_lessons") or [] if e.get("full_date") == lesson_day.isoformat()
+        ]
+    if not entries:
+        return {
+            "error": "not_a_lesson_date_of_active_cycle",
+            "recent_lesson_dates": [e.get("full_date_dmy") for e in (cat.get("past_lessons") or [])[:8]],
+        }
+    with_session = [e for e in entries if e.get("session")]
+    chosen = entries[0]
+    if len(with_session) > 1:
+        if int(session or 0) not in {1, 2}:
+            return {"error": "double_lesson_day_session_required", "sessions": [1, 2]}
+        chosen = next(e for e in with_session if int(e["session"]) == int(session))
+    if chosen.get("is_cancelled"):
+        return {"error": "lesson_cancelled"}
+    roster = _active_roster(await ctx.students(), name)
+    if not roster:
+        return {"error": "no_active_students"}
+    default_mark = "❌" if (present and not absent) else "✅"
+    marks = {str(s["Talaba_ID"]): default_mark for s in roster}
+    for query, mark in [(q, "❌") for q in (absent or [])] + [(q, "✅") for q in (present or [])]:
+        hit, miss = _fuzzy_pick(str(query), roster)
+        if not hit:
+            miss["roster"] = [s.get("F.I.O.") for s in roster]
+            return miss
+        marks[str(hit["Talaba_ID"])] = mark
+    payload = {
+        "group": name,
+        "date": lesson_day.isoformat(),
+        "date_dmy": lesson_day.strftime("%d.%m.%Y"),
+        "session": int(chosen.get("session") or 0) or None,
+        "already_marked": bool(chosen.get("is_marked")),
+        "marks": marks,
+        "names": {str(s["Talaba_ID"]): str(s.get("F.I.O.") or "") for s in roster},
+    }
+    return await _make_draft(ctx, "attendance", payload)
+
+
+async def tool_prepare_payment_revert(
+    ctx: ToolContext, student: str = "", group: str = "", cycle: str = ""
+) -> dict[str, Any]:
+    from app.handlers.payments import _fetch_full_cycle_history_sync
+
+    grp_name = ""
+    if group:
+        grp, err = await _match_group(ctx, group)
+        if not grp:
+            return err
+        grp_name = grp["Guruh_Nomi"]
+    stu, err = await _match_student(ctx, student, grp_name)
+    if not stu:
+        return err
+    grp_name = grp_name or str(stu.get("Guruh") or "").strip()
+    if grp_name.strip().lower() not in await ctx.group_names_lower():
+        return {"error": "group_not_allowed"}
+    cycles = await asyncio.to_thread(_fetch_full_cycle_history_sync, grp_name, str(stu["Talaba_ID"]))
+    paid = [c for c in cycles if c.get("is_paid")]
+    if not paid:
+        return {"error": "no_paid_cycle", "student": stu.get("F.I.O.")}
+    if cycle:
+        q = _norm(cycle)
+        chosen = next((c for c in paid if q in _norm(c.get("cycle_title"))), None)
+        if chosen is None:
+            return {"error": "cycle_not_found", "paid_cycles": [c["cycle_title"] for c in paid]}
+    else:
+        paid.sort(key=lambda c: int(c.get("cycle_number") or 0))
+        chosen = paid[-1]
+    payload = {
+        "student_id": str(stu["Talaba_ID"]),
+        "student_name": str(stu.get("F.I.O.") or ""),
+        "group": grp_name,
+        "cycle_title": chosen["cycle_title"],
+        "amount": int(chosen.get("prorated_amount") or 0),
+    }
+    return await _make_draft(ctx, "payment_revert", payload)
+
+
+async def tool_prepare_student_edit(
+    ctx: ToolContext, student: str = "", field: str = "", value: str = ""
+) -> dict[str, Any]:
+    column = STUDENT_EDITABLE_FIELDS.get(str(field or "").strip()) or STUDENT_EDITABLE_FIELDS.get(
+        _norm(field)
+    )
+    if not column:
+        return {"error": "field_not_editable", "allowed": sorted(set(STUDENT_EDITABLE_FIELDS.values()))}
+    new_val = " ".join(str(value or "").split())
+    if not new_val:
+        return {"error": "value_required"}
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    payload = {
+        "student_id": str(stu["Talaba_ID"]),
+        "student_name": str(stu.get("F.I.O.") or ""),
+        "group": str(stu.get("Guruh") or ""),
+        "field": column,
+        "old_value": str(stu.get(column) or ""),
+        "new_value": new_val[:120],
+    }
+    return await _make_draft(ctx, "student_edit", payload)
+
+
+async def tool_prepare_device_link(
+    ctx: ToolContext, student: str = "", phone: str = ""
+) -> dict[str, Any]:
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    clean_phone = ""
+    if phone:
+        digits = re.sub(r"\D", "", phone)
+        if len(digits) < 7 or len(digits) > 15:
+            return {"error": "invalid_phone"}
+        clean_phone = phone.strip()
+    payload = {
+        "student_id": str(stu["Talaba_ID"]),
+        "student_name": str(stu.get("F.I.O.") or ""),
+        "group": str(stu.get("Guruh") or ""),
+        "phone": clean_phone,
+    }
+    return await _make_draft(ctx, "device_link", payload)
+
+
+async def tool_prepare_student_transfer(
+    ctx: ToolContext, student: str = "", target_group: str = "", keep_in_old_group: bool = False
+) -> dict[str, Any]:
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    grp, err = await _match_group(ctx, target_group)
+    if not grp:
+        return err
+    old_group = str(stu.get("Guruh") or "").strip()
+    if old_group.lower() == grp["Guruh_Nomi"].strip().lower():
+        return {"error": "already_in_this_group"}
+    payload = {
+        "student_id": str(stu["Talaba_ID"]),
+        "student_name": str(stu.get("F.I.O.") or ""),
+        "old_group": old_group,
+        "group": grp["Guruh_Nomi"],
+        "keep_in_old_group": bool(keep_in_old_group),
+    }
+    return await _make_draft(ctx, "student_transfer", payload)
+
+
+async def tool_prepare_student_delete(ctx: ToolContext, student: str = "") -> dict[str, Any]:
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    payload = {
+        "student_id": str(stu["Talaba_ID"]),
+        "student_name": str(stu.get("F.I.O.") or ""),
+        "group": str(stu.get("Guruh") or ""),
+    }
+    return await _make_draft(ctx, "student_delete", payload)
+
+
+async def tool_prepare_group_create(
+    ctx: ToolContext,
+    name: str = "",
+    teacher: str = "",
+    lesson_count: int = 12,
+    lesson_days: str = "",
+    lesson_time: str = "",
+    monthly_fee: str = "",
+    lessons_per_day: int = 1,
+    start_date: str = "",
+) -> dict[str, Any]:
+    from app.handlers.groups_info import _format_days_from_indices
+
+    group_name = str(name or "").strip()
+    if not group_name or group_name in {"__cancel__", "__back__"}:
+        return {"error": "group_name_required"}
+    if await asyncio.to_thread(get_sheets_manager().get_group, group_name):
+        return {"error": "group_already_exists"}
+    days = parse_weekdays(lesson_days)
+    if not days:
+        return {"error": "lesson_days_required", "hint": "Du, Se, Chor, Pay, Ju, Shan, Yak"}
+    count = int(lesson_count or 12)
+    if count not in {8, 12}:
+        return {"error": "lesson_count_must_be_8_or_12"}
+    daily = 2 if int(lessons_per_day or 1) >= 2 else 1
+    raw_time = str(lesson_time or "").strip()
+    if not raw_time or is_agreed_lesson_time(raw_time):
+        time_value = AGREED_LESSON_TIME
+    else:
+        time_value = normalize_session_times(raw_time, daily) or ""
+        if not time_value:
+            _u, per_day = parse_lesson_sessions(raw_time)
+            if not per_day or not all(d in per_day for d in days):
+                return {"error": "invalid_time", "hint": "'14:00', '10:00 / 11:30' or 'Du 14:00, Chor 15:30'"}
+            time_value = ", ".join(
+                f"{LESSON_DAY_ABBR[i]} {' / '.join(per_day[i])}" for i in sorted(per_day)
+            )
+    fee = _parse_fee(monthly_fee) if monthly_fee else 0
+    if monthly_fee and fee is None:
+        return {"error": "invalid_fee"}
+    teacher_chat, teacher_label = "", ""
+    if teacher:
+        tch, err = await _match_teacher(teacher)
+        if not tch:
+            return err
+        teacher_chat = str(tch.get("Chat_ID") or tch.get("Ustoz_Chat_ID") or "").strip()
+        teacher_label = str(tch.get("F.I.O.") or tch.get("Ustoz_ID") or "").strip()
+        if not teacher_chat:
+            return {"error": "teacher_not_registered_in_bot", "teacher": teacher_label}
+    start_iso = ""
+    if start_date:
+        parsed = _parse_lesson_date(start_date)
+        if parsed is None:
+            return {"error": "invalid_start_date"}
+        start_iso = parsed.isoformat()
+    payload = {
+        "group": group_name,
+        "teacher_chat_id": teacher_chat,
+        "teacher_label": teacher_label,
+        "lesson_count": count,
+        "selected_days": days,
+        "days_text": _format_days_from_indices(days, "latn"),
+        "lesson_time": time_value,
+        "monthly_fee": fee or 0,
+        "daily_lessons": daily,
+        "start_date": start_iso,
+    }
+    return await _make_draft(ctx, "group_create", payload)
+
+
+async def tool_prepare_group_update(
+    ctx: ToolContext,
+    group: str = "",
+    new_name: str = "",
+    teacher: str = "",
+    monthly_fee: str = "",
+    lesson_days: str = "",
+    lesson_time: str = "",
+    lesson_count: int = 0,
+) -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    payload: dict[str, Any] = {"group": grp["Guruh_Nomi"], "changes": {}}
+    changes = payload["changes"]
+    if lesson_days or lesson_time or lesson_count:
+        sched = _validate_schedule(grp, lesson_time, lesson_days, lesson_count)
+        if sched.get("error"):
+            return sched
+        if sched.pop("changed"):
+            changes["schedule"] = {"old": sched["old"], "new": sched["new"]}
+    if monthly_fee:
+        fee = _parse_fee(monthly_fee)
+        if fee is None:
+            return {"error": "invalid_fee"}
+        changes["fee"] = {"old": str(grp.get("Oylik_Tolov_Summa") or ""), "new": fee}
+    if teacher:
+        tch, err = await _match_teacher(teacher)
+        if not tch:
+            return err
+        changes["teacher"] = {
+            "teacher_id": str(tch.get("Ustoz_ID") or tch.get("Chat_ID") or ""),
+            "teacher_name": str(tch.get("F.I.O.") or ""),
+        }
+    clean_name = str(new_name or "").strip()
+    if clean_name and clean_name != grp["Guruh_Nomi"]:
+        existing = await asyncio.to_thread(get_sheets_manager().get_group, clean_name)
+        if existing and existing["Guruh_Nomi"].strip().lower() != grp["Guruh_Nomi"].strip().lower():
+            return {"error": "group_name_taken"}
+        changes["name"] = {"old": grp["Guruh_Nomi"], "new": clean_name}
+    if not changes:
+        return {"error": "nothing_changes"}
+    return await _make_draft(ctx, "group_update", payload)
+
+
+async def tool_prepare_group_delete(ctx: ToolContext, group: str = "") -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    roster = _active_roster(await ctx.students(), grp["Guruh_Nomi"])
+    return await _make_draft(
+        ctx, "group_delete", {"group": grp["Guruh_Nomi"], "active_students": len(roster)}
+    )
+
+
+async def tool_prepare_teacher_invite(ctx: ToolContext, group: str = "") -> dict[str, Any]:
+    linked = ""
+    if group:
+        grp, err = await _match_group(ctx, group)
+        if not grp:
+            return err
+        linked = grp["Guruh_Nomi"]
+    return await _make_draft(ctx, "teacher_invite", {"group": linked})
+
+
+async def tool_prepare_teacher_assign(
+    ctx: ToolContext, teacher: str = "", group: str = ""
+) -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    tch, err = await _match_teacher(teacher)
+    if not tch:
+        return err
+    return await _make_draft(
+        ctx,
+        "teacher_assign",
+        {
+            "group": grp["Guruh_Nomi"],
+            "teacher_id": str(tch.get("Ustoz_ID") or tch.get("Chat_ID") or ""),
+            "teacher_name": str(tch.get("F.I.O.") or ""),
+        },
+    )
+
+
+async def tool_prepare_teacher_delete(ctx: ToolContext, teacher: str = "") -> dict[str, Any]:
+    tch, err = await _match_teacher(teacher)
+    if not tch:
+        return err
+    return await _make_draft(
+        ctx,
+        "teacher_delete",
+        {
+            "teacher_id": str(tch.get("Ustoz_ID") or ""),
+            "teacher_name": str(tch.get("F.I.O.") or ""),
+        },
+    )
+
+
 ToolFn = Callable[..., Awaitable[dict[str, Any]]]
 
+_BOTH = {"admin", "teacher"}
+_ADMIN = {"admin"}
+_OBJ = "object"
+
+
+def _schema(props: dict[str, Any], required: Optional[list[str]] = None) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": _OBJ, "properties": props}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+_S = {"type": "string"}
+_I = {"type": "integer"}
+_B = {"type": "boolean"}
+_LIST = {"type": "array", "items": {"type": "string"}}
+
 # name -> (allowed roles, description, JSON schema of parameters, implementation)
+# Teacher tools are additionally scoped to the teacher's OWN groups/students in
+# Python (ToolContext.groups()/students()), never only by the prompt.
 TOOLS: dict[str, tuple[set[str], str, dict[str, Any], ToolFn]] = {
-    "list_groups": (
-        {"admin", "teacher"},
-        "List the groups the user may see (teacher: only own groups) with teacher, days, "
-        "time, monthly lessons, lessons done, fee and active student count.",
-        {"type": "object", "properties": {}},
-        tool_list_groups,
+    # ---------------- read (both roles; teacher = own groups only)
+    "list_groups": (_BOTH, "Groups with teacher, days, time, lessons done/monthly, fee, active students.", _schema({}), tool_list_groups),
+    "list_today_groups": (_BOTH, "Groups that have a lesson TODAY.", _schema({}), tool_list_today_groups),
+    "group_details": (_BOTH, "One group's schedule, active roster and active-cycle lesson dates with status.", _schema({"group": _S}, ["group"]), tool_group_details),
+    "group_contacts": (_BOTH, "Clickable contacts of a group's students and their father/mother.", _schema({"group": _S}, ["group"]), tool_group_contacts),
+    "list_students": (_BOTH, "Students. status: active | zaxira | all. Optional group.", _schema({"status": {"type": "string", "enum": ["active", "zaxira", "all"]}, "group": _S}), tool_list_students),
+    "list_debtors": (_BOTH, "Debtors summary with exact debt in UZS (optional group).", _schema({"group": _S}), tool_list_debtors),
+    "debtor_lesson_dates": (_BOTH, "Detailed debtor view: unpaid cycles with every lesson date and attendance status.", _schema({"student": _S}, ["student"]), tool_debtor_lesson_dates),
+    "list_lesson_topics": (_BOTH, "Saved lesson topics of a group.", _schema({"group": _S, "limit": _I}, ["group"]), tool_list_lesson_topics),
+    "student_invite_link": (_BOTH, "Student self-join invite link (?start=join_...) of a group.", _schema({"group": _S}, ["group"]), tool_student_invite_link),
+    # ---------------- drafts (both roles; teacher = own groups only)
+    "prepare_attendance": (
+        _BOTH,
+        "DRAFT attendance (📋 Yo'qlama) for today or a PAST lesson date (never future). "
+        "absent = names who missed; present = names who came (then the rest are absent). "
+        "session = 1 or 2 on double-lesson days.",
+        _schema({"group": _S, "date": _S, "absent": _LIST, "present": _LIST, "session": _I}, ["group"]),
+        tool_prepare_attendance,
     ),
-    "group_details": (
-        {"admin", "teacher"},
-        "One group's schedule, active student roster and active-cycle lesson dates with status.",
-        {
-            "type": "object",
-            "properties": {"group": {"type": "string", "description": "Group name"}},
-            "required": ["group"],
-        },
-        tool_group_details,
+    "prepare_payment_confirmation": (_BOTH, "DRAFT confirming a student's payment for an unpaid cycle (oldest if omitted).", _schema({"student": _S, "group": _S, "cycle": _S}, ["student"]), tool_prepare_payment_confirmation),
+    "prepare_payment_revert": (_BOTH, "DRAFT reverting (cancelling) a confirmed payment of a paid cycle (latest if omitted).", _schema({"student": _S, "group": _S, "cycle": _S}, ["student"]), tool_prepare_payment_revert),
+    "prepare_lesson_topic": (_BOTH, "DRAFT saving AND publishing a lesson topic/plan (date DD.MM, 'bugun', 'ertaga').", _schema({"group": _S, "date": _S, "topic": _S, "plan": _S}, ["group", "topic"]), tool_prepare_lesson_topic),
+    "prepare_student_status": (_BOTH, "DRAFT: action 'to_zaxira' (O'qimayapti) or 'restore' (O'qiyapti, target_group default former group).", _schema({"student": _S, "action": {"type": "string", "enum": ["to_zaxira", "restore"]}, "target_group": _S}, ["student", "action"]), tool_prepare_student_status),
+    "prepare_student_edit": (_BOTH, "DRAFT editing one student field: F.I.O., Talaba_Tel, Talaba_TG, Otasi_FIO, Otasi_Tel, Onasi_FIO, Onasi_Tel.", _schema({"student": _S, "field": _S, "value": _S}, ["student", "field", "value"]), tool_prepare_student_edit),
+    "prepare_device_link": (_BOTH, "DRAFT generating the device-binding link (?start=stu_<ID>) for a student without the bot; optional phone.", _schema({"student": _S, "phone": _S}, ["student"]), tool_prepare_device_link),
+    "prepare_student_transfer": (_BOTH, "DRAFT moving a student to another group; keep_in_old_group=true keeps them in both groups.", _schema({"student": _S, "target_group": _S, "keep_in_old_group": _B}, ["student", "target_group"]), tool_prepare_student_transfer),
+    # ---------------- admin only
+    "list_leads": (_ADMIN, "Leads (Qiziquvchilar_Lidlar). only_new=true hides contacted ones.", _schema({"only_new": _B, "limit": _I}), tool_list_leads),
+    "list_teachers": (_ADMIN, "All teachers with phone, username, status and their groups.", _schema({}), tool_list_teachers),
+    "center_statistics": (_ADMIN, "Center statistics: active/reserve students, groups, teachers, debtors, leads.", _schema({}), tool_center_statistics),
+    "prepare_schedule_update": (_ADMIN, "DRAFT changing a group's lesson time / days / monthly lesson count (8 or 12).", _schema({"group": _S, "lesson_time": _S, "lesson_days": _S, "lesson_count": _I}, ["group"]), tool_prepare_schedule_update),
+    "prepare_group_create": (
+        _ADMIN,
+        "DRAFT creating a group: name, teacher (name or Ustoz_ID), lesson_count 8/12, lesson_days "
+        "('Du, Chor, Ju'), lesson_time ('14:00' / 'Du 14:00, Chor 15:30' / empty = Kelishilgan vaqtda), "
+        "monthly_fee, lessons_per_day 1/2, optional start_date.",
+        _schema({"name": _S, "teacher": _S, "lesson_count": _I, "lesson_days": _S, "lesson_time": _S, "monthly_fee": _S, "lessons_per_day": _I, "start_date": _S}, ["name", "lesson_days"]),
+        tool_prepare_group_create,
     ),
-    "list_students": (
-        {"admin"},
-        "List students. status: 'active' (O'qiyapti), 'zaxira' (reserve) or 'all'. "
-        "Optional group filter.",
-        {
-            "type": "object",
-            "properties": {
-                "status": {"type": "string", "enum": ["active", "zaxira", "all"]},
-                "group": {"type": "string"},
-            },
-        },
-        tool_list_students,
-    ),
-    "list_debtors": (
-        {"admin", "teacher"},
-        "Debtors with exact debt in UZS (unpaid cycles incl. Qarzdor_Oylar + legacy debts). "
-        "Teacher: only own groups. Optional group filter.",
-        {"type": "object", "properties": {"group": {"type": "string"}}},
-        tool_list_debtors,
-    ),
-    "list_leads": (
-        {"admin"},
-        "Recent leads (Qiziquvchilar_Lidlar). only_new=true hides contacted ones.",
-        {
-            "type": "object",
-            "properties": {"only_new": {"type": "boolean"}, "limit": {"type": "integer"}},
-        },
-        tool_list_leads,
-    ),
-    "list_teachers": (
-        {"admin"},
-        "All teachers (Ustozlar) with phone, username, status and their groups.",
-        {"type": "object", "properties": {}},
-        tool_list_teachers,
-    ),
-    "list_lesson_topics": (
-        {"admin", "teacher"},
-        "Recent lesson topics saved for a group.",
-        {
-            "type": "object",
-            "properties": {"group": {"type": "string"}, "limit": {"type": "integer"}},
-            "required": ["group"],
-        },
-        tool_list_lesson_topics,
-    ),
-    "prepare_schedule_update": (
-        {"admin"},
-        "DRAFT (needs ✅ confirmation) changing a group's lesson time ('14:00', double "
-        "'10:00 / 11:30', per-day 'Du 14:00, Chor 15:30' or 'Kelishilgan vaqtda'), "
-        "lesson days ('Du, Chor, Ju') and/or monthly lesson count (8 or 12). "
-        "Omit fields that do not change.",
-        {
-            "type": "object",
-            "properties": {
-                "group": {"type": "string"},
-                "lesson_time": {"type": "string"},
-                "lesson_days": {"type": "string"},
-                "lesson_count": {"type": "integer"},
-            },
-            "required": ["group"],
-        },
-        tool_prepare_schedule_update,
-    ),
-    "prepare_payment_confirmation": (
-        {"admin", "teacher"},
-        "DRAFT (needs ✅ confirmation) confirming a student's payment for one unpaid "
-        "cycle (oldest unpaid if cycle is omitted). Teacher: only own groups.",
-        {
-            "type": "object",
-            "properties": {
-                "student": {"type": "string", "description": "Name, Talaba_ID or phone"},
-                "group": {"type": "string"},
-                "cycle": {"type": "string", "description": "e.g. 'NOYABR 2026'"},
-            },
-            "required": ["student"],
-        },
-        tool_prepare_payment_confirmation,
-    ),
-    "prepare_student_status": (
-        {"admin"},
-        "DRAFT (needs ✅ confirmation): action 'to_zaxira' moves a student to Zaxira; "
-        "'restore' returns them to target_group (default: former group).",
-        {
-            "type": "object",
-            "properties": {
-                "student": {"type": "string"},
-                "action": {"type": "string", "enum": ["to_zaxira", "restore"]},
-                "target_group": {"type": "string"},
-            },
-            "required": ["student", "action"],
-        },
-        tool_prepare_student_status,
-    ),
-    "prepare_lead_contacted": (
-        {"admin"},
-        "DRAFT (needs ✅ confirmation) marking a lead as \"Bog'lanildi\" (lead id, name or phone).",
-        {
-            "type": "object",
-            "properties": {"lead": {"type": "string"}},
-            "required": ["lead"],
-        },
-        tool_prepare_lead_contacted,
-    ),
-    "prepare_lesson_topic": (
-        {"admin", "teacher"},
-        "DRAFT (needs ✅ confirmation) saving a lesson topic and optional plan for a group "
-        "and date (DD.MM, DD.MM.YYYY, 'bugun', 'ertaga'). Teacher: only own groups.",
-        {
-            "type": "object",
-            "properties": {
-                "group": {"type": "string"},
-                "date": {"type": "string"},
-                "topic": {"type": "string"},
-                "plan": {"type": "string"},
-            },
-            "required": ["group", "topic"],
-        },
-        tool_prepare_lesson_topic,
-    ),
+    "prepare_group_update": (_ADMIN, "DRAFT updating a group: new_name, teacher, monthly_fee, lesson_days, lesson_time, lesson_count (only what changes).", _schema({"group": _S, "new_name": _S, "teacher": _S, "monthly_fee": _S, "lesson_days": _S, "lesson_time": _S, "lesson_count": _I}, ["group"]), tool_prepare_group_update),
+    "prepare_group_delete": (_ADMIN, "DRAFT deleting a group (Guruhlar row + its {Group}_{Year} sheets; students go to Zahira).", _schema({"group": _S}, ["group"]), tool_prepare_group_delete),
+    "prepare_teacher_invite": (_ADMIN, "DRAFT creating a one-time teacher invite link (?start=tch_...), optionally bound to a group.", _schema({"group": _S}), tool_prepare_teacher_invite),
+    "prepare_teacher_assign": (_ADMIN, "DRAFT assigning an existing teacher to a group.", _schema({"teacher": _S, "group": _S}, ["teacher", "group"]), tool_prepare_teacher_assign),
+    "prepare_teacher_delete": (_ADMIN, "DRAFT permanently deleting a teacher.", _schema({"teacher": _S}, ["teacher"]), tool_prepare_teacher_delete),
+    "prepare_student_delete": (_ADMIN, "DRAFT permanently deleting a student (Sheets + SQLite purge incl. orphaned parents).", _schema({"student": _S}, ["student"]), tool_prepare_student_delete),
+    "prepare_lead_contacted": (_ADMIN, "DRAFT marking a lead as \"Bog'lanildi\" (lead id, name or phone).", _schema({"lead": _S}, ["lead"]), tool_prepare_lead_contacted),
 }
 
 
@@ -1126,7 +1667,12 @@ def _system_prompt(ctx: ToolContext) -> str:
         "3. If a tool returns ambiguous/not-found candidates, ask one short clarifying question.\n"
         "4. Answer in Uzbek, in the SAME script as the user (Latin or Cyrillic), plain text "
         "without Markdown, at most 8 short lines. Money as '450 000 so'm'.\n"
-        "5. Lesson day abbreviations: Du, Se, Chor, Pay, Ju, Shan, Yak."
+        "5. Lesson day abbreviations: Du, Se, Chor, Pay, Ju, Shan, Yak.\n"
+        "6. Attendance: 'hamma keldi' = absent []; 'faqat X kelmadi' = absent [X]; "
+        "'bugun' = today, 'kecha' = yesterday. Never use a future date.\n"
+        "7. You can do everything the user's role can do with the bot's buttons: read "
+        "data with the list/details tools and prepare changes with prepare_* tools. "
+        "If a needed detail is missing (e.g. which group), ask one short question."
     )
 
 
@@ -1200,6 +1746,7 @@ async def ask(
     lang_hint: str,
     text: str = "",
     audio: Optional[bytes] = None,
+    bot: Any = None,
 ) -> AiReply:
     """Runs one assistant turn (text or voice) with the tool loop."""
     from google.genai import errors, types
@@ -1207,7 +1754,7 @@ async def ask(
     lang = detect_script(text, lang_hint) if text else (lang_hint if lang_hint in TEXTS else "latn")
     if not AI_ENABLED:
         return AiReply("", lang=lang)
-    ctx = ToolContext(user_id, role, lang, actor_name)
+    ctx = ToolContext(user_id, role, lang, actor_name, bot)
 
     contents: list[Any] = []
     for user_turn, model_turn in _history(user_id):
@@ -1265,66 +1812,229 @@ async def ask(
 # ----------------------------------------------------------------------
 
 
-def render_draft_card(action: str, payload: dict[str, Any], lang: str) -> str:
+_CARD_TITLES: dict[str, tuple[str, str]] = {
+    # action: (latn, cyrl)
+    "schedule": ("🗓 <b>Dars jadvalini o‘zgartirish</b>", "🗓 <b>Дарс жадвалини ўзгартириш</b>"),
+    "payment": ("💳 <b>To‘lovni tasdiqlash</b>", "💳 <b>Тўловни тасдиқлаш</b>"),
+    "payment_revert": ("↩️ <b>To‘lovni bekor qilish</b>", "↩️ <b>Тўловни бекор қилиш</b>"),
+    "to_zaxira": ("⏸ <b>Talabani Zaxiraga o‘tkazish</b>", "⏸ <b>Талабани Захирага ўтказиш</b>"),
+    "restore": ("▶️ <b>Talabani darsga tiklash</b>", "▶️ <b>Талабани дарсга тиклаш</b>"),
+    "lead": ("📞 <b>Lid bilan bog‘lanildi</b>", "📞 <b>Лид билан боғланилди</b>"),
+    "topic": ("📝 <b>Dars mavzusini saqlash va e’lon qilish</b>", "📝 <b>Дарс мавзусини сақлаш ва эълон қилиш</b>"),
+    "attendance": ("📋 <b>Yo‘qlama</b>", "📋 <b>Йўқлама</b>"),
+    "student_edit": ("✏️ <b>Talaba ma’lumotini o‘zgartirish</b>", "✏️ <b>Талаба маълумотини ўзгартириш</b>"),
+    "device_link": ("📱 <b>Qurilmaga ulash havolasi</b>", "📱 <b>Қурилмага улаш ҳаволаси</b>"),
+    "student_transfer": ("🔄 <b>Talabani boshqa guruhga o‘tkazish</b>", "🔄 <b>Талабани бошқа гуруҳга ўтказиш</b>"),
+    "student_delete": ("🗑 <b>Talabani butunlay o‘chirish</b>", "🗑 <b>Талабани бутунлай ўчириш</b>"),
+    "group_create": ("➕ <b>Yangi guruh yaratish</b>", "➕ <b>Янги гуруҳ яратиш</b>"),
+    "group_update": ("✏️ <b>Guruhni tahrirlash</b>", "✏️ <b>Гуруҳни таҳрирлаш</b>"),
+    "group_delete": ("🗑 <b>Guruhni o‘chirish</b>", "🗑 <b>Гуруҳни ўчириш</b>"),
+    "teacher_invite": ("🔗 <b>Ustoz taklif havolasi</b>", "🔗 <b>Устоз таклиф ҳаволаси</b>"),
+    "teacher_assign": ("👨‍🏫 <b>Ustozni guruhga biriktirish</b>", "👨‍🏫 <b>Устозни гуруҳга бириктириш</b>"),
+    "teacher_delete": ("🗑 <b>Ustozni o‘chirish</b>", "🗑 <b>Устозни ўчириш</b>"),
+}
+
+
+def _schedule_change_lines(old: dict[str, Any], new: dict[str, Any], lang: str) -> list[str]:
+    """Only the schedule fields that really change (days / time / lesson count)."""
+    from app.handlers.groups_info import _format_days_from_indices
+
     esc = html.escape
     lines: list[str] = []
+    old_idx = parse_weekdays(old.get("days") or "")
+    new_idx = list(new.get("days_idx") or [])
+    if old_idx != new_idx:
+        lines.append(
+            f"{tr('lbl_days', lang)}: {esc(_format_days_from_indices(old_idx, lang) or '—')} ➡️ "
+            f"<b>{esc(_format_days_from_indices(new_idx, lang))}</b>"
+        )
+    if str(old.get("time") or "").strip() != str(new.get("time") or "").strip():
+        lines.append(
+            f"{tr('lbl_time', lang)}: {esc(format_lesson_time_display(old.get('time'), lang) or '—')} ➡️ "
+            f"<b>{esc(format_lesson_time_display(new.get('time'), lang) or '—')}</b>"
+        )
+    if str(old.get("count")) != str(new.get("count")):
+        lines.append(
+            f"{tr('lbl_count', lang)}: {esc(str(old.get('count')))} ➡️ <b>{esc(str(new.get('count')))}</b>"
+        )
+    return lines
+
+
+def render_draft_card(action: str, payload: dict[str, Any], lang: str) -> str:
+    esc = html.escape
+    cy = lang == "cyrl"
+    title = _CARD_TITLES.get(action, ("📝 <b>Qoralama</b>", "📝 <b>Қоралама</b>"))[1 if cy else 0]
+    lines: list[str] = [title + (" (қоралама)" if cy else " (qoralama)"), ""]
+    group_line = f"{tr('lbl_group', lang)}: <b>{esc(str(payload.get('group') or '—'))}</b>"
+    student_line = (
+        f"{tr('lbl_student', lang)}: <b>{esc(str(payload.get('student_name') or ''))}</b> "
+        f"({esc(str(payload.get('student_id') or ''))})"
+    )
     if action == "schedule":
-        old, new = payload["old"], payload["new"]
-        lines = [
-            tr("title_schedule", lang),
-            "",
-            f"{tr('lbl_group', lang)}: <b>{esc(payload['group'])}</b>",
-            f"{tr('lbl_days', lang)}: {esc(old['days'] or '—')} ➡️ <b>{esc(new['days'])}</b>",
-            f"{tr('lbl_time', lang)}: {esc(format_lesson_time_display(old['time'], lang) or '—')} ➡️ "
-            f"<b>{esc(format_lesson_time_display(new['time'], lang) or '—')}</b>",
-            f"{tr('lbl_count', lang)}: {esc(str(old['count']))} ➡️ <b>{esc(str(new['count']))}</b>",
-        ]
-    elif action == "payment":
-        lines = [
-            tr("title_payment", lang),
-            "",
-            f"{tr('lbl_student', lang)}: <b>{esc(payload['student_name'])}</b> ({esc(payload['student_id'])})",
-            f"{tr('lbl_group', lang)}: <b>{esc(payload['group'])}</b>",
-            f"{tr('lbl_cycle', lang)}: <b>{esc(payload['cycle_title'])}</b>",
-        ]
+        lines += [group_line, *_schedule_change_lines(payload["old"], payload["new"], lang)]
+    elif action in {"payment", "payment_revert"}:
+        lines += [student_line, group_line, f"{tr('lbl_cycle', lang)}: <b>{esc(payload['cycle_title'])}</b>"]
         if int(payload.get("amount") or 0) > 0:
             lines.append(f"{tr('lbl_amount', lang)}: <b>{_fmt_money(payload['amount'])} so'm</b>")
-    elif action in {"to_zaxira", "restore"}:
-        lines = [
-            tr("title_to_zaxira" if action == "to_zaxira" else "title_restore", lang),
-            "",
-            f"{tr('lbl_student', lang)}: <b>{esc(str(payload['student_name']))}</b> ({esc(payload['student_id'])})",
-            f"{tr('lbl_group' if action == 'to_zaxira' else 'lbl_target', lang)}: <b>{esc(payload['group'])}</b>",
+    elif action in {"to_zaxira", "restore", "student_delete", "device_link"}:
+        lines += [student_line, group_line]
+        if action == "device_link" and payload.get("phone"):
+            lines.append(f"📱 <b>{esc(payload['phone'])}</b>")
+    elif action == "student_edit":
+        lines += [
+            student_line,
+            f"🔤 {esc(payload['field'])}: {esc(payload['old_value'] or '—')} ➡️ <b>{esc(payload['new_value'])}</b>",
+        ]
+    elif action == "student_transfer":
+        keep = payload.get("keep_in_old_group")
+        lines += [
+            student_line,
+            f"📚 {esc(payload.get('old_group') or '—')} ➡️ <b>{esc(payload['group'])}</b>",
+            ("✅ Eski guruhda ham qoladi" if not cy else "✅ Эски гуруҳда ҳам қолади")
+            if keep
+            else ("🚪 Eski guruhdan chiqariladi" if not cy else "🚪 Эски гуруҳдан чиқарилади"),
         ]
     elif action == "lead":
-        lines = [
-            tr("title_lead", lang),
-            "",
+        lines += [
             f"{tr('lbl_lead', lang)}: <b>#{payload['lead_id']} {esc(str(payload.get('name') or ''))}</b>",
             f"📱 {esc(str(payload.get('phone') or '—'))} | 📚 {esc(str(payload.get('course') or '—'))}",
         ]
     elif action == "topic":
-        lines = [
-            tr("title_topic", lang),
-            "",
-            f"{tr('lbl_group', lang)}: <b>{esc(payload['group'])}</b>",
+        lines += [
+            group_line,
             f"{tr('lbl_date', lang)}: <b>{esc(payload['date_full'])}</b>",
             f"{tr('lbl_topic', lang)}: <b>{esc(payload['topic'])}</b>",
         ]
         if payload.get("plan"):
             lines.append(f"{tr('lbl_plan', lang)}: {esc(payload['plan'][:500])}")
+    elif action == "attendance":
+        session = payload.get("session")
+        lines += [
+            group_line,
+            f"{tr('lbl_date', lang)}: <b>{esc(payload['date_dmy'])}</b>"
+            + (f" — <b>{int(session)}-dars</b>" if session else ""),
+        ]
+        if payload.get("already_marked"):
+            lines.append("♻️ Avval belgilangan — qayta yangilanadi" if not cy else "♻️ Аввал белгиланган — қайта янгиланади")
+        lines.append("")
+        for sid, mark in payload["marks"].items():
+            name = esc(str(payload["names"].get(sid) or sid))
+            if mark == "✅":
+                lines.append(f"🟢 {name} — {'Қатнашди' if cy else 'Qatnashdi'}")
+            else:
+                lines.append(f"🔴 {name} — {'Келмади' if cy else 'Kelmadi'}")
+    elif action == "group_create":
+        lines += [
+            f"{tr('lbl_group', lang)}: <b>{esc(payload['group'])}</b>",
+            f"👨‍🏫 {esc(payload.get('teacher_label') or '—')}",
+            f"{tr('lbl_days', lang)}: <b>{esc(payload['days_text'])}</b>",
+            f"{tr('lbl_time', lang)}: <b>{esc(format_lesson_time_display(payload['lesson_time'], lang))}</b>",
+            f"{tr('lbl_count', lang)}: <b>{payload['lesson_count']}</b>"
+            + (" | 🔁 2/kun" if int(payload.get("daily_lessons") or 1) >= 2 else ""),
+        ]
+        if int(payload.get("monthly_fee") or 0) > 0:
+            lines.append(f"{tr('lbl_amount', lang)}: <b>{_fmt_money(payload['monthly_fee'])} so'm</b>")
+        if payload.get("start_date"):
+            lines.append(f"{tr('lbl_date', lang)}: <b>{esc(payload['start_date'])}</b>")
+    elif action == "group_update":
+        changes = payload["changes"]
+        lines.append(group_line)
+        if "name" in changes:
+            lines.append(f"📝 {esc(changes['name']['old'])} ➡️ <b>{esc(changes['name']['new'])}</b>")
+        if "teacher" in changes:
+            lines.append(f"👨‍🏫 ➡️ <b>{esc(changes['teacher']['teacher_name'])}</b>")
+        if "fee" in changes:
+            lines.append(
+                f"{tr('lbl_amount', lang)}: {esc(changes['fee']['old'] or '—')} ➡️ "
+                f"<b>{_fmt_money(changes['fee']['new'])} so'm</b>"
+            )
+        if "schedule" in changes:
+            lines += _schedule_change_lines(
+                changes["schedule"]["old"], changes["schedule"]["new"], lang
+            )
+    elif action == "group_delete":
+        lines += [
+            group_line,
+            (
+                f"⚠️ Guruh varaqlari o‘chiriladi, {payload.get('active_students', 0)} ta talaba Zahira guruhiga o‘tadi."
+                if not cy
+                else f"⚠️ Гуруҳ варақлари ўчирилади, {payload.get('active_students', 0)} та талаба Захира гуруҳига ўтади."
+            ),
+        ]
+    elif action == "teacher_invite":
+        lines.append(group_line)
+    elif action in {"teacher_assign", "teacher_delete"}:
+        lines.append(f"👨‍🏫 <b>{esc(str(payload.get('teacher_name') or ''))}</b> ({esc(str(payload.get('teacher_id') or ''))})")
+        if action == "teacher_assign":
+            lines.append(group_line)
     lines += ["", f"<i>{tr('draft_hint', lang)}</i>"]
     return "\n".join(lines)
 
 
-_ACTION_ROLES = {
-    "schedule": {"admin"},
-    "payment": {"admin", "teacher"},
-    "to_zaxira": {"admin"},
-    "restore": {"admin"},
-    "lead": {"admin"},
-    "topic": {"admin", "teacher"},
+_ACTION_ROLES: dict[str, set[str]] = {
+    "attendance": _BOTH,
+    "payment": _BOTH,
+    "payment_revert": _BOTH,
+    "topic": _BOTH,
+    "to_zaxira": _BOTH,
+    "restore": _BOTH,
+    "student_edit": _BOTH,
+    "device_link": _BOTH,
+    "student_transfer": _BOTH,
+    "schedule": _ADMIN,
+    "lead": _ADMIN,
+    "student_delete": _ADMIN,
+    "group_create": _ADMIN,
+    "group_update": _ADMIN,
+    "group_delete": _ADMIN,
+    "teacher_invite": _ADMIN,
+    "teacher_assign": _ADMIN,
+    "teacher_delete": _ADMIN,
 }
+
+_STUDENT_ACTIONS = {
+    "payment", "payment_revert", "to_zaxira", "student_edit", "device_link",
+    "student_transfer", "student_delete",
+}
+
+
+async def _run_schedule_change(
+    bot: Any, actor_id: int, actor_name: str, group_name: str, old: dict[str, Any], new: dict[str, Any]
+) -> int:
+    """Existing "⏰/📆/🔢" schedule flow: rebuild cycle sheet + Audit_Log + broadcast."""
+    from app.handlers.groups_info import _broadcast_group_update
+
+    sheets = get_sheets_manager()
+    final_dates = await asyncio.to_thread(
+        sheets.rebuild_active_cycle_sheet,
+        group_name,
+        int(new["count"]),
+        str(new["days"]),
+        str(new["time"]),
+    )
+    await database.set_group_lesson_time(group_name, str(new["time"]))
+    change_items: list[tuple[str, str, str]] = []
+    if str(new["count"]) != str(old["count"]):
+        change_items.append(("Oylik_Dars_Soni", str(old["count"]), str(new["count"])))
+    if parse_weekdays(old["days"]) != list(new["days_idx"]):
+        change_items.append(("Dars_Kunlari", old["days"], new["days"]))
+    if str(new["time"]).strip() != str(old["time"]).strip():
+        change_items.append(("Dars_Vaqti", old["time"], new["time"]))
+    await log_audit_event(
+        actor_id=actor_id,
+        action=AUDIT_GROUP_EDITED,
+        target=group_name,
+        details="AI: " + "; ".join(f"{k}: {a} → {b}" for k, a, b in change_items),
+        actor_name=actor_name,
+    )
+    return await _broadcast_group_update(
+        bot,
+        sheets,
+        group_name,
+        change_items=change_items or [("Dars_Vaqti", old["time"], new["time"])],
+        dates_list=final_dates,
+        triggered_by_user_id=actor_id,
+    )
 
 
 async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[str, Any], lang: str) -> str:
@@ -1334,51 +2044,26 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
     role = await resolve_ai_role(actor_id)
     if role is None or role not in _ACTION_ROLES.get(action, set()):
         return tr("no_permission", lang)
-    ctx = ToolContext(actor_id, role, lang, actor_name)
+    ctx = ToolContext(actor_id, role, lang, actor_name, bot)
+    # Re-check scope at execution time (a teacher may have lost the group).
     group_name = str(payload.get("group") or "")
-    if group_name and group_name.strip().lower() not in await ctx.group_names_lower():
-        return tr("no_permission", lang)
+    if action not in {"group_create", "teacher_invite"} and group_name:
+        if group_name.strip().lower() not in await ctx.group_names_lower():
+            return tr("no_permission", lang)
+    if action in _STUDENT_ACTIONS and role != "admin":
+        visible = {str(s.get("Talaba_ID") or "") for s in await ctx.students()}
+        if str(payload.get("student_id") or "") not in visible:
+            return tr("no_permission", lang)
     esc = html.escape
     sheets = get_sheets_manager()
 
     if action == "schedule":
-        from app.handlers.groups_info import _broadcast_group_update
-
-        new = payload["new"]
-        old = payload["old"]
-        final_dates = await asyncio.to_thread(
-            sheets.rebuild_active_cycle_sheet,
-            group_name,
-            int(new["count"]),
-            str(new["days"]),
-            str(new["time"]),
-        )
-        await database.set_group_lesson_time(group_name, str(new["time"]))
-        change_items: list[tuple[str, str, str]] = []
-        if str(new["count"]) != str(old["count"]):
-            change_items.append(("Oylik_Dars_Soni", str(old["count"]), str(new["count"])))
-        if parse_weekdays(old["days"]) != list(new["days_idx"]):
-            change_items.append(("Dars_Kunlari", old["days"], new["days"]))
-        if str(new["time"]).strip() != str(old["time"]).strip():
-            change_items.append(("Dars_Vaqti", old["time"], new["time"]))
-        await log_audit_event(
-            actor_id=actor_id,
-            action=AUDIT_GROUP_EDITED,
-            target=group_name,
-            details="AI: " + "; ".join(f"{k}: {a} → {b}" for k, a, b in change_items),
-            actor_name=actor_name,
-        )
-        sent = await _broadcast_group_update(
-            bot,
-            sheets,
-            group_name,
-            change_items=change_items or [("Dars_Vaqti", old["time"], new["time"])],
-            dates_list=final_dates,
-            triggered_by_user_id=actor_id,
+        sent = await _run_schedule_change(
+            bot, actor_id, actor_name, group_name, payload["old"], payload["new"]
         )
         return tr("done_schedule", lang, group=esc(group_name), sent=sent)
 
-    if action == "payment":
+    if action in {"payment", "payment_revert"}:
         from app.handlers.payments import execute_payment_confirmation
 
         result = await execute_payment_confirmation(
@@ -1388,16 +2073,36 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
             group_name,
             str(payload["student_id"]),
             str(payload["cycle_title"]),
+            revert=action == "payment_revert",
         )
         if not result["ok"]:
             return tr("exec_failed", lang, reason=esc(result["reason"]))
+        key = "done_payment_revert" if action == "payment_revert" else "done_payment"
         return tr(
-            "done_payment",
+            key,
             lang,
             student=esc(str(payload["student_name"])),
             group=esc(group_name),
             cycle=esc(str(payload["cycle_title"])),
         )
+
+    if action == "attendance":
+        from app.handlers.attendance import submit_attendance
+
+        lesson_day = date.fromisoformat(str(payload["date"]))
+        if lesson_day > today_tashkent():
+            return tr("exec_failed", lang, reason="future_date")
+        result = await submit_attendance(
+            bot,
+            actor_id,
+            actor_name,
+            lang,
+            group_name,
+            lesson_day,
+            {str(k): str(v) for k, v in payload["marks"].items()},
+            session=payload.get("session"),
+        )
+        return str(result.get("text") or "")
 
     if action == "to_zaxira":
         from app.handlers.students import _notify_reserve_move
@@ -1433,6 +2138,60 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
         await _notify_restore_from_reserve(bot, restored, new_group, actor_id)
         return tr("done_restore", lang, student=esc(name), group=esc(new_group))
 
+    if action == "student_edit":
+        from app.handlers.students import execute_student_field_update
+
+        updated = await execute_student_field_update(
+            str(payload["student_id"]), str(payload["field"]), str(payload["new_value"])
+        )
+        if not updated:
+            return tr("exec_failed", lang, reason="student_not_found")
+        return tr(
+            "done_student_edit",
+            lang,
+            student=esc(str(updated.get("F.I.O.") or payload["student_name"])),
+            field=esc(str(payload["field"])),
+            value=esc(str(payload["new_value"])),
+        )
+
+    if action == "device_link":
+        from app.handlers.students import _attach_student_device_safe, _can_manage_student_device
+
+        student = await sheets.a_get_student_by_id(str(payload["student_id"]))
+        if not student or not await _can_manage_student_device(actor_id, student):
+            return tr("no_permission", lang)
+        updated = await _attach_student_device_safe(
+            str(payload["student_id"]), new_phone=str(payload.get("phone") or "") or None
+        )
+        me = await bot.get_me()
+        link = f"https://t.me/{me.username}?start=stu_{payload['student_id']}"
+        return tr(
+            "done_device_link",
+            lang,
+            student=esc(str((updated or student).get("F.I.O.") or payload["student_name"])),
+            link=esc(link),
+        )
+
+    if action == "student_transfer":
+        from app.handlers.students import execute_student_transfer
+
+        result = await execute_student_transfer(
+            bot,
+            actor_id,
+            lang,
+            str(payload["student_id"]),
+            group_name,
+            bool(payload.get("keep_in_old_group")),
+        )
+        if not result.get("ok"):
+            return tr("exec_failed", lang, reason="transfer_failed")
+        return str(result["admin_notice"])
+
+    if action == "student_delete":
+        from app.handlers.students import execute_student_delete
+
+        return await execute_student_delete(actor_id, actor_name, lang, str(payload["student_id"]))
+
     if action == "lead":
         lead_id = int(payload["lead_id"])
         lead = await get_lead(lead_id)
@@ -1447,6 +2206,8 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
         return tr("done_lead", lang, lead_id=lead_id, name=esc(str(payload.get("name") or "")))
 
     if action == "topic":
+        from app.handlers.schedule import publish_group_topics
+
         await save_lesson_topic(
             group_name=group_name,
             lesson_date=str(payload["date"]),
@@ -1456,6 +2217,129 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
             teacher_name=actor_name,
             is_published=0,
         )
-        return tr("done_topic", lang, group=esc(group_name), date=esc(str(payload["date_full"])))
+        topic_count, sent = await publish_group_topics(
+            bot=bot,
+            group_name=group_name,
+            lesson_dates=[str(payload["date"])],
+            actor_user_id=actor_id,
+        )
+        return tr(
+            "done_topic_published",
+            lang,
+            group=esc(group_name),
+            date=esc(str(payload["date_full"])),
+            sent=sent,
+        )
+
+    if action == "group_create":
+        from app.handlers.groups_info import create_group_from_data
+
+        data = {
+            "group_name": group_name,
+            "teacher_chat_id": str(payload.get("teacher_chat_id") or ""),
+            "teacher_label": str(payload.get("teacher_label") or ""),
+            "lesson_count": int(payload["lesson_count"]),
+            "selected_days": list(payload["selected_days"]),
+            "lesson_time": str(payload["lesson_time"]),
+            "monthly_fee": int(payload.get("monthly_fee") or 0),
+            "daily_lessons": int(payload.get("daily_lessons") or 1),
+        }
+        if payload.get("start_date"):
+            data["start_date"] = str(payload["start_date"])
+        result = await create_group_from_data(bot, actor_id, lang, data)
+        text = str(result.get("text") or "")
+        if result.get("ok"):
+            text += "\n\n" + tr("link_group_hint", lang, group=esc(group_name))
+        return text
+
+    if action == "group_update":
+        from app.handlers.groups_info import (
+            _broadcast_group_update,
+            _rename_group_in_sqlite,
+            _sync_rename_group_everywhere,
+            _sync_update_group_fee,
+            execute_teacher_assignment,
+        )
+
+        changes = payload["changes"]
+        done: list[str] = []
+        current = group_name
+        if "schedule" in changes:
+            await _run_schedule_change(
+                bot, actor_id, actor_name, current, changes["schedule"]["old"], changes["schedule"]["new"]
+            )
+            done.append("🗓")
+        if "fee" in changes:
+            new_fee = int(changes["fee"]["new"])
+            await asyncio.to_thread(_sync_update_group_fee, sheets, current, new_fee)
+            await log_audit_event(
+                actor_id=actor_id,
+                action=AUDIT_GROUP_EDITED,
+                target=current,
+                details=f"AI: Oylik_Tolov_Summa: {changes['fee']['old'] or '—'} → {new_fee}",
+                actor_name=actor_name,
+            )
+            await _broadcast_group_update(
+                bot,
+                sheets,
+                current,
+                change_items=[("Oylik_Tolov_Summa", str(changes["fee"]["old"]), str(new_fee))],
+                triggered_by_user_id=actor_id,
+            )
+            done.append("💰")
+        if "teacher" in changes:
+            assign = await execute_teacher_assignment(
+                bot, actor_id, actor_name, lang, str(changes["teacher"]["teacher_id"]), current
+            )
+            done.append("👨‍🏫" if assign["status"] != "error" else "⚠️👨‍🏫")
+        if "name" in changes:
+            new_name = str(changes["name"]["new"])
+            await asyncio.to_thread(_sync_rename_group_everywhere, sheets, current, new_name)
+            await _rename_group_in_sqlite(current, new_name)
+            await database.rename_group_weekly_reminder(current, new_name)
+            await log_audit_event(
+                actor_id=actor_id,
+                action=AUDIT_GROUP_EDITED,
+                target=new_name,
+                details=f"AI: Guruh_Nomi: {current} → {new_name}",
+                actor_name=actor_name,
+            )
+            await _broadcast_group_update(
+                bot,
+                sheets,
+                new_name,
+                change_items=[("Guruh_Nomi", current, new_name)],
+                triggered_by_user_id=actor_id,
+            )
+            current = new_name
+            done.append("📝")
+        return tr("done_group_update", lang, group=esc(current), parts=" ".join(done))
+
+    if action == "group_delete":
+        from app.handlers.groups_info import execute_group_delete
+
+        deleted, canonical = await execute_group_delete(actor_id, actor_name, group_name)
+        if not deleted:
+            return tr("exec_failed", lang, reason="group_not_found")
+        return tr("done_group_delete", lang, group=esc(canonical))
+
+    if action == "teacher_invite":
+        from app.handlers.groups_info import create_teacher_invite_link
+
+        link = await create_teacher_invite_link(bot, actor_id, group_name or None)
+        return tr("done_teacher_invite", lang, group=esc(group_name or "—"), link=esc(link))
+
+    if action == "teacher_assign":
+        from app.handlers.groups_info import execute_teacher_assignment
+
+        assign = await execute_teacher_assignment(
+            bot, actor_id, actor_name, lang, str(payload["teacher_id"]), group_name
+        )
+        return str(assign["notice"])
+
+    if action == "teacher_delete":
+        from app.handlers.groups_info import execute_teacher_delete
+
+        return await execute_teacher_delete(bot, actor_id, actor_name, lang, str(payload["teacher_id"]))
 
     return tr("draft_not_found", lang)

@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiosqlite
 from aiogram import F, Router
@@ -1349,31 +1349,34 @@ async def cb_attendance_cancel_marking(
     await callback.answer()
 
 
-@router.callback_query(AttendanceStates.marking_students, F.data == "att_finish")
-async def cb_attendance_finish_instant(
-    callback: CallbackQuery, state: FSMContext
-) -> None:
-    if not callback.from_user or not callback.message:
-        return
-    user_id = callback.from_user.id
-    lang = await get_user_lang(user_id)
-    data = await state.get_data()
-
-    group_name: str = data["group_name"]
-    if not await _can_manage_group(user_id, group_name):
-        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
-        return
-
-    lesson_date = date.fromisoformat(data["lesson_date"])
-    marks_map: dict[str, str] = data["marks_map"]
-    cycle_title_hint: str = data.get("cycle_title_hint", "")
+async def submit_attendance(
+    bot: Any,
+    user_id: int,
+    actor_name: str,
+    lang: str,
+    group_name: str,
+    lesson_date: date,
+    marks_map: dict[str, str],
+    session: Optional[int] = None,
+    cycle_title_hint: str = "",
+    on_saved: Optional[Callable[[str], Awaitable[Any]]] = None,
+) -> dict[str, Any]:
+    """
+    The complete "✅ Yakunlash" attendance flow, shared by the inline marking
+    screen and the AI assistant: saves ✅/❌ into {Group}_{Year} (+1 lesson
+    counter for a newly marked lesson / session), sends the official student
+    and parent notices (lesson number, topic, debt note), the group-chat
+    progress summary, cycle completion when the cycle ends and the admin
+    report. `on_saved` is awaited right after the sheet + DMs are done (the
+    button uses it to edit its message at exactly the same moment as before).
+    """
     date_dm = lesson_date.strftime("%d.%m")
     sana_dmy = lesson_date.strftime("%d.%m.%Y")
     today_dmy = today_tashkent().strftime("%d.%m.%Y")
     is_past_date = sana_dmy != today_dmy
     date_display = format_uz_date(date_dm, lang)
 
-    lesson_session = _parse_int(data.get("lesson_session"))
+    lesson_session = _parse_int(session)
     sheets = get_sheets_manager()
     previous_marks = await asyncio.to_thread(
         _get_existing_attendance_for_date_sync,
@@ -1420,7 +1423,7 @@ async def cb_attendance_finish_instant(
     lesson_topic = await _get_silent_lesson_topic(group_name, lesson_date)
     mavzu = str(lesson_topic.get("topic") or "").strip() if lesson_topic else ""
     teacher_name = await _resolve_teacher_name(
-        sheets, group, user_id, callback.from_user.full_name or str(user_id)
+        sheets, group, user_id, actor_name or str(user_id)
     )
 
     students_sent = 0
@@ -1520,7 +1523,7 @@ async def cb_attendance_finish_instant(
                     sana=html.escape(sana_dmy),
                 )
             student_dm_ok[sid] = await _safe_send(
-                callback.bot, stu_cid, f"{s_prefix}{s_body}"
+                bot, stu_cid, f"{s_prefix}{s_body}"
             )
             if student_dm_ok[sid]:
                 students_sent += 1
@@ -1641,7 +1644,7 @@ async def cb_attendance_finish_instant(
                 p_lang,
                 sana=html.escape(sana_dmy),
             )
-        if await _safe_send(callback.bot, p_cid, f"{p_prefix}{p_body}"):
+        if await _safe_send(bot, p_cid, f"{p_prefix}{p_body}"):
             parents_sent += 1
             for c_sid, _n, _m, _d in children_list:
                 parent_dm_ok_count[c_sid] = parent_dm_ok_count.get(c_sid, 0) + 1
@@ -1676,24 +1679,22 @@ async def cb_attendance_finish_instant(
         else:
             absent_items.append(item_payload)
 
-    await state.clear()
-    await callback.message.edit_text(
-        t(
-            "attendance_saved_instant",
-            lang,
-            group=html.escape(group_name),
-            date=date_display,
-            present_count=present_count,
-            absent_count=absent_count,
-        ),
-        parse_mode="HTML",
+    saved_text = t(
+        "attendance_saved_instant",
+        lang,
+        group=html.escape(group_name),
+        date=date_display,
+        present_count=present_count,
+        absent_count=absent_count,
     )
+    if on_saved is not None:
+        await on_saved(saved_text)
 
     # Group chat progress summary (no student names / absences / debts). Sent once
     # per lesson - an edited re-submission does not spam the group again.
     if not is_resubmit:
         await _broadcast_group_lesson_progress(
-            bot=callback.bot,
+            bot=bot,
             group=group,
             group_name=group_name,
             cycle_title=cycle_title,
@@ -1706,7 +1707,7 @@ async def cb_attendance_finish_instant(
 
     if (not is_resubmit) and group and new_count >= limit:
         await _trigger_cycle_completion(
-            bot=callback.bot,
+            bot=bot,
             sheets=sheets,
             group=group,
             group_name=group_name,
@@ -1766,7 +1767,7 @@ async def cb_attendance_finish_instant(
             report_payload, is_detailed=False, lang=admin_lang
         )
         await _safe_send(
-            callback.bot,
+            bot,
             admin_id,
             report_text,
             reply_markup=admin_attendance_report_kb(
@@ -1774,6 +1775,53 @@ async def cb_attendance_finish_instant(
             ),
         )
 
+    return {
+        "text": saved_text,
+        "present_count": present_count,
+        "absent_count": absent_count,
+        "students_sent": students_sent,
+        "parents_sent": parents_sent,
+        "lesson_number": dars_raqami,
+        "is_resubmit": is_resubmit,
+        "cycle_title": cycle_title,
+    }
+
+
+@router.callback_query(AttendanceStates.marking_students, F.data == "att_finish")
+async def cb_attendance_finish_instant(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    data = await state.get_data()
+
+    group_name: str = data["group_name"]
+    if not await _can_manage_group(user_id, group_name):
+        await callback.answer(t("link_group_no_permission", lang), show_alert=True)
+        return
+
+    lesson_date = date.fromisoformat(data["lesson_date"])
+    marks_map: dict[str, str] = data["marks_map"]
+    cycle_title_hint: str = data.get("cycle_title_hint", "")
+
+    async def _on_saved(saved_text: str) -> None:
+        await state.clear()
+        await callback.message.edit_text(saved_text, parse_mode="HTML")
+
+    await submit_attendance(
+        callback.bot,
+        user_id,
+        callback.from_user.full_name or str(user_id),
+        lang,
+        group_name,
+        lesson_date,
+        marks_map,
+        session=_parse_int(data.get("lesson_session")),
+        cycle_title_hint=cycle_title_hint,
+        on_saved=_on_saved,
+    )
     await callback.answer()
 
 

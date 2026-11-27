@@ -2617,6 +2617,346 @@ async def msg_attach_student_device_phone(
         await message.answer(t("error_generic", lang))
 
 
+async def execute_student_field_update(
+    sid: str, field_name: str, new_val: str
+) -> Optional[dict[str, Any]]:
+    """
+    "✏️ Tahrirlash" core shared by the inline editor and the AI assistant:
+    updates Baza_Talabalar, syncs the change into every {Group}_{Year} sheet
+    and (for F.I.O.) the student's SQLite user name. Returns the fresh row.
+    """
+    if field_name == "Talaba_TG" and new_val and not new_val.startswith("@"):
+        new_val = f"@{new_val}"
+
+    sheets = get_sheets_manager()
+    await asyncio.to_thread(_ensure_extended_student_headers_sync)
+    student_before = await sheets.a_get_student_by_id(sid)
+    old_fio = (
+        str(student_before.get("F.I.O.") or "").strip() if student_before else ""
+    )
+
+    updates: dict[str, Any] = {field_name: new_val}
+    if field_name == "Otasi_Tel" and student_before:
+        if not str(student_before.get("OtaOna_Tel") or "").strip():
+            updates["OtaOna_Tel"] = new_val
+
+    await asyncio.to_thread(sheets.update_student, sid, updates)
+    new_fio = new_val if field_name == "F.I.O." else old_fio
+    await sheets.a_sync_student_across_all_sheets(
+        sid,
+        old_fio=old_fio,
+        new_fio=new_fio,
+        updated_fields=updates,
+    )
+
+    if field_name == "F.I.O." and student_before:
+        stu_cid_str = str(student_before.get("Talaba_Chat_ID") or "").strip()
+        if stu_cid_str.isdigit():
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "UPDATE users SET full_name = ? WHERE telegram_id = ?;",
+                        (new_val, int(stu_cid_str)),
+                    )
+                    await db.commit()
+            except Exception:
+                pass
+
+    return await sheets.a_get_student_by_id(sid)
+
+
+async def execute_student_transfer(
+    bot: Any,
+    user_id: int,
+    lang: str,
+    sid: str,
+    target_group: str,
+    keep_in_old_group: bool,
+) -> dict[str, Any]:
+    """
+    "🔄 Guruhni o‘zgartirish" core (inline flow + AI assistant): transfer or
+    dual-enroll in Sheets, start the new group's initial notice timer, sync the
+    student across sheets and notify the student, father, mother, the new and
+    (on a move) the old teacher. Returns {"ok", "admin_notice", ...}.
+    """
+    sheets = get_sheets_manager()
+    try:
+        result = await sheets.a_transfer_or_enroll_student(
+            sid, target_group, keep_in_old_group
+        )
+    except Exception:
+        logger.exception("Error transferring student %s to %s", sid, target_group)
+        return {"ok": False}
+
+    old_group = result["old_group"]
+    new_group = result["new_group"]
+    new_student_id = result["new_student_id"]
+    updated_student = result["student"]
+    student_name = str(updated_student.get("F.I.O.") or "").strip()
+    schedule_group_initial_notice(bot, new_group)
+
+    await sheets.a_sync_student_across_all_sheets(
+        new_student_id,
+        old_fio=student_name,
+        new_fio=student_name,
+        updated_fields={"Guruh": new_group},
+    )
+
+    stu_cid_str = str(updated_student.get("Talaba_Chat_ID") or "").strip()
+    if stu_cid_str.isdigit() and int(stu_cid_str) != user_id:
+        try:
+            s_cid = int(stu_cid_str)
+            s_lang = await get_user_lang(s_cid)
+            s_key = (
+                "stu_transfer_notify_dual_student"
+                if keep_in_old_group
+                else "stu_transfer_notify_move_student"
+            )
+            await bot.send_message(
+                chat_id=s_cid,
+                text=t(
+                    s_key,
+                    s_lang,
+                    student_name=html.escape(student_name),
+                    old_group=html.escape(old_group),
+                    new_group=html.escape(new_group),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    notified_parents: set[int] = set()
+    father_cid_str = str(updated_student.get("Otasi_Chat_ID") or "").strip()
+    if father_cid_str.isdigit() and int(father_cid_str) != user_id:
+        f_cid = int(father_cid_str)
+        notified_parents.add(f_cid)
+        try:
+            f_lang = await get_user_lang(f_cid)
+            f_name = (
+                str(updated_student.get("Otasi_FIO") or "").strip()
+                or t("parent_label_father", f_lang)
+            )
+            f_key = (
+                "stu_transfer_notify_dual_father"
+                if keep_in_old_group
+                else "stu_transfer_notify_move_father"
+            )
+            await bot.send_message(
+                chat_id=f_cid,
+                text=t(
+                    f_key,
+                    f_lang,
+                    parent_name=html.escape(f_name),
+                    student_name=html.escape(student_name),
+                    old_group=html.escape(old_group),
+                    new_group=html.escape(new_group),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    mother_cid_str = str(updated_student.get("Onasi_Chat_ID") or "").strip()
+    if mother_cid_str.isdigit() and int(mother_cid_str) != user_id:
+        m_cid = int(mother_cid_str)
+        if m_cid not in notified_parents:
+            notified_parents.add(m_cid)
+            try:
+                m_lang = await get_user_lang(m_cid)
+                m_name = (
+                    str(updated_student.get("Onasi_FIO") or "").strip()
+                    or t("parent_label_mother", m_lang)
+                )
+                m_key = (
+                    "stu_transfer_notify_dual_mother"
+                    if keep_in_old_group
+                    else "stu_transfer_notify_move_mother"
+                )
+                await bot.send_message(
+                    chat_id=m_cid,
+                    text=t(
+                        m_key,
+                        m_lang,
+                        parent_name=html.escape(m_name),
+                        student_name=html.escape(student_name),
+                        old_group=html.escape(old_group),
+                        new_group=html.escape(new_group),
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    legacy_parent_cid_str = str(
+        updated_student.get("OtaOna_Chat_ID") or ""
+    ).strip()
+    if legacy_parent_cid_str.isdigit() and int(legacy_parent_cid_str) != user_id:
+        p_cid = int(legacy_parent_cid_str)
+        if p_cid not in notified_parents:
+            try:
+                p_lang = await get_user_lang(p_cid)
+                p_key = (
+                    "stu_transfer_notify_dual_father"
+                    if keep_in_old_group
+                    else "stu_transfer_notify_move_father"
+                )
+                await bot.send_message(
+                    chat_id=p_cid,
+                    text=t(
+                        p_key,
+                        p_lang,
+                        parent_name=t("role_parent", p_lang),
+                        student_name=html.escape(student_name),
+                        old_group=html.escape(old_group),
+                        new_group=html.escape(new_group),
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    new_grp_obj = await sheets.a_get_group(new_group)
+    new_t_cid_str = (
+        str(new_grp_obj.get("Ustoz_Chat_ID") or "").strip()
+        if new_grp_obj
+        else ""
+    )
+    if new_t_cid_str.isdigit() and int(new_t_cid_str) != user_id:
+        try:
+            nt_cid = int(new_t_cid_str)
+            nt_lang = await get_user_lang(nt_cid)
+            await bot.send_message(
+                chat_id=nt_cid,
+                text=t(
+                    "stu_transfer_notify_new_teacher",
+                    nt_lang,
+                    new_group=html.escape(new_group),
+                    student_name=html.escape(student_name),
+                    student_id=html.escape(new_student_id),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    if not keep_in_old_group and old_group:
+        old_grp_obj = await sheets.a_get_group(old_group)
+        old_t_cid_str = (
+            str(old_grp_obj.get("Ustoz_Chat_ID") or "").strip()
+            if old_grp_obj
+            else ""
+        )
+        if (
+            old_t_cid_str.isdigit()
+            and int(old_t_cid_str) != user_id
+            and old_t_cid_str != new_t_cid_str
+        ):
+            try:
+                ot_cid = int(old_t_cid_str)
+                ot_lang = await get_user_lang(ot_cid)
+                await bot.send_message(
+                    chat_id=ot_cid,
+                    text=t(
+                        "stu_transfer_notify_old_teacher_moved",
+                        ot_lang,
+                        student_name=html.escape(student_name),
+                        old_group=html.escape(old_group),
+                        new_group=html.escape(new_group),
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    if keep_in_old_group:
+        admin_notice = t(
+            "stu_transfer_success_dual_admin",
+            lang,
+            student_name=html.escape(student_name),
+            old_group=html.escape(old_group),
+            new_group=html.escape(new_group),
+            new_student_id=html.escape(new_student_id),
+        )
+    else:
+        admin_notice = t(
+            "stu_transfer_success_move_admin",
+            lang,
+            student_name=html.escape(student_name),
+            student_id=html.escape(new_student_id),
+            old_group=html.escape(old_group),
+            new_group=html.escape(new_group),
+        )
+
+    return {
+        "ok": True,
+        "admin_notice": admin_notice,
+        "new_student_id": new_student_id,
+        "new_group": new_group,
+        "old_group": old_group,
+        "student": updated_student,
+    }
+
+
+async def execute_student_delete(
+    user_id: int, actor_name: str, lang: str, sid: str
+) -> str:
+    """
+    "🗑 Talabani o‘chirish" core (inline flow + AI assistant): full Google
+    Sheets purge (Baza_Talabalar + every {Group}_{Year}), prorated overrides,
+    Audit_Log, SQLite purge incl. orphaned parents. Returns the result text.
+    """
+    sheets = get_sheets_manager()
+    student_before = await sheets.a_get_student_by_id(sid)
+    # Sheets purge (Baza_Talabalar + every {Group}_{Year} worksheet); the
+    # returned payload says which parents are left without any child.
+    payload = await sheets.a_purge_student_completely(sid)
+    if payload.get("deleted"):
+        del_name = str(payload.get("student_name") or sid)
+        del_group = str((student_before or {}).get("Guruh") or "").strip() or "—"
+        try:
+            await database.delete_cycle_overrides(student_id=sid)
+        except Exception:
+            logger.exception("Could not drop prorated overrides of %s", sid)
+        await log_audit_event(
+            actor_id=user_id,
+            action=AUDIT_STUDENT_DELETED,
+            target=f"{del_name} ({payload.get('student_id') or sid}) | {del_group}",
+            details=(
+                f"Talaba: {del_name}; Guruh: {del_group}; "
+                f"O'chirilgan sikl qatorlari: {int(payload.get('removed_cycle_rows') or 0)}"
+            ),
+            actor_name=actor_name or "",
+        )
+        stu_cid = payload.get("student_chat_id")
+        # A student with another enrollment (same chat id) keeps the student role.
+        purge_stu_cid = None if payload.get("student_has_other_enrollments") else stu_cid
+        db_result = await database.purge_student_and_orphaned_parents(
+            str(payload.get("student_id") or sid),
+            purge_stu_cid,
+            list(payload.get("orphaned_parent_chat_ids") or []),
+        )
+        # Re-point still-valid users (remaining enrollments / other children).
+        await _cleanup_deleted_student_sqlite(sid, student_before)
+        state_key = {
+            "deleted": "purge_state_deleted",
+            "updated": "purge_state_updated",
+        }.get(str(db_result.get("student_user")), "purge_state_none")
+        parents_purged = sum(
+            1 for v in (db_result.get("parents") or {}).values() if v == "deleted"
+        )
+        return _st(
+                "deleted_purged",
+                lang,
+                full_name=html.escape(str(payload.get("student_name") or sid)),
+                student_id=html.escape(str(payload.get("student_id") or sid)),
+                cycle_rows=int(payload.get("removed_cycle_rows") or 0),
+                student_state=_st(state_key, lang),
+                parents_purged=parents_purged,
+            )
+    return t("error_generic", lang)
+
+
 # ======================================================================
 # 3. MANAGE EXISTING STUDENTS (Admin Unrestricted Visibility: Status, Edit, Transfer, Links, Delete)
 # ======================================================================
@@ -3164,217 +3504,18 @@ async def stu_transfer_keep_confirmed(
         await callback.answer()
         return
 
-    sheets = get_sheets_manager()
-    try:
-        result = await sheets.a_transfer_or_enroll_student(
-            sid, target_group, keep_in_old_group
-        )
-    except Exception:
-        logger.exception("Error transferring student %s to %s", sid, target_group)
+    transfer = await execute_student_transfer(
+        callback.bot, user_id, lang, sid, target_group, keep_in_old_group
+    )
+    if not transfer["ok"]:
         await state.clear()
         await callback.message.edit_text(t("error_generic", lang))
         await callback.answer()
         return
-
-    old_group = result["old_group"]
-    new_group = result["new_group"]
-    new_student_id = result["new_student_id"]
-    updated_student = result["student"]
-    student_name = str(updated_student.get("F.I.O.") or "").strip()
-    schedule_group_initial_notice(callback.bot, new_group)
-
-    await sheets.a_sync_student_across_all_sheets(
-        new_student_id,
-        old_fio=student_name,
-        new_fio=student_name,
-        updated_fields={"Guruh": new_group},
-    )
-
-    stu_cid_str = str(updated_student.get("Talaba_Chat_ID") or "").strip()
-    if stu_cid_str.isdigit() and int(stu_cid_str) != user_id:
-        try:
-            s_cid = int(stu_cid_str)
-            s_lang = await get_user_lang(s_cid)
-            s_key = (
-                "stu_transfer_notify_dual_student"
-                if keep_in_old_group
-                else "stu_transfer_notify_move_student"
-            )
-            await callback.bot.send_message(
-                chat_id=s_cid,
-                text=t(
-                    s_key,
-                    s_lang,
-                    student_name=html.escape(student_name),
-                    old_group=html.escape(old_group),
-                    new_group=html.escape(new_group),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    notified_parents: set[int] = set()
-    father_cid_str = str(updated_student.get("Otasi_Chat_ID") or "").strip()
-    if father_cid_str.isdigit() and int(father_cid_str) != user_id:
-        f_cid = int(father_cid_str)
-        notified_parents.add(f_cid)
-        try:
-            f_lang = await get_user_lang(f_cid)
-            f_name = (
-                str(updated_student.get("Otasi_FIO") or "").strip()
-                or t("parent_label_father", f_lang)
-            )
-            f_key = (
-                "stu_transfer_notify_dual_father"
-                if keep_in_old_group
-                else "stu_transfer_notify_move_father"
-            )
-            await callback.bot.send_message(
-                chat_id=f_cid,
-                text=t(
-                    f_key,
-                    f_lang,
-                    parent_name=html.escape(f_name),
-                    student_name=html.escape(student_name),
-                    old_group=html.escape(old_group),
-                    new_group=html.escape(new_group),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    mother_cid_str = str(updated_student.get("Onasi_Chat_ID") or "").strip()
-    if mother_cid_str.isdigit() and int(mother_cid_str) != user_id:
-        m_cid = int(mother_cid_str)
-        if m_cid not in notified_parents:
-            notified_parents.add(m_cid)
-            try:
-                m_lang = await get_user_lang(m_cid)
-                m_name = (
-                    str(updated_student.get("Onasi_FIO") or "").strip()
-                    or t("parent_label_mother", m_lang)
-                )
-                m_key = (
-                    "stu_transfer_notify_dual_mother"
-                    if keep_in_old_group
-                    else "stu_transfer_notify_move_mother"
-                )
-                await callback.bot.send_message(
-                    chat_id=m_cid,
-                    text=t(
-                        m_key,
-                        m_lang,
-                        parent_name=html.escape(m_name),
-                        student_name=html.escape(student_name),
-                        old_group=html.escape(old_group),
-                        new_group=html.escape(new_group),
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-    legacy_parent_cid_str = str(
-        updated_student.get("OtaOna_Chat_ID") or ""
-    ).strip()
-    if legacy_parent_cid_str.isdigit() and int(legacy_parent_cid_str) != user_id:
-        p_cid = int(legacy_parent_cid_str)
-        if p_cid not in notified_parents:
-            try:
-                p_lang = await get_user_lang(p_cid)
-                p_key = (
-                    "stu_transfer_notify_dual_father"
-                    if keep_in_old_group
-                    else "stu_transfer_notify_move_father"
-                )
-                await callback.bot.send_message(
-                    chat_id=p_cid,
-                    text=t(
-                        p_key,
-                        p_lang,
-                        parent_name=t("role_parent", p_lang),
-                        student_name=html.escape(student_name),
-                        old_group=html.escape(old_group),
-                        new_group=html.escape(new_group),
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-    new_grp_obj = await sheets.a_get_group(new_group)
-    new_t_cid_str = (
-        str(new_grp_obj.get("Ustoz_Chat_ID") or "").strip()
-        if new_grp_obj
-        else ""
-    )
-    if new_t_cid_str.isdigit() and int(new_t_cid_str) != user_id:
-        try:
-            nt_cid = int(new_t_cid_str)
-            nt_lang = await get_user_lang(nt_cid)
-            await callback.bot.send_message(
-                chat_id=nt_cid,
-                text=t(
-                    "stu_transfer_notify_new_teacher",
-                    nt_lang,
-                    new_group=html.escape(new_group),
-                    student_name=html.escape(student_name),
-                    student_id=html.escape(new_student_id),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    if not keep_in_old_group and old_group:
-        old_grp_obj = await sheets.a_get_group(old_group)
-        old_t_cid_str = (
-            str(old_grp_obj.get("Ustoz_Chat_ID") or "").strip()
-            if old_grp_obj
-            else ""
-        )
-        if (
-            old_t_cid_str.isdigit()
-            and int(old_t_cid_str) != user_id
-            and old_t_cid_str != new_t_cid_str
-        ):
-            try:
-                ot_cid = int(old_t_cid_str)
-                ot_lang = await get_user_lang(ot_cid)
-                await callback.bot.send_message(
-                    chat_id=ot_cid,
-                    text=t(
-                        "stu_transfer_notify_old_teacher_moved",
-                        ot_lang,
-                        student_name=html.escape(student_name),
-                        old_group=html.escape(old_group),
-                        new_group=html.escape(new_group),
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
-    if keep_in_old_group:
-        admin_notice = t(
-            "stu_transfer_success_dual_admin",
-            lang,
-            student_name=html.escape(student_name),
-            old_group=html.escape(old_group),
-            new_group=html.escape(new_group),
-            new_student_id=html.escape(new_student_id),
-        )
-    else:
-        admin_notice = t(
-            "stu_transfer_success_move_admin",
-            lang,
-            student_name=html.escape(student_name),
-            student_id=html.escape(new_student_id),
-            old_group=html.escape(old_group),
-            new_group=html.escape(new_group),
-        )
+    admin_notice = transfer["admin_notice"]
+    new_student_id = transfer["new_student_id"]
+    new_group = transfer["new_group"]
+    updated_student = transfer["student"]
 
     await state.update_data(student_id=new_student_id, group_name=new_group)
     await state.set_state(StudentManageStates.viewing_student)
@@ -3408,44 +3549,7 @@ async def stu_edit_new_value_entered(message: Message, state: FSMContext) -> Non
     sid = data["student_id"]
     field_name = data["edit_field"]
 
-    if field_name == "Talaba_TG" and new_val and not new_val.startswith("@"):
-        new_val = f"@{new_val}"
-
-    sheets = get_sheets_manager()
-    await asyncio.to_thread(_ensure_extended_student_headers_sync)
-    student_before = await sheets.a_get_student_by_id(sid)
-    old_fio = (
-        str(student_before.get("F.I.O.") or "").strip() if student_before else ""
-    )
-
-    updates: dict[str, Any] = {field_name: new_val}
-    if field_name == "Otasi_Tel" and student_before:
-        if not str(student_before.get("OtaOna_Tel") or "").strip():
-            updates["OtaOna_Tel"] = new_val
-
-    await asyncio.to_thread(sheets.update_student, sid, updates)
-    new_fio = new_val if field_name == "F.I.O." else old_fio
-    await sheets.a_sync_student_across_all_sheets(
-        sid,
-        old_fio=old_fio,
-        new_fio=new_fio,
-        updated_fields=updates,
-    )
-
-    if field_name == "F.I.O." and student_before:
-        stu_cid_str = str(student_before.get("Talaba_Chat_ID") or "").strip()
-        if stu_cid_str.isdigit():
-            try:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE users SET full_name = ? WHERE telegram_id = ?;",
-                        (new_val, int(stu_cid_str)),
-                    )
-                    await db.commit()
-            except Exception:
-                pass
-
-    student = await sheets.a_get_student_by_id(sid)
+    student = await execute_student_field_update(sid, field_name, new_val)
     await state.set_state(StudentManageStates.viewing_student)
 
     await message.answer(_st("updated_ok", lang), parse_mode="HTML")
@@ -3508,60 +3612,11 @@ async def stu_delete_confirmed(callback: CallbackQuery, state: FSMContext) -> No
         await callback.answer(_st("no_permission", lang), show_alert=True)
         return
     sid = (callback.data or "").split(":", 1)[1]
-    sheets = get_sheets_manager()
-    student_before = await sheets.a_get_student_by_id(sid)
-    # Sheets purge (Baza_Talabalar + every {Group}_{Year} worksheet); the
-    # returned payload says which parents are left without any child.
-    payload = await sheets.a_purge_student_completely(sid)
+    result_text = await execute_student_delete(
+        user_id, callback.from_user.full_name or "", lang, sid
+    )
     await state.clear()
-    if payload.get("deleted"):
-        del_name = str(payload.get("student_name") or sid)
-        del_group = str((student_before or {}).get("Guruh") or "").strip() or "—"
-        try:
-            await database.delete_cycle_overrides(student_id=sid)
-        except Exception:
-            logger.exception("Could not drop prorated overrides of %s", sid)
-        await log_audit_event(
-            actor_id=user_id,
-            action=AUDIT_STUDENT_DELETED,
-            target=f"{del_name} ({payload.get('student_id') or sid}) | {del_group}",
-            details=(
-                f"Talaba: {del_name}; Guruh: {del_group}; "
-                f"O'chirilgan sikl qatorlari: {int(payload.get('removed_cycle_rows') or 0)}"
-            ),
-            actor_name=callback.from_user.full_name or "",
-        )
-        stu_cid = payload.get("student_chat_id")
-        # A student with another enrollment (same chat id) keeps the student role.
-        purge_stu_cid = None if payload.get("student_has_other_enrollments") else stu_cid
-        db_result = await database.purge_student_and_orphaned_parents(
-            str(payload.get("student_id") or sid),
-            purge_stu_cid,
-            list(payload.get("orphaned_parent_chat_ids") or []),
-        )
-        # Re-point still-valid users (remaining enrollments / other children).
-        await _cleanup_deleted_student_sqlite(sid, student_before)
-        state_key = {
-            "deleted": "purge_state_deleted",
-            "updated": "purge_state_updated",
-        }.get(str(db_result.get("student_user")), "purge_state_none")
-        parents_purged = sum(
-            1 for v in (db_result.get("parents") or {}).values() if v == "deleted"
-        )
-        await callback.message.edit_text(
-            _st(
-                "deleted_purged",
-                lang,
-                full_name=html.escape(str(payload.get("student_name") or sid)),
-                student_id=html.escape(str(payload.get("student_id") or sid)),
-                cycle_rows=int(payload.get("removed_cycle_rows") or 0),
-                student_state=_st(state_key, lang),
-                parents_purged=parents_purged,
-            ),
-            parse_mode="HTML",
-        )
-    else:
-        await callback.message.edit_text(t("error_generic", lang), parse_mode="HTML")
+    await callback.message.edit_text(result_text, parse_mode="HTML")
     await callback.answer()
 
 

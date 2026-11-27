@@ -1473,9 +1473,12 @@ async def execute_payment_confirmation(
     group_name: str,
     student_id: str,
     cycle_title: str,
+    revert: bool = False,
 ) -> dict[str, Any]:
     """
-    The exact "✅ To'lovni tasdiqlash" flow without the inline UI (used by the
+    revert=False: the exact "✅ To'lovni tasdiqlash" flow; revert=True: the exact
+    "↩️ To'lovni bekor qilish" flow (red cells back, debt restored,
+    AUDIT_PAYMENT_REVERTED, revert notices). Without the inline UI (used by the
     AI assistant's confirmation card): green cells + debt removal in Sheets
     (a_confirm_student_payment), Audit_Log entry and student/parent/group
     notifications. Returns {"ok": bool, "reason": str, "amount": int}.
@@ -1491,8 +1494,10 @@ async def execute_payment_confirmation(
     )
     if cycle is None:
         return {"ok": False, "reason": "cycle_not_found", "amount": 0}
-    if cycle.get("is_paid"):
+    if cycle.get("is_paid") and not revert:
         return {"ok": False, "reason": "already_paid", "amount": 0}
+    if revert and not cycle.get("is_paid"):
+        return {"ok": False, "reason": "not_paid_yet", "amount": 0}
     sheets = get_sheets_manager()
     student = await sheets.a_get_student_by_id(student_id)
     if not student:
@@ -1502,7 +1507,8 @@ async def execute_payment_confirmation(
     monthly_fee = int(fee_digits) if fee_digits else _get_default_monthly_fee()
     amount = int(cycle["prorated_amount"]) if cycle.get("prorated_amount") else monthly_fee
 
-    ok = await sheets.a_confirm_student_payment(
+    action_fn = sheets.a_revert_student_payment if revert else sheets.a_confirm_student_payment
+    ok = await action_fn(
         student_id=student_id, group_name=group_name, cycle_title=cycle_title
     )
     if not ok:
@@ -1510,7 +1516,7 @@ async def execute_payment_confirmation(
     student_name = str(student.get("F.I.O.") or student_id).strip()
     await log_audit_event(
         actor_id=actor_id,
-        action=AUDIT_PAYMENT_CONFIRMED,
+        action=AUDIT_PAYMENT_REVERTED if revert else AUDIT_PAYMENT_CONFIRMED,
         target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
         amount=amount,
         details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
@@ -1522,7 +1528,7 @@ async def execute_payment_confirmation(
         group_name=group_name,
         student=fresh,
         cycle_title=_format_cycle_display_title(cycle, "latn"),
-        is_confirm=True,
+        is_confirm=not revert,
         actor_user_id=actor_id,
         paid_amount=cycle.get("prorated_amount"),
         overrides_by_title=cycle.get("student_overrides"),
