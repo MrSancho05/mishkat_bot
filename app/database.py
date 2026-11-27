@@ -266,6 +266,21 @@ async def init_db() -> None:
             );
             """
         )
+        # Mishkat AI assistant: pending write drafts (✅ Tasdiqlash / ❌ Bekor
+        # qilish). Nothing is changed in Sheets/SQLite until the creator confirms.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_drafts (
+                draft_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            """
+        )
         # One-time teacher reminder for "Kelishilgan vaqtda" groups (day before).
         await db.execute(
             """
@@ -2427,6 +2442,68 @@ async def release_agreed_time_reminder(group_name: str, lesson_date: str) -> Non
             (_lesson_key(group_name), str(lesson_date).strip()),
         )
         await db.commit()
+
+
+async def create_ai_draft(
+    draft_id: str, chat_id: int, action: str, payload: dict[str, Any], ttl_minutes: int = 10
+) -> None:
+    now = now_tashkent()
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Housekeeping: drop drafts that expired more than a day ago.
+        await db.execute(
+            "DELETE FROM ai_drafts WHERE expires_at < ?;",
+            ((now - timedelta(days=1)).isoformat(),),
+        )
+        await db.execute(
+            "INSERT INTO ai_drafts (draft_id, chat_id, action, payload_json, status, "
+            "created_at, expires_at) VALUES (?, ?, ?, ?, 'pending', ?, ?);",
+            (
+                draft_id,
+                int(chat_id),
+                action,
+                json.dumps(payload, ensure_ascii=False),
+                now.isoformat(),
+                (now + timedelta(minutes=ttl_minutes)).isoformat(),
+            ),
+        )
+        await db.commit()
+
+
+async def claim_ai_draft(draft_id: str, chat_id: int, new_status: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """
+    Atomically moves a PENDING draft of this chat to new_status ('confirmed' /
+    'cancelled'). Returns (result, draft): result is 'ok', 'not_found',
+    'forbidden' (another user's draft), 'expired' or 'done' (already handled).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM ai_drafts WHERE draft_id = ?;", (draft_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return "not_found", None
+        draft = dict(row)
+        draft["payload"] = json.loads(draft.get("payload_json") or "{}")
+        if int(draft["chat_id"]) != int(chat_id):
+            return "forbidden", draft
+        if draft["status"] != "pending":
+            return "done", draft
+        expires = _parse_due_at(draft.get("expires_at"))
+        if expires is not None and now_tashkent() > expires:
+            await db.execute(
+                "UPDATE ai_drafts SET status = 'expired' WHERE draft_id = ?;", (draft_id,)
+            )
+            await db.commit()
+            return "expired", draft
+        cursor = await db.execute(
+            "UPDATE ai_drafts SET status = ? WHERE draft_id = ? AND status = 'pending';",
+            (new_status, draft_id),
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            return "done", draft
+        return "ok", draft
 
 
 async def save_callback_token(token: str, data: str) -> None:

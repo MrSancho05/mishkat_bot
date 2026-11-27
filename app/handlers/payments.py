@@ -1466,6 +1466,70 @@ async def cb_payment_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+async def execute_payment_confirmation(
+    bot: Any,
+    actor_id: int,
+    actor_name: str,
+    group_name: str,
+    student_id: str,
+    cycle_title: str,
+) -> dict[str, Any]:
+    """
+    The exact "✅ To'lovni tasdiqlash" flow without the inline UI (used by the
+    AI assistant's confirmation card): green cells + debt removal in Sheets
+    (a_confirm_student_payment), Audit_Log entry and student/parent/group
+    notifications. Returns {"ok": bool, "reason": str, "amount": int}.
+    """
+    if not await _can_manage_group(actor_id, group_name):
+        return {"ok": False, "reason": "no_permission", "amount": 0}
+    cycles = await asyncio.to_thread(
+        _fetch_full_cycle_history_sync, group_name, student_id
+    )
+    cycle = next(
+        (c for c in cycles if str(c.get("cycle_title") or "").strip() == cycle_title.strip()),
+        None,
+    )
+    if cycle is None:
+        return {"ok": False, "reason": "cycle_not_found", "amount": 0}
+    if cycle.get("is_paid"):
+        return {"ok": False, "reason": "already_paid", "amount": 0}
+    sheets = get_sheets_manager()
+    student = await sheets.a_get_student_by_id(student_id)
+    if not student:
+        return {"ok": False, "reason": "student_not_found", "amount": 0}
+    group = await sheets.a_get_group(group_name) or {}
+    fee_digits = re.sub(r"[^\d]", "", str(group.get("Oylik_Tolov_Summa") or ""))
+    monthly_fee = int(fee_digits) if fee_digits else _get_default_monthly_fee()
+    amount = int(cycle["prorated_amount"]) if cycle.get("prorated_amount") else monthly_fee
+
+    ok = await sheets.a_confirm_student_payment(
+        student_id=student_id, group_name=group_name, cycle_title=cycle_title
+    )
+    if not ok:
+        return {"ok": False, "reason": "sheets_failed", "amount": 0}
+    student_name = str(student.get("F.I.O.") or student_id).strip()
+    await log_audit_event(
+        actor_id=actor_id,
+        action=AUDIT_PAYMENT_CONFIRMED,
+        target=f"{student_name} ({student_id}) | {group_name} | {cycle_title}",
+        amount=amount,
+        details=f"Talaba: {student_name}; Guruh: {group_name}; Sikl: {cycle_title}",
+        actor_name=actor_name,
+    )
+    fresh = await sheets.a_get_student_by_id(student_id) or student
+    await _broadcast_payment_event(
+        bot=bot,
+        group_name=group_name,
+        student=fresh,
+        cycle_title=_format_cycle_display_title(cycle, "latn"),
+        is_confirm=True,
+        actor_user_id=actor_id,
+        paid_amount=cycle.get("prorated_amount"),
+        overrides_by_title=cycle.get("student_overrides"),
+    )
+    return {"ok": True, "reason": "", "amount": amount}
+
+
 @router.callback_query(PaymentStates.confirming, F.data.startswith("pay_confirm:"))
 async def cb_payment_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user or not callback.message:
