@@ -2312,6 +2312,148 @@ async def cb_delete_group_confirm(
         return
 
     group_name = (callback.data or "").split("grp_del_ok:", 1)[1].strip()
+    deleted, canonical = await execute_group_delete(
+        user_id, callback.from_user.full_name or "", group_name
+    )
+    await state.clear()
+    if not deleted:
+        await callback.message.edit_text(
+            _lt("group_not_found", lang), parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=_lt("admins_btn_groups", lang),
+                    callback_data="groups_info:modes",
+                )
+            ]
+        ]
+    )
+    await callback.message.edit_text(
+        _lt("delete_group_success", lang, group=html.escape(canonical)),
+        reply_markup=back_kb,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+async def execute_teacher_assignment(
+    bot: Any,
+    user_id: int,
+    actor_name: str,
+    lang: str,
+    teacher_id: str,
+    group_name: str,
+) -> dict[str, Any]:
+    """
+    "👨‍🏫 Guruhga biriktirish" core (teacher manager + AI assistant): writes
+    Ustoz_ID + Ustoz_Chat_ID, Audit_Log, refreshes the teachers' group columns,
+    notifies the teacher and broadcasts the change. Re-selecting the same
+    teacher only backfills IDs (status "unchanged", no notifications).
+    """
+
+    sheets = get_sheets_manager()
+    old_group = await sheets.a_get_group(group_name)
+    old_teacher_chat_id = (
+        str(old_group.get("Ustoz_Chat_ID", "")).strip() if old_group else ""
+    )
+    old_teacher_name = "—"
+    if old_teacher_chat_id:
+        old_t_info = await _resolve_group_teacher_info(
+            sheets, old_teacher_chat_id, "latn"
+        )
+        old_teacher_name = old_t_info["name"] or old_teacher_chat_id
+
+    if old_group:
+        new_ids = await asyncio.to_thread(sheets.resolve_teacher_ids, teacher_id)
+        old_ids = (
+            str(old_group.get("Ustoz_ID") or "").strip(),
+            old_teacher_chat_id,
+        )
+        if (new_ids[0] and new_ids[0] == old_ids[0]) or (
+            new_ids[1] and new_ids[1] == old_ids[1]
+        ):
+            # Exact same teacher: only backfill a missing ID, never re-notify.
+            await asyncio.to_thread(sheets.set_group_teacher, group_name, teacher_id)
+            return {"status": "unchanged", "notice": t("teacher_unchanged", lang)}
+
+    try:
+        result = await sheets.a_assign_teacher_to_group(teacher_id, group_name)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Teacher %s assignment to %s failed", teacher_id, group_name
+        )
+        return {"status": "error", "notice": t("error_generic", lang)}
+
+    teacher = result["teacher"]
+    group = result["group"]
+    canonical_group = str(group.get("Guruh_Nomi", group_name)).strip()
+    teacher_name = str(teacher.get("F.I.O.", teacher_id)).strip()
+    teacher_chat_id = str(
+        teacher.get("Chat_ID") or teacher.get("Ustoz_Chat_ID") or ""
+    ).strip()
+
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_GROUP_EDITED,
+        target=canonical_group,
+        details=f"Ustoz: {old_teacher_name} → {teacher_name}",
+        actor_name=actor_name or "",
+    )
+
+    if old_teacher_chat_id and old_teacher_chat_id != teacher_chat_id:
+        await asyncio.to_thread(
+            _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
+        )
+    if teacher_chat_id:
+        await asyncio.to_thread(
+            _sync_refresh_teacher_groups_column, sheets, teacher_chat_id
+        )
+
+    if teacher_chat_id.isdigit() and int(teacher_chat_id) != user_id:
+        try:
+            t_lang = await get_user_lang(int(teacher_chat_id))
+            await bot.send_message(
+                chat_id=int(teacher_chat_id),
+                text=t(
+                    "teacher_manage_assign_notify_teacher",
+                    t_lang,
+                    group=html.escape(canonical_group),
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await _broadcast_group_update(
+        bot,
+        sheets,
+        canonical_group,
+        change_items=[("Ustoz", old_teacher_name, teacher_name)],
+        triggered_by_user_id=user_id,
+    )
+
+    notice = t(
+        "teacher_manage_assign_success_admin",
+        lang,
+        full_name=html.escape(teacher_name),
+        group=html.escape(canonical_group),
+    )
+    return {"status": "ok", "notice": notice, "teacher_name": teacher_name}
+
+
+async def execute_group_delete(
+    user_id: int, actor_name: str, group_name: str
+) -> tuple[bool, str]:
+    """
+    "🗑 Guruhni o‘chirish" core (inline + AI): removes the Guruhlar row and the
+    group's {Group}_{Year} sheets (students go to Zahira), Audit_Log, SQLite
+    cleanup and the teacher's group column. Returns (deleted, canonical name).
+    """
     sheets = get_sheets_manager()
     group = await sheets.a_get_group(group_name)
     canonical = group["Guruh_Nomi"].strip() if group else group_name
@@ -2320,14 +2462,8 @@ async def cb_delete_group_confirm(
     )
 
     deleted = await sheets.a_delete_group_completely(canonical)
-    await state.clear()
-
     if not deleted:
-        await callback.message.edit_text(
-            _lt("group_not_found", lang), parse_mode="HTML"
-        )
-        await callback.answer()
-        return
+        return False, canonical
 
     await log_audit_event(
         actor_id=user_id,
@@ -2337,7 +2473,7 @@ async def cb_delete_group_confirm(
             f"Guruh: {canonical}; talabalar Zahira guruhiga o'tkazildi; "
             f"Ustoz chat ID: {old_teacher_chat_id or '—'}"
         ),
-        actor_name=callback.from_user.full_name or "",
+        actor_name=actor_name or "",
     )
     await _cleanup_deleted_group_in_sqlite(canonical)
     try:
@@ -2356,23 +2492,80 @@ async def cb_delete_group_confirm(
         await asyncio.to_thread(
             _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
         )
+    return True, canonical
 
-    back_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=_lt("admins_btn_groups", lang),
-                    callback_data="groups_info:modes",
-                )
-            ]
-        ]
+
+async def execute_teacher_delete(
+    bot: Any, user_id: int, actor_name: str, lang: str, teacher_id: str
+) -> str:
+    """
+    "🗑 Ustozni o‘chirish" core (teacher manager + AI): purges the teacher from
+    Ustozlar / Guruhlar / SQLite, Audit_Log, resets the role and notifies the
+    teacher. Returns the admin notice.
+    """
+    sheets = get_sheets_manager()
+    teacher = await sheets.a_get_teacher_by_id(teacher_id)
+    teacher_name = (
+        str(teacher.get("F.I.O.", teacher_id)).strip() if teacher else teacher_id
     )
-    await callback.message.edit_text(
-        _lt("delete_group_success", lang, group=html.escape(canonical)),
-        reply_markup=back_kb,
-        parse_mode="HTML",
+
+    payload = await sheets.a_purge_teacher_completely(teacher_id)
+    await log_audit_event(
+        actor_id=user_id,
+        action=AUDIT_TEACHER_DELETED,
+        target=f"{teacher_name} ({payload.get('teacher_id') or teacher_id})",
+        details=f"Ustoz: {teacher_name}; Ustoz ID: {payload.get('teacher_id') or teacher_id}",
+        actor_name=actor_name or "",
     )
-    await callback.answer()
+    t_cid_int = payload.get("teacher_chat_id")
+    teacher_lang_before = await get_user_lang(int(t_cid_int)) if t_cid_int else "latn"
+    chat_id = str(t_cid_int) if t_cid_int else ""
+    real_tid = str(payload.get("teacher_id") or teacher_id).strip()
+    if t_cid_int:
+        await database.purge_deleted_person_from_db(int(t_cid_int), "teacher")
+    await _reset_teacher_role_in_sqlite(real_tid, "")
+
+    if chat_id.isdigit() and int(chat_id) != user_id:
+        target_cid = int(chat_id)
+        try:
+            t_lang = teacher_lang_before
+            await bot.send_message(
+                chat_id=target_cid,
+                text=t("teacher_manage_delete_notify_teacher", t_lang),
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode="HTML",
+            )
+            await bot.send_message(
+                chat_id=target_cid,
+                text=t("choose_language", "latn"),
+                reply_markup=lang_selection_kb(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    notice = t(
+        "teacher_manage_delete_success",
+        lang,
+        full_name=html.escape(teacher_name),
+    )
+    notice += t("teacher_manage_delete_purged", lang)
+    return notice
+
+
+async def create_teacher_invite_link(
+    bot: Any, user_id: int, linked_group: Optional[str]
+) -> str:
+    """One-time "?start=tch_<CODE>" teacher invite (optionally bound to a group)."""
+    invite_code = secrets.token_hex(4).upper()
+    await create_teacher_invite(invite_code, PLACEHOLDER_TEXT)
+    await _upsert_teacher_meta(
+        invite_code=invite_code,
+        linked_group_name=linked_group,
+        invited_by=user_id,
+    )
+    bot_me = await bot.get_me()
+    return f"https://t.me/{bot_me.username}?start=tch_{invite_code}"
 
 
 # ----------------------------------------------------------------------
@@ -2583,87 +2776,19 @@ async def cb_teacher_manage_assign_execute(
         return
     teacher_id = parts[2].strip()
     group_name = parts[3].strip()
-
-    sheets = get_sheets_manager()
-    old_group = await sheets.a_get_group(group_name)
-    old_teacher_chat_id = (
-        str(old_group.get("Ustoz_Chat_ID", "")).strip() if old_group else ""
-    )
-    old_teacher_name = "—"
-    if old_teacher_chat_id:
-        old_t_info = await _resolve_group_teacher_info(
-            sheets, old_teacher_chat_id, "latn"
-        )
-        old_teacher_name = old_t_info["name"] or old_teacher_chat_id
-
-    if old_group:
-        new_ids = await asyncio.to_thread(sheets.resolve_teacher_ids, teacher_id)
-        old_ids = (
-            str(old_group.get("Ustoz_ID") or "").strip(),
-            old_teacher_chat_id,
-        )
-        if (new_ids[0] and new_ids[0] == old_ids[0]) or (
-            new_ids[1] and new_ids[1] == old_ids[1]
-        ):
-            # Exact same teacher: only backfill a missing ID, never re-notify.
-            await asyncio.to_thread(sheets.set_group_teacher, group_name, teacher_id)
-            await callback.answer(t("teacher_unchanged", lang), show_alert=True)
-            return
-
-    try:
-        result = await sheets.a_assign_teacher_to_group(teacher_id, group_name)
-    except Exception:
-        await callback.answer(t("error_generic", lang), show_alert=True)
-        return
-
-    teacher = result["teacher"]
-    group = result["group"]
-    canonical_group = str(group.get("Guruh_Nomi", group_name)).strip()
-    teacher_name = str(teacher.get("F.I.O.", teacher_id)).strip()
-    teacher_chat_id = str(
-        teacher.get("Chat_ID") or teacher.get("Ustoz_Chat_ID") or ""
-    ).strip()
-
-    await log_audit_event(
-        actor_id=user_id,
-        action=AUDIT_GROUP_EDITED,
-        target=canonical_group,
-        details=f"Ustoz: {old_teacher_name} → {teacher_name}",
-        actor_name=callback.from_user.full_name or "",
-    )
-
-    if old_teacher_chat_id and old_teacher_chat_id != teacher_chat_id:
-        await asyncio.to_thread(
-            _sync_refresh_teacher_groups_column, sheets, old_teacher_chat_id
-        )
-    if teacher_chat_id:
-        await asyncio.to_thread(
-            _sync_refresh_teacher_groups_column, sheets, teacher_chat_id
-        )
-
-    if teacher_chat_id.isdigit() and int(teacher_chat_id) != user_id:
-        try:
-            t_lang = await get_user_lang(int(teacher_chat_id))
-            await callback.bot.send_message(
-                chat_id=int(teacher_chat_id),
-                text=t(
-                    "teacher_manage_assign_notify_teacher",
-                    t_lang,
-                    group=html.escape(canonical_group),
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    await _broadcast_group_update(
+    assign = await execute_teacher_assignment(
         callback.bot,
-        sheets,
-        canonical_group,
-        change_items=[("Ustoz", old_teacher_name, teacher_name)],
-        triggered_by_user_id=user_id,
+        user_id,
+        callback.from_user.full_name or "",
+        lang,
+        teacher_id,
+        group_name,
     )
-
+    if assign["status"] != "ok":
+        await callback.answer(assign["notice"], show_alert=True)
+        return
+    notice = assign["notice"]
+    sheets = get_sheets_manager()
     teachers = await sheets.a_get_all_teachers_detailed()
     enriched_teacher = next(
         (
@@ -2672,12 +2797,6 @@ async def cb_teacher_manage_assign_execute(
             if str(tch.get("Ustoz_ID", "")).strip() == teacher_id
         ),
         None,
-    )
-    notice = t(
-        "teacher_manage_assign_success_admin",
-        lang,
-        full_name=html.escape(teacher_name),
-        group=html.escape(canonical_group),
     )
 
     await state.set_state(TeacherManageStates.viewing_teacher)
@@ -2754,53 +2873,9 @@ async def cb_teacher_manage_delete_confirm(
         await callback.answer(_lt("no_permission", lang), show_alert=True)
         return
     teacher_id = (callback.data or "").split(":", 2)[2].strip()
-    sheets = get_sheets_manager()
-    teacher = await sheets.a_get_teacher_by_id(teacher_id)
-    teacher_name = (
-        str(teacher.get("F.I.O.", teacher_id)).strip() if teacher else teacher_id
+    notice = await execute_teacher_delete(
+        callback.bot, user_id, callback.from_user.full_name or "", lang, teacher_id
     )
-
-    payload = await sheets.a_purge_teacher_completely(teacher_id)
-    await log_audit_event(
-        actor_id=user_id,
-        action=AUDIT_TEACHER_DELETED,
-        target=f"{teacher_name} ({payload.get('teacher_id') or teacher_id})",
-        details=f"Ustoz: {teacher_name}; Ustoz ID: {payload.get('teacher_id') or teacher_id}",
-        actor_name=callback.from_user.full_name or "",
-    )
-    t_cid_int = payload.get("teacher_chat_id")
-    teacher_lang_before = await get_user_lang(int(t_cid_int)) if t_cid_int else "latn"
-    chat_id = str(t_cid_int) if t_cid_int else ""
-    real_tid = str(payload.get("teacher_id") or teacher_id).strip()
-    if t_cid_int:
-        await database.purge_deleted_person_from_db(int(t_cid_int), "teacher")
-    await _reset_teacher_role_in_sqlite(real_tid, "")
-
-    if chat_id.isdigit() and int(chat_id) != user_id:
-        target_cid = int(chat_id)
-        try:
-            t_lang = teacher_lang_before
-            await callback.bot.send_message(
-                chat_id=target_cid,
-                text=t("teacher_manage_delete_notify_teacher", t_lang),
-                reply_markup=ReplyKeyboardRemove(),
-                parse_mode="HTML",
-            )
-            await callback.bot.send_message(
-                chat_id=target_cid,
-                text=t("choose_language", "latn"),
-                reply_markup=lang_selection_kb(),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    notice = t(
-        "teacher_manage_delete_success",
-        lang,
-        full_name=html.escape(teacher_name),
-    )
-    notice += t("teacher_manage_delete_purged", lang)
     if callback.message:
         await _show_teacher_list_panel(
             callback.message, state, lang, edit=True, notice=notice
@@ -3358,15 +3433,7 @@ async def cb_add_teacher_group_selected(callback: CallbackQuery) -> None:
     group_name = (callback.data or "").split(":", 1)[1].strip()
     linked_group = None if group_name == "__none__" else group_name
 
-    invite_code = secrets.token_hex(4).upper()
-    await create_teacher_invite(invite_code, PLACEHOLDER_TEXT)
-    await _upsert_teacher_meta(
-        invite_code=invite_code,
-        linked_group_name=linked_group,
-        invited_by=user_id,
-    )
-    bot_me = await callback.bot.get_me()
-    invite_link = f"https://t.me/{bot_me.username}?start=tch_{invite_code}"
+    invite_link = await create_teacher_invite_link(callback.bot, user_id, linked_group)
     back_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -4071,26 +4138,18 @@ async def cb_group_calendar_back(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
-@router.callback_query(GroupAddStates.confirming, F.data == "grp_add:confirm")
-async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-    user_id = callback.from_user.id
-    lang = await get_user_lang(user_id)
-    if not await _is_admin(user_id):
-        await state.clear()
-        await callback.answer(_lt("no_permission", lang), show_alert=True)
-        return
-    data = await state.get_data()
-    if not {"group_name", "lesson_count", "selected_days", "lesson_time"}.issubset(
-        data.keys()
-    ):
-        await state.clear()
-        if callback.message:
-            await callback.message.edit_text(
-                t("error_generic", lang), parse_mode="HTML"
-            )
-        await callback.answer()
-        return
-
+async def create_group_from_data(
+    bot: Any, user_id: int, lang: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    "➕ Yangi guruh" confirmation core (inline wizard + AI assistant). `data`
+    holds the wizard fields: group_name, teacher_chat_id, teacher_label,
+    pending_teacher_invite_code, lesson_count, selected_days, lesson_time,
+    monthly_fee, daily_lessons and optional start_date (ISO). Creates the
+    Guruhlar row (Ustoz_ID + Ustoz_Chat_ID), the first cycle sheet, counters,
+    notifies the teacher and the upfront-payment notice; returns
+    {"ok", "text", "group_name", "join_link"}.
+    """
     group_name = data["group_name"]
     teacher_chat_id = str(data.get("teacher_chat_id") or "")
     teacher_label = str(data.get("teacher_label") or teacher_chat_id or "—")
@@ -4114,14 +4173,10 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
 
     sheets = get_sheets_manager()
     if await sheets.a_get_group(group_name):
-        await state.clear()
-        if callback.message:
-            await callback.message.edit_text(
-                _lt("add_group_already_exists", lang, group=html.escape(group_name)),
-                parse_mode="HTML",
-            )
-        await callback.answer()
-        return
+        return {
+            "ok": False,
+            "text": _lt("add_group_already_exists", lang, group=html.escape(group_name)),
+        }
 
     today = today_tashkent()
     start_date = _group_add_start_date(data)
@@ -4198,18 +4253,13 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
                 _sync_refresh_teacher_groups_column, sheets, teacher_chat_id
             )
     except Exception:
-        await state.clear()
-        if callback.message:
-            await callback.message.edit_text(
-                t("error_generic", lang), parse_mode="HTML"
-            )
-        await callback.answer()
-        return
+        logging.getLogger(__name__).exception("Group creation failed for %s", group_name)
+        return {"ok": False, "text": t("error_generic", lang)}
 
     if teacher_chat_id.isdigit() and int(teacher_chat_id) != user_id:
         try:
             t_lang = await get_user_lang(int(teacher_chat_id))
-            await callback.bot.send_message(
+            await bot.send_message(
                 chat_id=int(teacher_chat_id),
                 text=_lt(
                     "teacher_reassigned_notify",
@@ -4222,15 +4272,16 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
             pass
 
     await _notify_upfront_cycle_payment(
-        callback.bot, sheets, group_name, cycle_info
+        bot, sheets, group_name, cycle_info
     )
 
-    bot_me = await callback.bot.get_me()
+    bot_me = await bot.get_me()
     join_link = f"https://t.me/{bot_me.username}?start=join_{_make_join_slug(group_name)}"
-    await state.clear()
-    if callback.message:
-        await callback.message.edit_text(
-            _lt(
+    return {
+        "ok": True,
+        "group_name": group_name,
+        "join_link": join_link,
+        "text": _lt(
                 "add_group_success",
                 lang,
                 group=html.escape(group_name),
@@ -4248,8 +4299,34 @@ async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> No
                 if monthly_fee > 0
                 else ""
             ),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+    }
+
+
+@router.callback_query(GroupAddStates.confirming, F.data == "grp_add:confirm")
+async def cb_add_group_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    lang = await get_user_lang(user_id)
+    if not await _is_admin(user_id):
+        await state.clear()
+        await callback.answer(_lt("no_permission", lang), show_alert=True)
+        return
+    data = await state.get_data()
+    if not {"group_name", "lesson_count", "selected_days", "lesson_time"}.issubset(
+        data.keys()
+    ):
+        await state.clear()
+        if callback.message:
+            await callback.message.edit_text(
+                t("error_generic", lang), parse_mode="HTML"
+            )
+        await callback.answer()
+        return
+
+    result = await create_group_from_data(callback.bot, user_id, lang, data)
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            result["text"], parse_mode="HTML", disable_web_page_preview=True
         )
     await callback.answer()
 
