@@ -752,6 +752,10 @@ AUDIT_STUDENT_RESTORED = "▶️ Darsga tiklandi"
 AUDIT_GROUP_DELETED = "🗑 Guruh o'chirildi"
 AUDIT_GROUP_EDITED = "✏️ Guruh tahrirlandi"
 AUDIT_TEACHER_DELETED = "🗑 Ustoz o'chirildi"
+AUDIT_LEGACY_DEBT = "📜 Avvalgi qarz"
+AUDIT_ATTENDANCE_CLEARED = "🧹 Yo'qlama tozalandi"
+AUDIT_LEAD_DELETED = "🗑 Lid o'chirildi"
+AUDIT_TOPIC_DELETED = "🗑 Dars mavzusi o'chirildi"
 
 
 async def resolve_audit_actor(
@@ -3318,6 +3322,38 @@ async def set_legacy_debt_paid(debt_id: int, paid: bool = True) -> bool:
             "UPDATE legacy_debts SET is_paid = ?, paid_at = ? WHERE id = ?;",
             (1 if paid else 0, paid_at, int(debt_id)),
         )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def update_legacy_debt(debt_id: int, **fields: Any) -> bool:
+    """Edits cycle_label / lesson_dates / months / amount / note of a legacy debt."""
+    allowed = {"cycle_label", "lesson_dates", "months", "amount", "note"}
+    clean = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not clean:
+        return False
+    if "months" in clean:
+        clean["months"] = max(1, int(clean["months"]))
+    if "amount" in clean:
+        clean["amount"] = max(0, int(clean["amount"]))
+    assignments = ", ".join(f"{k} = ?" for k in clean)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"UPDATE legacy_debts SET {assignments} WHERE id = ?;",
+            (*clean.values(), int(debt_id)),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_lead(lead_id: int) -> bool:
+    """Removes a lead (and its admin message copies) from SQLite."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("DELETE FROM lead_admin_messages WHERE lead_id = ?;", (int(lead_id),))
+        except Exception:
+            pass
+        cursor = await db.execute("DELETE FROM leads WHERE id = ?;", (int(lead_id),))
         await db.commit()
         return cursor.rowcount > 0
 

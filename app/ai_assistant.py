@@ -25,7 +25,13 @@ from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
 from app import database
-from app.config import ADMIN_IDS, AI_ENABLED, GEMINI_API_KEY, GEMINI_MODEL
+from app.config import (
+    ADMIN_IDS,
+    AI_ENABLED,
+    GEMINI_API_KEY,
+    GEMINI_FALLBACK_MODEL,
+    GEMINI_PRIMARY_MODEL,
+)
 from app.database import (
     AUDIT_GROUP_EDITED,
     AUDIT_STUDENT_RESTORED,
@@ -64,7 +70,11 @@ TEMPERATURE = 0.2
 MEMORY_TURNS = 4
 MEMORY_TTL_SECONDS = 600
 DRAFT_TTL_MINUTES = 10
-MAX_TOOL_ROUNDS = 4
+# Chained commands ("hamma keldi faqat Ali kelmadi, keyin Aliga qarz qo'sh...")
+# may need several tool calls in sequence within one user turn.
+MAX_TOOL_ROUNDS = 6
+# Errors on the primary model that trigger an immediate retry on the fallback.
+FALLBACK_STATUS_CODES = {429, 503, 404}
 MAX_VOICE_BYTES = 15 * 1024 * 1024
 TOOL_RESULT_CHAR_LIMIT = 6000
 
@@ -119,6 +129,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "done_group_delete": "🗑 <b>{group}</b> guruhi o‘chirildi (talabalar Zahira guruhiga o‘tkazildi).",
         "done_teacher_invite": "🔗 Ustoz taklif havolasi ({group}):\n<code>{link}</code>",
         "link_group_hint": "👥 Telegram guruhini ulash uchun guruh chatida yuboring:\n<code>/link_group {group}</code>",
+        "done_attendance_clear": "🧹 <b>{group}</b> — {date} yo‘qlamasi tozalandi. O‘tilgan darslar: {count}.",
+        "done_topic_delete": "🗑 <b>{group}</b> — {date} dars mavzusi o‘chirildi.",
+        "done_legacy_add": "📜 <b>{student}</b> uchun avvalgi qarz qo‘shildi: <b>{amount} so'm</b>.",
+        "done_legacy_edit": "📜 Avvalgi qarz #{debt_id} yangilandi.",
+        "done_legacy_delete": "🗑 Avvalgi qarz #{debt_id} o‘chirildi.",
+        "done_lead_delete": "🗑 Lid #{lead_id} ({name}) o‘chirildi.",
         "lbl_group": "📚 Guruh",
         "lbl_student": "👤 Talaba",
         "lbl_cycle": "🗓 Sikl",
@@ -171,6 +187,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "done_group_delete": "🗑 <b>{group}</b> гуруҳи ўчирилди (талабалар Захира гуруҳига ўтказилди).",
         "done_teacher_invite": "🔗 Устоз таклиф ҳаволаси ({group}):\n<code>{link}</code>",
         "link_group_hint": "👥 Telegram гуруҳини улаш учун гуруҳ чатида юборинг:\n<code>/link_group {group}</code>",
+        "done_attendance_clear": "🧹 <b>{group}</b> — {date} йўқламаси тозаланди. Ўтилган дарслар: {count}.",
+        "done_topic_delete": "🗑 <b>{group}</b> — {date} дарс мавзуси ўчирилди.",
+        "done_legacy_add": "📜 <b>{student}</b> учун аввалги қарз қўшилди: <b>{amount} so'm</b>.",
+        "done_legacy_edit": "📜 Аввалги қарз #{debt_id} янгиланди.",
+        "done_legacy_delete": "🗑 Аввалги қарз #{debt_id} ўчирилди.",
+        "done_lead_delete": "🗑 Лид #{lead_id} ({name}) ўчирилди.",
         "lbl_group": "📚 Гуруҳ",
         "lbl_student": "👤 Талаба",
         "lbl_cycle": "🗓 Цикл",
@@ -1535,6 +1557,217 @@ async def tool_prepare_teacher_delete(ctx: ToolContext, teacher: str = "") -> di
     )
 
 
+# ----------------------------------------------------------------------
+# Full CRUD additions: attendance clear, topic delete, legacy debts, lead delete
+# ----------------------------------------------------------------------
+
+
+async def tool_prepare_attendance_clear(
+    ctx: ToolContext, group: str = "", date: str = "bugun", session: int = 0
+) -> dict[str, Any]:
+    """Draft: wipe a mistakenly logged lesson (today or past) back to unlogged."""
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    lesson_day = _parse_lesson_date(date or "bugun")
+    if lesson_day is None:
+        return {"error": "invalid_date"}
+    if lesson_day > today_tashkent():
+        return {"error": "future_date_not_allowed"}
+    return await _make_draft(
+        ctx,
+        "attendance_clear",
+        {
+            "group": grp["Guruh_Nomi"],
+            "date": lesson_day.isoformat(),
+            "date_dmy": lesson_day.strftime("%d.%m.%Y"),
+            "session": int(session or 0) or None,
+        },
+    )
+
+
+async def tool_prepare_topic_delete(ctx: ToolContext, group: str = "", date: str = "") -> dict[str, Any]:
+    grp, err = await _match_group(ctx, group)
+    if not grp:
+        return err
+    lesson_day = _parse_lesson_date(date or "bugun")
+    if lesson_day is None:
+        return {"error": "invalid_date"}
+    existing = await database.get_lesson_topic(grp["Guruh_Nomi"], lesson_day.strftime("%d.%m"))
+    if not existing:
+        return {"error": "topic_not_found_for_date"}
+    return await _make_draft(
+        ctx,
+        "topic_delete",
+        {
+            "group": grp["Guruh_Nomi"],
+            "date": lesson_day.strftime("%d.%m"),
+            "date_full": lesson_day.strftime("%d.%m.%Y"),
+            "topic": str(existing.get("topic") or ""),
+        },
+    )
+
+
+async def tool_list_legacy_debts(ctx: ToolContext, student: str = "") -> dict[str, Any]:
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    rows = await database.get_legacy_debts(str(stu["Talaba_ID"]))
+    return {
+        "student": stu.get("F.I.O."),
+        "legacy_debts": [
+            {
+                "debt_id": r.get("id"),
+                "label": r.get("cycle_label"),
+                "dates": r.get("lesson_dates"),
+                "months": r.get("months"),
+                "amount_uzs": r.get("amount"),
+                "paid": bool(r.get("is_paid")),
+            }
+            for r in rows
+        ],
+    }
+
+
+async def tool_prepare_legacy_debt_add(
+    ctx: ToolContext,
+    student: str = "",
+    amount: str = "",
+    months: int = 1,
+    label: str = "",
+    dates: str = "",
+) -> dict[str, Any]:
+    stu, err = await _match_student(ctx, student)
+    if not stu:
+        return err
+    digits = re.sub(r"\D", "", str(amount or ""))
+    if not digits or int(digits) <= 0:
+        return {"error": "amount_required"}
+    value = int(digits)
+    if value < 10000:
+        value *= 1000
+    group_name = str(stu.get("Guruh") or "").strip()
+    if group_name.lower() == RESERVE_GROUP_NAME.lower() and stu.get("Sobiq_Guruh"):
+        group_name = str(stu.get("Sobiq_Guruh"))
+    return await _make_draft(
+        ctx,
+        "legacy_add",
+        {
+            "student_id": str(stu["Talaba_ID"]),
+            "student_name": str(stu.get("F.I.O.") or ""),
+            "group": group_name,
+            "label": (label or "Avvalgi qarz").strip()[:120],
+            "dates": str(dates or "").strip()[:300],
+            "months": max(1, int(months or 1)),
+            "amount": value,
+        },
+    )
+
+
+async def _legacy_row_for_ctx(ctx: ToolContext, debt_id: Any) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    try:
+        row = await database.get_legacy_debt(int(str(debt_id).lstrip("#")))
+    except (TypeError, ValueError):
+        row = None
+    if not row:
+        return None, {"error": "legacy_debt_not_found", "hint": "use list_legacy_debts first"}
+    return row, {}
+
+
+async def tool_prepare_legacy_debt_edit(
+    ctx: ToolContext,
+    debt_id: str = "",
+    amount: str = "",
+    months: int = 0,
+    label: str = "",
+    dates: str = "",
+) -> dict[str, Any]:
+    row, err = await _legacy_row_for_ctx(ctx, debt_id)
+    if not row:
+        return err
+    changes: dict[str, Any] = {}
+    if amount:
+        digits = re.sub(r"\D", "", str(amount))
+        if not digits:
+            return {"error": "invalid_amount"}
+        value = int(digits)
+        changes["amount"] = value * 1000 if value < 10000 else value
+    if months:
+        changes["months"] = max(1, int(months))
+    if label:
+        changes["cycle_label"] = label.strip()[:120]
+    if dates:
+        changes["lesson_dates"] = dates.strip()[:300]
+    if not changes:
+        return {"error": "nothing_changes"}
+    return await _make_draft(
+        ctx,
+        "legacy_edit",
+        {
+            "debt_id": int(row["id"]),
+            "student_id": str(row.get("student_id") or ""),
+            "student_name": str(row.get("student_name") or ""),
+            "old": {
+                "amount": row.get("amount"),
+                "months": row.get("months"),
+                "cycle_label": row.get("cycle_label"),
+                "lesson_dates": row.get("lesson_dates"),
+            },
+            "changes": changes,
+        },
+    )
+
+
+async def tool_prepare_legacy_debt_delete(ctx: ToolContext, debt_id: str = "") -> dict[str, Any]:
+    row, err = await _legacy_row_for_ctx(ctx, debt_id)
+    if not row:
+        return err
+    return await _make_draft(
+        ctx,
+        "legacy_delete",
+        {
+            "debt_id": int(row["id"]),
+            "student_id": str(row.get("student_id") or ""),
+            "student_name": str(row.get("student_name") or ""),
+            "label": str(row.get("cycle_label") or ""),
+            "amount": int(row.get("amount") or 0),
+        },
+    )
+
+
+async def tool_prepare_lead_delete(ctx: ToolContext, lead: str = "") -> dict[str, Any]:
+    query = str(lead or "").strip().lstrip("#")
+    row = await get_lead(int(query)) if query.isdigit() and len(query) < 7 else None
+    if row is None:
+        q = _norm(query)
+        q_digits = re.sub(r"\D", "", query)
+        hits = [
+            r
+            for r in await get_recent_leads(200)
+            if (q and q in _norm(r.get("full_name")))
+            or (len(q_digits) >= 7 and q_digits[-9:] in re.sub(r"\D", "", str(r.get("phone") or "")))
+        ]
+        if len(hits) > 1:
+            return {
+                "error": "ambiguous_lead",
+                "candidates": [f"#{r['id']} {r.get('full_name')} {r.get('phone')}" for r in hits[:6]],
+            }
+        row = hits[0] if hits else None
+    if not row:
+        return {"error": "lead_not_found"}
+    return await _make_draft(
+        ctx,
+        "lead_delete",
+        {
+            "lead_id": int(row["id"]),
+            "name": row.get("full_name"),
+            "phone": row.get("phone"),
+            "course": row.get("course_name"),
+            "telegram_id": row.get("telegram_id"),
+        },
+    )
+
+
 ToolFn = Callable[..., Awaitable[dict[str, Any]]]
 
 _BOTH = {"admin", "teacher"}
@@ -1583,6 +1816,8 @@ TOOLS: dict[str, tuple[set[str], str, dict[str, Any], ToolFn]] = {
     "prepare_student_status": (_BOTH, "DRAFT: action 'to_zaxira' (O'qimayapti) or 'restore' (O'qiyapti, target_group default former group).", _schema({"student": _S, "action": {"type": "string", "enum": ["to_zaxira", "restore"]}, "target_group": _S}, ["student", "action"]), tool_prepare_student_status),
     "prepare_student_edit": (_BOTH, "DRAFT editing one student field: F.I.O., Talaba_Tel, Talaba_TG, Otasi_FIO, Otasi_Tel, Onasi_FIO, Onasi_Tel.", _schema({"student": _S, "field": _S, "value": _S}, ["student", "field", "value"]), tool_prepare_student_edit),
     "prepare_device_link": (_BOTH, "DRAFT generating the device-binding link (?start=stu_<ID>) for a student without the bot; optional phone.", _schema({"student": _S, "phone": _S}, ["student"]), tool_prepare_device_link),
+    "prepare_attendance_clear": (_BOTH, "DRAFT clearing (deleting) a mistakenly entered attendance of today or a past lesson date back to unlogged (counter -1 if it was logged).", _schema({"group": _S, "date": _S, "session": _I}, ["group"]), tool_prepare_attendance_clear),
+    "prepare_topic_delete": (_BOTH, "DRAFT deleting a saved lesson topic of a date (to EDIT a topic just call prepare_lesson_topic again).", _schema({"group": _S, "date": _S}, ["group", "date"]), tool_prepare_topic_delete),
     "prepare_student_transfer": (_BOTH, "DRAFT moving a student to another group; keep_in_old_group=true keeps them in both groups.", _schema({"student": _S, "target_group": _S, "keep_in_old_group": _B}, ["student", "target_group"]), tool_prepare_student_transfer),
     # ---------------- admin only
     "list_leads": (_ADMIN, "Leads (Qiziquvchilar_Lidlar). only_new=true hides contacted ones.", _schema({"only_new": _B, "limit": _I}), tool_list_leads),
@@ -1603,6 +1838,11 @@ TOOLS: dict[str, tuple[set[str], str, dict[str, Any], ToolFn]] = {
     "prepare_teacher_assign": (_ADMIN, "DRAFT assigning an existing teacher to a group.", _schema({"teacher": _S, "group": _S}, ["teacher", "group"]), tool_prepare_teacher_assign),
     "prepare_teacher_delete": (_ADMIN, "DRAFT permanently deleting a teacher.", _schema({"teacher": _S}, ["teacher"]), tool_prepare_teacher_delete),
     "prepare_student_delete": (_ADMIN, "DRAFT permanently deleting a student (Sheets + SQLite purge incl. orphaned parents).", _schema({"student": _S}, ["student"]), tool_prepare_student_delete),
+    "list_legacy_debts": (_ADMIN, "A student's pre-system (legacy) debts with debt_id, label, months, amount.", _schema({"student": _S}, ["student"]), tool_list_legacy_debts),
+    "prepare_legacy_debt_add": (_ADMIN, "DRAFT adding a pre-system unpaid debt (amount UZS, months, label e.g. 'Sentyabr-Oktyabr 2026', optional lesson dates).", _schema({"student": _S, "amount": _S, "months": _I, "label": _S, "dates": _S}, ["student", "amount"]), tool_prepare_legacy_debt_add),
+    "prepare_legacy_debt_edit": (_ADMIN, "DRAFT editing a legacy debt by debt_id (only the fields that change).", _schema({"debt_id": _S, "amount": _S, "months": _I, "label": _S, "dates": _S}, ["debt_id"]), tool_prepare_legacy_debt_edit),
+    "prepare_legacy_debt_delete": (_ADMIN, "DRAFT permanently deleting a legacy debt by debt_id.", _schema({"debt_id": _S}, ["debt_id"]), tool_prepare_legacy_debt_delete),
+    "prepare_lead_delete": (_ADMIN, "DRAFT deleting a spam/invalid lead (row in Qiziquvchilar_Lidlar + SQLite).", _schema({"lead": _S}, ["lead"]), tool_prepare_lead_delete),
     "prepare_lead_contacted": (_ADMIN, "DRAFT marking a lead as \"Bog'lanildi\" (lead id, name or phone).", _schema({"lead": _S}, ["lead"]), tool_prepare_lead_contacted),
 }
 
@@ -1627,7 +1867,12 @@ async def dispatch_tool(ctx: ToolContext, name: str, args: dict[str, Any]) -> di
 # ----------------------------------------------------------------------
 
 _client: Any = None
-_thinking_supported = True
+# model name -> whether it accepted thinking_config (learned at runtime)
+_thinking_supported: dict[str, bool] = {}
+
+
+class BothModelsRateLimited(Exception):
+    """Primary AND fallback answered 429 — only then the user sees 'band'."""
 
 
 def _get_client() -> Any:
@@ -1670,6 +1915,9 @@ def _system_prompt(ctx: ToolContext) -> str:
         "5. Lesson day abbreviations: Du, Se, Chor, Pay, Ju, Shan, Yak.\n"
         "6. Attendance: 'hamma keldi' = absent []; 'faqat X kelmadi' = absent [X]; "
         "'bugun' = today, 'kecha' = yesterday. Never use a future date.\n"
+        "8. Compound commands: call several tools in one turn, one per action, in the "
+        "order spoken (e.g. attendance, then legacy debt, then topic). Each prepare_* "
+        "makes its own card.\n"
         "7. You can do everything the user's role can do with the bot's buttons: read "
         "data with the list/details tools and prepare changes with prepare_* tools. "
         "If a needed detail is missing (e.g. which group), ask one short question."
@@ -1699,7 +1947,11 @@ def _response_text(resp: Any) -> str:
 
 
 async def _generate(contents: list[Any], ctx: ToolContext) -> Any:
-    global _thinking_supported
+    """
+    One generate_content call with primary -> fallback routing. Used for the
+    first call AND every round of the chained tool loop, so a mid-chain 429 on
+    the primary continues on the fallback with the same history and tools.
+    """
     from google.genai import errors, types
 
     def _config(with_thinking: bool) -> Any:
@@ -1717,19 +1969,46 @@ async def _generate(contents: list[Any], ctx: ToolContext) -> Any:
         return types.GenerateContentConfig(**kwargs)
 
     client = _get_client()
-    async with _get_semaphore():
+
+    async def _call(model: str) -> Any:
+        use_thinking = _thinking_supported.get(model, True)
         try:
             return await client.aio.models.generate_content(
-                model=GEMINI_MODEL, contents=contents, config=_config(_thinking_supported)
+                model=model, contents=contents, config=_config(use_thinking)
             )
         except errors.ClientError as exc:
-            if _thinking_supported and int(getattr(exc, "code", 0) or 0) == 400 and "think" in str(exc).lower():
-                # Model does not accept a thinking level: retry without it.
-                _thinking_supported = False
+            if (
+                use_thinking
+                and int(getattr(exc, "code", 0) or 0) == 400
+                and "think" in str(exc).lower()
+            ):
+                # This model does not accept a thinking level: retry without it.
+                _thinking_supported[model] = False
                 return await client.aio.models.generate_content(
-                    model=GEMINI_MODEL, contents=contents, config=_config(False)
+                    model=model, contents=contents, config=_config(False)
                 )
             raise
+
+    async with _get_semaphore():
+        try:
+            return await _call(GEMINI_PRIMARY_MODEL)
+        except errors.APIError as exc:
+            code = int(getattr(exc, "code", 0) or 0)
+            if code not in FALLBACK_STATUS_CODES or GEMINI_FALLBACK_MODEL == GEMINI_PRIMARY_MODEL:
+                raise
+            logger.warning(
+                "Primary model %s unavailable (%s), switching to fallback %s",
+                GEMINI_PRIMARY_MODEL,
+                code,
+                GEMINI_FALLBACK_MODEL,
+            )
+            try:
+                return await _call(GEMINI_FALLBACK_MODEL)
+            except errors.APIError as fb_exc:
+                fb_code = int(getattr(fb_exc, "code", 0) or 0)
+                if code == 429 and fb_code == 429:
+                    raise BothModelsRateLimited() from fb_exc
+                raise
 
 
 class AiReply:
@@ -1793,10 +2072,14 @@ async def ask(
                     types.Part.from_function_response(name=str(call.name or ""), response={"result": result})
                 )
             contents.append(types.Content(role="user", parts=response_parts))
+    except BothModelsRateLimited:
+        logger.warning("Gemini: both %s and %s are rate-limited (429) for user %s",
+                       GEMINI_PRIMARY_MODEL, GEMINI_FALLBACK_MODEL, user_id)
+        return AiReply(tr("api_busy", lang), ctx.drafts, lang)
     except errors.APIError as exc:
         code = int(getattr(exc, "code", 0) or 0)
         logger.warning("Gemini API error %s for user %s: %s", code, user_id, str(exc)[:300])
-        return AiReply(tr("api_busy" if code in {429, 503} else "api_error", lang), ctx.drafts, lang)
+        return AiReply(tr("api_error", lang), ctx.drafts, lang)
     except Exception:
         logger.exception("Gemini call failed for user %s", user_id)
         return AiReply(tr("api_error", lang), ctx.drafts, lang)
@@ -1832,6 +2115,12 @@ _CARD_TITLES: dict[str, tuple[str, str]] = {
     "teacher_invite": ("🔗 <b>Ustoz taklif havolasi</b>", "🔗 <b>Устоз таклиф ҳаволаси</b>"),
     "teacher_assign": ("👨‍🏫 <b>Ustozni guruhga biriktirish</b>", "👨‍🏫 <b>Устозни гуруҳга бириктириш</b>"),
     "teacher_delete": ("🗑 <b>Ustozni o‘chirish</b>", "🗑 <b>Устозни ўчириш</b>"),
+    "attendance_clear": ("🧹 <b>Yo‘qlamani tozalash</b>", "🧹 <b>Йўқламани тозалаш</b>"),
+    "topic_delete": ("🗑 <b>Dars mavzusini o‘chirish</b>", "🗑 <b>Дарс мавзусини ўчириш</b>"),
+    "legacy_add": ("📜 <b>Avvalgi qarz qo‘shish</b>", "📜 <b>Аввалги қарз қўшиш</b>"),
+    "legacy_edit": ("📜 <b>Avvalgi qarzni tahrirlash</b>", "📜 <b>Аввалги қарзни таҳрирлаш</b>"),
+    "legacy_delete": ("🗑 <b>Avvalgi qarzni o‘chirish</b>", "🗑 <b>Аввалги қарзни ўчириш</b>"),
+    "lead_delete": ("🗑 <b>Lidni o‘chirish</b>", "🗑 <b>Лидни ўчириш</b>"),
 }
 
 
@@ -1963,6 +2252,44 @@ def render_draft_card(action: str, payload: dict[str, Any], lang: str) -> str:
         ]
     elif action == "teacher_invite":
         lines.append(group_line)
+    elif action == "attendance_clear":
+        session = payload.get("session")
+        lines += [
+            group_line,
+            f"{tr('lbl_date', lang)}: <b>{esc(payload['date_dmy'])}</b>"
+            + (f" — <b>{int(session)}-dars</b>" if session else ""),
+            "⚠️ Barcha ✅/❌ belgilar o‘chadi, katakchalar oq rangga qaytadi."
+            if not cy
+            else "⚠️ Барча ✅/❌ белгилар ўчади, катакчалар оқ рангга қайтади.",
+        ]
+    elif action == "topic_delete":
+        lines += [
+            group_line,
+            f"{tr('lbl_date', lang)}: <b>{esc(payload['date_full'])}</b>",
+            f"{tr('lbl_topic', lang)}: <s>{esc(payload.get('topic') or '')}</s>",
+        ]
+    elif action == "legacy_add":
+        lines += [
+            student_line,
+            f"🏷 <b>{esc(payload['label'])}</b>" + (f" ({esc(payload['dates'])})" if payload.get("dates") else ""),
+            f"{tr('lbl_amount', lang)}: <b>{_fmt_money(payload['amount'])} so'm</b> | {int(payload['months'])} oy",
+        ]
+    elif action == "legacy_edit":
+        old, ch = payload["old"], payload["changes"]
+        lines.append(student_line + f" | #{payload['debt_id']}")
+        for key, label in (("amount", "💰"), ("months", "🗓"), ("cycle_label", "🏷"), ("lesson_dates", "📅")):
+            if key in ch:
+                lines.append(f"{label} {esc(str(old.get(key) or '—'))} ➡️ <b>{esc(str(ch[key]))}</b>")
+    elif action == "legacy_delete":
+        lines += [
+            student_line + f" | #{payload['debt_id']}",
+            f"🏷 {esc(payload.get('label') or '')} — <s>{_fmt_money(payload.get('amount'))} so'm</s>",
+        ]
+    elif action == "lead_delete":
+        lines += [
+            f"{tr('lbl_lead', lang)}: <b>#{payload['lead_id']} {esc(str(payload.get('name') or ''))}</b>",
+            f"📱 {esc(str(payload.get('phone') or '—'))} | 📚 {esc(str(payload.get('course') or '—'))}",
+        ]
     elif action in {"teacher_assign", "teacher_delete"}:
         lines.append(f"👨‍🏫 <b>{esc(str(payload.get('teacher_name') or ''))}</b> ({esc(str(payload.get('teacher_id') or ''))})")
         if action == "teacher_assign":
@@ -1990,6 +2317,12 @@ _ACTION_ROLES: dict[str, set[str]] = {
     "teacher_invite": _ADMIN,
     "teacher_assign": _ADMIN,
     "teacher_delete": _ADMIN,
+    "attendance_clear": _BOTH,
+    "topic_delete": _BOTH,
+    "legacy_add": _ADMIN,
+    "legacy_edit": _ADMIN,
+    "legacy_delete": _ADMIN,
+    "lead_delete": _ADMIN,
 }
 
 _STUDENT_ACTIONS = {
@@ -2038,6 +2371,22 @@ async def _run_schedule_change(
 
 
 async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[str, Any], lang: str) -> str:
+    """
+    Runs the confirmed draft through the existing helpers and then drops every
+    in-memory Sheets read cache, so the next question sees the change at once.
+    """
+    try:
+        return await _execute_draft_inner(bot, actor_id, actor_name, draft, lang)
+    finally:
+        try:
+            get_sheets_manager().invalidate_all_caches()
+        except Exception:
+            logger.exception("Cache invalidation after AI draft failed")
+
+
+async def _execute_draft_inner(
+    bot: Any, actor_id: int, actor_name: str, draft: dict[str, Any], lang: str
+) -> str:
     """Runs the confirmed draft through the existing helpers. Returns HTML text."""
     action = str(draft.get("action") or "")
     payload = dict(draft.get("payload") or {})
@@ -2341,5 +2690,112 @@ async def execute_draft(bot: Any, actor_id: int, actor_name: str, draft: dict[st
         from app.handlers.groups_info import execute_teacher_delete
 
         return await execute_teacher_delete(bot, actor_id, actor_name, lang, str(payload["teacher_id"]))
+
+    if action == "attendance_clear":
+        lesson_day = date.fromisoformat(str(payload["date"]))
+        result = await asyncio.to_thread(
+            sheets.clear_attendance_for_date, group_name, lesson_day, payload.get("session")
+        )
+        if not result.get("ok"):
+            return tr("exec_failed", lang, reason=esc(str(result.get("reason") or "")))
+        await database.upsert_group_counter(group_name, lesson_count=int(result["lesson_count"]))
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_ATTENDANCE_CLEARED,
+            target=f"{group_name} | {payload['date_dmy']}",
+            details=f"Guruh: {group_name}; Sana: {payload['date_dmy']}; "
+            f"Hisoblagich: {result['lesson_count']}",
+            actor_name=actor_name,
+        )
+        return tr(
+            "done_attendance_clear",
+            lang,
+            group=esc(group_name),
+            date=esc(payload["date_dmy"]),
+            count=int(result["lesson_count"]),
+        )
+
+    if action == "topic_delete":
+        deleted = await database.delete_lesson_topic(group_name, str(payload["date"]))
+        if not deleted:
+            return tr("exec_failed", lang, reason="topic_not_found")
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_TOPIC_DELETED,
+            target=f"{group_name} | {payload['date_full']}",
+            details=f"Mavzu: {payload.get('topic') or ''}",
+            actor_name=actor_name,
+        )
+        return tr("done_topic_delete", lang, group=esc(group_name), date=esc(payload["date_full"]))
+
+    if action == "legacy_add":
+        row = await database.add_legacy_debt(
+            student_id=str(payload["student_id"]),
+            cycle_label=str(payload["label"]),
+            amount=int(payload["amount"]),
+            months=int(payload["months"]),
+            lesson_dates=str(payload.get("dates") or ""),
+            student_name=str(payload.get("student_name") or ""),
+            group_name=group_name,
+            created_by=actor_id,
+        )
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_LEGACY_DEBT,
+            target=f"{payload['student_name']} ({payload['student_id']})",
+            amount=int(payload["amount"]),
+            details=f"Qo'shildi #{(row or {}).get('id')}: {payload['label']}; {payload['months']} oy",
+            actor_name=actor_name,
+        )
+        return tr(
+            "done_legacy_add",
+            lang,
+            student=esc(str(payload["student_name"])),
+            amount=_fmt_money(payload["amount"]),
+        )
+
+    if action == "legacy_edit":
+        ok = await database.update_legacy_debt(int(payload["debt_id"]), **payload["changes"])
+        if not ok:
+            return tr("exec_failed", lang, reason="legacy_debt_not_found")
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_LEGACY_DEBT,
+            target=f"{payload['student_name']} ({payload['student_id']})",
+            details=f"Tahrirlandi #{payload['debt_id']}: "
+            + "; ".join(f"{k}: {payload['old'].get(k)} → {v}" for k, v in payload["changes"].items()),
+            actor_name=actor_name,
+        )
+        return tr("done_legacy_edit", lang, debt_id=int(payload["debt_id"]))
+
+    if action == "legacy_delete":
+        ok = await database.delete_legacy_debt(int(payload["debt_id"]))
+        if not ok:
+            return tr("exec_failed", lang, reason="legacy_debt_not_found")
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_LEGACY_DEBT,
+            target=f"{payload['student_name']} ({payload['student_id']})",
+            amount=int(payload.get("amount") or 0),
+            details=f"O'chirildi #{payload['debt_id']}: {payload.get('label') or ''}",
+            actor_name=actor_name,
+        )
+        return tr("done_legacy_delete", lang, debt_id=int(payload["debt_id"]))
+
+    if action == "lead_delete":
+        lead_id = int(payload["lead_id"])
+        try:
+            await asyncio.to_thread(sheets.delete_lead_row, f"{lead_id}", payload.get("telegram_id"))
+        except Exception:
+            logger.exception("AI: could not delete lead #%s row from Qiziquvchilar_Lidlar", lead_id)
+        await database.delete_lead(lead_id)
+        await log_audit_event(
+            actor_id=actor_id,
+            action=database.AUDIT_LEAD_DELETED,
+            target=f"#{lead_id} {payload.get('name') or ''}",
+            details=f"Tel: {payload.get('phone') or ''}; Kurs: {payload.get('course') or ''}",
+            actor_name=actor_name,
+        )
+        return tr("done_lead_delete", lang, lead_id=lead_id, name=esc(str(payload.get("name") or "")))
 
     return tr("draft_not_found", lang)

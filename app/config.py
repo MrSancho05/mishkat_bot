@@ -52,7 +52,19 @@ if MAIN_ADMIN_ID is not None and MAIN_ADMIN_ID not in ADMIN_IDS:
 # Without GEMINI_API_KEY the assistant is simply OFF: no client is created,
 # nothing is sent to Google and every existing menu keeps working unchanged.
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
+# Primary model (GEMINI_PRIMARY_MODEL, else a legacy GEMINI_MODEL, else
+# gemini-3.5-flash). When it is rate-limited / unavailable / unknown (429, 503,
+# 404) the SAME request is retried immediately on the fallback model.
+GEMINI_PRIMARY_MODEL: str = (
+    os.getenv("GEMINI_PRIMARY_MODEL", "").strip()
+    or os.getenv("GEMINI_MODEL", "").strip()
+    or "gemini-3.5-flash"
+)
+GEMINI_FALLBACK_MODEL: str = (
+    os.getenv("GEMINI_FALLBACK_MODEL", "").strip() or "gemini-3.5-flash-lite"
+)
+# Backwards-compatible alias (older code / logs refer to GEMINI_MODEL).
+GEMINI_MODEL: str = GEMINI_PRIMARY_MODEL
 AI_ENABLED: bool = bool(GEMINI_API_KEY)
 
 
