@@ -823,6 +823,19 @@ class SheetsManager:
     def _invalidate_groups_cache(self) -> None:
         self._groups_cache = None
 
+    def invalidate_all_caches(self) -> None:
+        """
+        Drops every in-memory read cache (students, groups, cycle snapshots,
+        tab list, header cache) so the next read after a write/edit/delete
+        reflects Google Sheets exactly.
+        """
+        with self._lock:
+            self._students_cache = None
+            self._groups_cache = None
+            self._cycle_snapshot_cache.clear()
+            self._tab_list_cache = None
+            self._ws_cache.clear()
+
     def _execute_with_retry(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         backoff_delays = (2.0, 4.0, 8.0, 15.0)
         attempt = 0
@@ -2516,6 +2529,83 @@ class SheetsManager:
                 if status == "contacted":
                     break
             return found
+
+    def delete_lead_row(self, lead_id: Any, chat_id: Any = None) -> bool:
+        """Removes a spam / invalid lead's row from Qiziquvchilar_Lidlar."""
+        with self._lock:
+            ws, headers = self._lead_ws()
+            row_1 = self._find_lead_row(ws, headers, lead_id, chat_id)
+            if row_1 <= 1:
+                _sheets_logger.warning(
+                    "Lead %s / chat %s not found in %s (delete)", lead_id, chat_id, LEAD_SHEET_NAME
+                )
+                return False
+            self._retry_sheets_op(ws.delete_rows, row_1)
+            self._ws_cache.pop(ws.title, None)
+            return True
+
+    def clear_attendance_for_date(
+        self,
+        group_name: str,
+        target_date: date,
+        session: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """
+        Undo a mistakenly entered attendance: empties every student's ✅/❌ in the
+        lesson column, paints the header + cells white (#FFFFFF = not logged)
+        and, when the column WAS logged, decrements Otilgan_Dars_Hisoblagich by 1.
+        Returns {"ok", "was_marked", "lesson_count", "cycle_title"}.
+        """
+        with self._lock:
+            date_str = target_date.strftime("%d.%m")
+            found = self._find_cycle_for_date_str(
+                group_name, date_str, None, session=session
+            )
+            if not found:
+                return {"ok": False, "reason": "date_not_in_cycle"}
+            ws, cycle, col_idx = found
+            marked_cols, _cancelled = self._get_cycle_colored_columns(ws, cycle)
+            had_marks = any(
+                _is_recorded_mark(s_row["marks"].get(col_idx, ""))
+                for s_row in cycle["student_rows"]
+            )
+            was_marked = had_marks or col_idx in marked_cols
+            updates = [
+                {"range": f"{_col_letter(col_idx)}{s_row['row_idx'] + 1}", "values": [[""]]}
+                for s_row in cycle["student_rows"]
+            ]
+            if updates:
+                self._retry_sheets_op(
+                    ws.batch_update, updates, value_input_option="USER_ENTERED"
+                )
+            header_row_0 = cycle["header_row_idx"]
+            last_row_0 = cycle["last_row_idx"]
+            requests = [
+                _cell_bg_request(
+                    ws.id, header_row_0, header_row_0 + 1, col_idx, col_idx + 1,
+                    WHITE_BG, bold=True, h_align="CENTER",
+                )
+            ]
+            if last_row_0 > header_row_0:
+                requests.append(
+                    _cell_bg_request(
+                        ws.id, header_row_0 + 1, last_row_0 + 1, col_idx, col_idx + 1,
+                        WHITE_BG, h_align="CENTER",
+                    )
+                )
+            self._retry_sheets_op(self._get_spreadsheet().batch_update, {"requests": requests})
+            group = self.get_group(group_name) or {}
+            lesson_count = int(group.get("Otilgan_Dars_Hisoblagich") or 0)
+            if was_marked and lesson_count > 0:
+                lesson_count -= 1
+                self.update_group(group_name, {"Otilgan_Dars_Hisoblagich": str(lesson_count)})
+            self._cycle_snapshot_cache.clear()
+            return {
+                "ok": True,
+                "was_marked": was_marked,
+                "lesson_count": lesson_count,
+                "cycle_title": cycle["title"],
+            }
 
     def mark_lead_contacted(self, lead_id: Any, chat_id: Any = None) -> bool:
         """Holat 'Yangi' -> "Bog'lanildi" and red -> green background."""
